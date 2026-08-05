@@ -27,6 +27,7 @@ jobs:
       - run: npm install
       - run: npm run typecheck
       - run: npm run build
+      - run: npm test
 
   deploy:
     needs: build-and-test
@@ -57,6 +58,8 @@ jobs:
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
 
       - name: Deploy to Cloud Run
+        env:
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
         run: |
           gcloud run deploy ${{ env.SERVICE }} \
             --image="${{ env.IMAGE }}" \
@@ -66,7 +69,7 @@ jobs:
             --min-instances=0 \
             --max-instances=2 \
             --memory=128Mi \
-            --set-env-vars=SERVICE_ENV=prod
+            --set-env-vars="SUPABASE_URL=https://dvyoghaqeknyyrdujssi.supabase.co,SUPABASE_ANON_KEY=sb_publishable_gRal6V08wNzz0drb1F1QAw_Na-j9XoL,ALLOWED_ORIGIN=*,DB_SCHEMA=public,AUTOMATION_API_URL=https://automation-7yo5yw7xca-uc.a.run.app,ENCRYPTION_KEY=${ENCRYPTION_KEY}"
 
       - name: Show service URL
         run: gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }} --format='value(status.url)'

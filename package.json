@@ -6,15 +6,18 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@cloudops360/shared-lib": "git+https://github.com/kknr8367/cloudops-shared-lib.git#v1.0.0",
     "@hono/node-server": "^1.13.7",
+    "aws4fetch": "^1.0.20",
     "hono": "^4.6.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.8"
   }
 }
