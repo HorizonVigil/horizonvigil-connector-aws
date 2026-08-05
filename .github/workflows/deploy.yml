@@ -1,0 +1,72 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PROJECT_ID: cloudops360
+  REGION: us-central1
+  SERVICE: connector-aws
+  REPO: cloudops360
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Configure git for private shared-lib dependency
+        run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          printf "machine github.com\nlogin x-access-token\npassword %s\n" "${{ secrets.GH_PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc
+      - run: npm install
+      - run: npm run typecheck
+      - run: npm run build
+
+  deploy:
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push image
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          DOCKER_BUILDKIT: "1"
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.SERVICE }}:${{ github.sha }}"
+          docker build --secret id=gh_pat,env=GH_PAT -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE }} \
+            --image="${{ env.IMAGE }}" \
+            --region=${{ env.REGION }} \
+            --platform=managed \
+            --allow-unauthenticated \
+            --min-instances=0 \
+            --max-instances=2 \
+            --memory=128Mi \
+            --set-env-vars=SERVICE_ENV=prod
+
+      - name: Show service URL
+        run: gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }} --format='value(status.url)'
