@@ -68,7 +68,7 @@ jobs:
             --allow-unauthenticated \
             --min-instances=0 \
             --max-instances=2 \
-            --memory=128Mi \
+            --memory=256Mi \
             --set-env-vars="SUPABASE_URL=https://dvyoghaqeknyyrdujssi.supabase.co,SUPABASE_ANON_KEY=sb_publishable_gRal6V08wNzz0drb1F1QAw_Na-j9XoL,ALLOWED_ORIGIN=*,DB_SCHEMA=public,AUTOMATION_API_URL=https://automation-7yo5yw7xca-uc.a.run.app,ENCRYPTION_KEY=${ENCRYPTION_KEY}"
 
       - name: Show service URL
