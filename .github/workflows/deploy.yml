@@ -69,7 +69,7 @@ jobs:
             --min-instances=0 \
             --max-instances=2 \
             --memory=256Mi \
-            --set-env-vars="SUPABASE_URL=https://dvyoghaqeknyyrdujssi.supabase.co,SUPABASE_ANON_KEY=sb_publishable_gRal6V08wNzz0drb1F1QAw_Na-j9XoL,ALLOWED_ORIGIN=https://frontend-7yo5yw7xca-uc.a.run.app|https://frontend-test-7yo5yw7xca-uc.a.run.app,DB_SCHEMA=public,AUTOMATION_API_URL=https://automation-7yo5yw7xca-uc.a.run.app,ENCRYPTION_KEY=${ENCRYPTION_KEY}"
+            --set-env-vars="SUPABASE_URL=https://dvyoghaqeknyyrdujssi.supabase.co,SUPABASE_ANON_KEY=sb_publishable_gRal6V08wNzz0drb1F1QAw_Na-j9XoL,ALLOWED_ORIGIN=https://frontend-7yo5yw7xca-uc.a.run.app|https://frontend-153395452624.us-central1.run.app|https://frontend-test-7yo5yw7xca-uc.a.run.app|https://frontend-test-153395452624.us-central1.run.app,DB_SCHEMA=public,AUTOMATION_API_URL=https://automation-7yo5yw7xca-uc.a.run.app,ENCRYPTION_KEY=${ENCRYPTION_KEY}"
 
       - name: Show service URL
         run: gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }} --format='value(status.url)'
