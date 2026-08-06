@@ -12,6 +12,7 @@ import { scanLambda, LAMBDA_RESOURCE_TYPES } from '../lib/scanners/lambda';
 import { scanEcs, ECS_RESOURCE_TYPES } from '../lib/scanners/ecs';
 import { scanEcr, ECR_RESOURCE_TYPES } from '../lib/scanners/ecr';
 import { scanEks, EKS_RESOURCE_TYPES } from '../lib/scanners/eks';
+import { scanEksWorkloads, EKS_WORKLOAD_RESOURCE_TYPES } from '../lib/scanners/eksWorkloads';
 import { scanElb, ELB_RESOURCE_TYPES } from '../lib/scanners/elb';
 import { scanRoute53, ROUTE53_RESOURCE_TYPES } from '../lib/scanners/route53';
 import { scanCloudFront, CLOUDFRONT_RESOURCE_TYPES } from '../lib/scanners/cloudfront';
@@ -91,6 +92,7 @@ const REGIONAL_SCANNERS: Record<string, ScannerFn> = {
   ecs: scanEcs,
   ecr: scanEcr,
   eks: scanEks,
+  eksworkloads: scanEksWorkloads,
   elb: scanElb,
   kms: scanKms,
   secretsmanager: scanSecretsManager,
@@ -171,6 +173,7 @@ const SCANNER_RESOURCE_TYPES: Record<string, readonly string[]> = {
   ecs: ECS_RESOURCE_TYPES,
   ecr: ECR_RESOURCE_TYPES,
   eks: EKS_RESOURCE_TYPES,
+  eksworkloads: EKS_WORKLOAD_RESOURCE_TYPES,
   elb: ELB_RESOURCE_TYPES,
   route53: ROUTE53_RESOURCE_TYPES,
   cloudfront: CLOUDFRONT_RESOURCE_TYPES,
