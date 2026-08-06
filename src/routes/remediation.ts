@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMember, requireRole, writeAuditLog, guarded, okJson, errJson, type Db } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMember, requireRole, writeAuditLog, guarded, okJson, errJson, enforceRateLimit, type Db } from '@cloudops360/shared-lib';
 import type { Env } from '../env';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
 import {
@@ -161,6 +161,7 @@ remediationRoutes.post('/remediation/:id/approve', (c) =>
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
     await requireRole(db, auth.userId, orgId, ['admin'], true);
+    await enforceRateLimit(db, `remediation:approve:${orgId}`, 20, 60);
 
     const existing = await loadRequest(db, orgId, c.req.param('id'));
     if (!existing) return errJson(404, 'Remediation request not found');
@@ -250,6 +251,12 @@ remediationRoutes.post('/remediation/:id/execute', (c) =>
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
     await requireRole(db, auth.userId, orgId, ['admin'], true);
+    // The one check on this file that matters most — this is the endpoint
+    // that actually mutates real customer infrastructure (stop/start/
+    // delete/resize). 10/60s per org is generous for legitimate bulk
+    // remediation while still capping a runaway script or compromised
+    // session from firing an unbounded number of real AWS mutations.
+    await enforceRateLimit(db, `remediation:execute:${orgId}`, 10, 60);
 
     const existing = await loadRequest(db, orgId, c.req.param('id'));
     if (!existing) return errJson(404, 'Remediation request not found');
@@ -440,6 +447,7 @@ remediationRoutes.post('/remediation/:id/rollback', (c) =>
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
     await requireRole(db, auth.userId, orgId, ['admin'], true);
+    await enforceRateLimit(db, `remediation:execute:${orgId}`, 10, 60);
 
     const existing = await loadRequest(db, orgId, c.req.param('id'));
     if (!existing) return errJson(404, 'Remediation request not found');

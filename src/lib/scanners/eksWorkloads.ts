@@ -6,19 +6,13 @@ import type { ScannedResource, ScannerContext } from './types';
 export const EKS_WORKLOAD_RESOURCE_TYPES = ['eks_pod', 'eks_deployment'] as const;
 
 /**
- * UNVERIFIED AGAINST A REAL CLUSTER — flagging this explicitly because
- * every other scanner in this codebase was checked against real AWS
- * infrastructure before being called done, and this one hasn't been (no
- * EKS cluster exists anywhere available to this deployment to test
- * against). What IS independently verified: the presigned-STS-URL token
- * construction below produces the exact token shape AWS's own `aws eks
- * get-token` CLI command produces (checked by hand against the documented
- * aws-iam-authenticator protocol — SignedHeaders includes x-k8s-aws-id,
- * Action=GetCallerIdentity, k8s-aws-v1.<base64url> format) and the undici
- * fetch + custom-CA Agent mechanism was verified end-to-end against a real
- * HTTPS endpoint (same mechanism as gkeWorkloads.ts in the GCP connector).
- * What's unverified is whether a real EKS API server accepts this token
- * and CA cert the way the docs describe.
+ * VERIFIED against a real EKS cluster (2026-08-06) — deployed a real
+ * cluster + managed node group, deployed a test Deployment, and confirmed
+ * this scanner's compiled output correctly lists real pods/deployments with
+ * accurate namespace/state/cluster metadata. That test also caught and
+ * fixed a real bug: the presigned STS URL needs an explicit X-Amz-Expires
+ * (see buildEksToken's doc comment) — without it every request failed with
+ * 401 regardless of how correctly IAM/RBAC were configured on the cluster.
  *
  * EKS's own cluster-level scanner (eks.ts) doesn't parse
  * certificateAuthority.data — this scanner does its own GetCluster call
@@ -33,12 +27,12 @@ export const EKS_WORKLOAD_RESOURCE_TYPES = ['eks_pod', 'eks_deployment'] as cons
  * EKS API server independently replays that presigned URL against STS
  * server-side to verify the caller's IAM identity.
  *
- * Either way, IAM identity alone isn't enough: the customer must also map
- * this connection's IAM identity to a Kubernetes RBAC role via the
- * cluster's aws-auth ConfigMap (kube-system namespace) — a real,
- * per-cluster prerequisite, separate from the IAM permissions this
- * connection already has. Example mapping (added to the aws-auth
- * ConfigMap's mapUsers or mapRoles section):
+ * Either way, IAM identity alone isn't enough: the customer must also grant
+ * this connection's IAM identity cluster access — either an EKS access
+ * entry (API/API_AND_CONFIG_MAP auth mode clusters, the modern path,
+ * confirmed working in the real test above via the AmazonEKSClusterAdminPolicy
+ * managed access policy) or a mapping in the cluster's aws-auth ConfigMap
+ * (CONFIG_MAP-only clusters, the legacy path — kube-system namespace):
  *
  *   - userarn: <this connection's IAM user or role ARN>
  *     username: cloudops360-reader
@@ -49,9 +43,12 @@ export const EKS_WORKLOAD_RESOURCE_TYPES = ['eks_pod', 'eks_deployment'] as cons
  * by default via the standard Kubernetes bootstrap roles, but not
  * guaranteed on every cluster.)
  *
- * Without that mapping, every request here returns 403 — surfaced as a
- * clear, actionable thrown error, not silently swallowed to "0 pods
- * found" (which would be indistinguishable from a real empty cluster).
+ * Without that grant, requests here return 403 (identity authenticated,
+ * RBAC denies it) on API/API_AND_CONFIG_MAP clusters, or 401 (identity
+ * never recognized at all — confirmed empirically) on CONFIG_MAP-only
+ * clusters with no matching ConfigMap entry. Either is surfaced as a clear,
+ * actionable thrown error, not silently swallowed to "0 pods found" (which
+ * would be indistinguishable from a real empty cluster).
  */
 
 /**
@@ -96,13 +93,21 @@ async function getClusterDetail(ctx: ScannerContext, name: string): Promise<EksC
 
 /**
  * Builds the k8s-aws-v1 bearer token: a presigned STS GetCallerIdentity URL
- * with x-k8s-aws-id signed in as a header, base64url-encoded. 60-second
- * expiry matches the convention `aws eks get-token` itself uses (not
- * strictly required by the protocol, but the standard value).
+ * with x-k8s-aws-id signed in as a header, base64url-encoded.
+ *
+ * X-Amz-Expires=60 in the URL is NOT optional — confirmed against a real
+ * EKS cluster (2026-08-06): omitting it produces a validly-signed presigned
+ * URL that EKS's server-side token reviewer nonetheless rejects outright
+ * with 401 Unauthorized (a pure authentication failure, not an RBAC/403 —
+ * the cluster never even recognized the caller's identity), regardless of
+ * how correctly IAM/access-entries/aws-auth are configured on the
+ * cluster side. aws4fetch's AwsV4Signer does not add this automatically
+ * even with signQuery:true — it only signs whatever's already in the URL's
+ * query string, so it must be appended before constructing the signer.
  */
 async function buildEksToken(ctx: ScannerContext, clusterName: string): Promise<string> {
   const signer = new AwsV4Signer({
-    url: `https://sts.${ctx.region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15`,
+    url: `https://sts.${ctx.region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15&X-Amz-Expires=60`,
     method: 'GET',
     headers: { 'x-k8s-aws-id': clusterName },
     accessKeyId: ctx.creds.accessKeyId, secretAccessKey: ctx.creds.secretAccessKey, sessionToken: ctx.creds.sessionToken,
