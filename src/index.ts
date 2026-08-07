@@ -11,6 +11,7 @@ import { cloudtrailEventsRoutes } from './routes/cloudtrailEvents';
 import { reportsRoutes } from './routes/reports';
 import { discoveryRoutes } from './routes/discovery';
 import { internalScanRoutes } from './routes/internalScan';
+import { internalRegistryTokenRoutes } from './routes/internalRegistryToken';
 import { remediationRoutes } from './routes/remediation';
 import { curRoutes } from './routes/cur';
 
@@ -30,6 +31,7 @@ app.route('/api/aws-accounts', cloudtrailEventsRoutes);
 app.route('/api/aws-accounts', reportsRoutes);
 app.route('/api/aws-accounts', discoveryRoutes);
 app.route('/api/aws-accounts', internalScanRoutes);
+app.route('/api/aws-accounts', internalRegistryTokenRoutes);
 app.route('/api/aws-accounts', remediationRoutes);
 app.route('/api/aws-accounts', curRoutes);
 
