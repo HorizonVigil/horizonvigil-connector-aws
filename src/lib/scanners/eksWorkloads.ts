@@ -3,7 +3,7 @@ import { AwsV4Signer } from 'aws4fetch';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
-export const EKS_WORKLOAD_RESOURCE_TYPES = ['eks_pod', 'eks_deployment'] as const;
+export const EKS_WORKLOAD_RESOURCE_TYPES = ['eks_pod', 'eks_deployment', 'eks_namespace'] as const;
 
 /**
  * VERIFIED against a real EKS cluster (2026-08-06) — deployed a real
@@ -135,6 +135,11 @@ interface K8sDeployment {
   status?: { readyReplicas?: number; availableReplicas?: number };
 }
 interface K8sDeploymentList { items?: K8sDeployment[] }
+interface K8sNamespace {
+  metadata: K8sObjectMeta;
+  status?: { phase?: string };
+}
+interface K8sNamespaceList { items?: K8sNamespace[] }
 
 async function callK8sApi(endpoint: string, caCertPem: string, bearerToken: string, path: string): Promise<{ ok: boolean; status: number; body: unknown; forbidden: boolean }> {
   const agent = new Agent({ connect: { ca: caCertPem } });
@@ -211,6 +216,29 @@ export async function scanEksWorkloads(ctx: ScannerContext): Promise<ScannedReso
             availableReplicas: dep.status?.availableReplicas, images: dep.spec?.template?.spec?.containers?.map((c) => c.image),
             createdAt: dep.metadata.creationTimestamp,
           },
+          relationships: { clusterName: name },
+        });
+      }
+    }
+
+    // Cluster-scoped, not namespace-scoped (a namespace isn't "in" a
+    // namespace) — same endpoint pattern and token as pods/deployments,
+    // just a different path. No forbidden-tracking special case needed:
+    // any identity that can list pods/deployments in a namespace can list
+    // namespaces themselves (namespace listing needs less RBAC, not more),
+    // so a 403 here without one on pods/deployments would be a genuinely
+    // unusual RBAC setup worth surfacing as its own real error rather than
+    // silently folding into forbiddenClusters.
+    const namespacesResult = await callK8sApi(detail.endpoint, caCertPem, token, '/api/v1/namespaces');
+    if (!namespacesResult.ok) {
+      if (namespacesResult.forbidden) { if (!forbiddenClusters.includes(name)) forbiddenClusters.push(name); }
+      else throw new Error(`EKS namespace list failed for cluster ${clusterId}: HTTP ${namespacesResult.status} ${JSON.stringify(namespacesResult.body).slice(0, 200)}`);
+    } else {
+      for (const ns of (namespacesResult.body as K8sNamespaceList).items ?? []) {
+        out.push({
+          resourceTypeKey: 'eks_namespace', resourceId: `${clusterId}/${ns.metadata.name}`, region: ctx.region,
+          resourceName: ns.metadata.name, state: ns.status?.phase, tags: ns.metadata.labels ?? {},
+          metadata: { createdAt: ns.metadata.creationTimestamp },
           relationships: { clusterName: name },
         });
       }
