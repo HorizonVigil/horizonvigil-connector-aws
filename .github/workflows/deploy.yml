@@ -2,7 +2,7 @@ name: Deploy to Cloud Run
 
 on:
   push:
-    branches: [main]
+    branches: [main, test]
   pull_request:
 
 env:
@@ -79,7 +79,7 @@ jobs:
   # (staging) for auth and all data, not just billing.
   deploy-test:
     needs: build-and-test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
