@@ -3,7 +3,7 @@ import { AwsV4Signer } from 'aws4fetch';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
-export const EKS_WORKLOAD_RESOURCE_TYPES = ['eks_pod', 'eks_deployment', 'eks_namespace'] as const;
+export const EKS_WORKLOAD_RESOURCE_TYPES = ['eks_pod', 'eks_deployment', 'eks_namespace', 'eks_node'] as const;
 
 /**
  * VERIFIED against a real EKS cluster (2026-08-06) — deployed a real
@@ -141,6 +141,43 @@ interface K8sNamespace {
 }
 interface K8sNamespaceList { items?: K8sNamespace[] }
 
+interface K8sNodeObjectMeta {
+  name: string; uid?: string; creationTimestamp?: string;
+  labels?: Record<string, string>; annotations?: Record<string, string>;
+}
+interface K8sNode {
+  metadata: K8sNodeObjectMeta;
+  status?: {
+    addresses?: { type: string; address: string }[];
+    nodeInfo?: {
+      kernelVersion?: string; osImage?: string; containerRuntimeVersion?: string;
+      kubeletVersion?: string; architecture?: string; operatingSystem?: string;
+    };
+    capacity?: Record<string, string>;
+    allocatable?: Record<string, string>;
+    conditions?: { type: string; status: string }[];
+  };
+}
+interface K8sNodeList { items?: K8sNode[] }
+
+/**
+ * Real Kubernetes Node objects (kubelet/kernel version, IPs, capacity,
+ * Ready condition) -- distinct from eks.ts's eks_nodegroup, which is AWS's
+ * own management abstraction over a group of nodes and exposes none of
+ * this. A nodegroup can span nodes with different actual specs (e.g. mid
+ * scale-out), so this is real per-node data a nodegroup summary can't give.
+ * Standard AWS cloud-provider labels (topology.kubernetes.io/zone,
+ * node.kubernetes.io/instance-type, eks.amazonaws.com/capacityType) are
+ * read straight off metadata.labels, not re-derived -- they're already
+ * exactly what the AWS cloud provider integration sets on every node.
+ */
+function findNodeAddress(node: K8sNode, type: string): string | undefined {
+  return node.status?.addresses?.find((a) => a.type === type)?.address;
+}
+function isNodeReady(node: K8sNode): boolean {
+  return node.status?.conditions?.find((c) => c.type === 'Ready')?.status === 'True';
+}
+
 async function callK8sApi(endpoint: string, caCertPem: string, bearerToken: string, path: string): Promise<{ ok: boolean; status: number; body: unknown; forbidden: boolean }> {
   const agent = new Agent({ connect: { ca: caCertPem } });
   const res = await undiciFetch(`${endpoint}${path}`, {
@@ -239,6 +276,38 @@ export async function scanEksWorkloads(ctx: ScannerContext): Promise<ScannedReso
           resourceTypeKey: 'eks_namespace', resourceId: `${clusterId}/${ns.metadata.name}`, region: ctx.region,
           resourceName: ns.metadata.name, state: ns.status?.phase, tags: ns.metadata.labels ?? {},
           metadata: { createdAt: ns.metadata.creationTimestamp },
+          relationships: { clusterName: name },
+        });
+      }
+    }
+
+    // Cluster-scoped, like namespaces. Real per-node data (hostname, IPs,
+    // kernel/kubelet/runtime versions, capacity/allocatable, Ready
+    // condition) -- everything eks_nodegroup (eks.ts) can't give since it's
+    // AWS's management abstraction, not the Kubernetes object itself.
+    const nodesResult = await callK8sApi(detail.endpoint, caCertPem, token, '/api/v1/nodes');
+    if (!nodesResult.ok) {
+      if (nodesResult.forbidden) { if (!forbiddenClusters.includes(name)) forbiddenClusters.push(name); }
+      else throw new Error(`EKS node list failed for cluster ${clusterId}: HTTP ${nodesResult.status} ${JSON.stringify(nodesResult.body).slice(0, 200)}`);
+    } else {
+      for (const node of (nodesResult.body as K8sNodeList).items ?? []) {
+        out.push({
+          resourceTypeKey: 'eks_node', resourceId: `${clusterId}/${node.metadata.name}`, region: ctx.region,
+          resourceName: node.metadata.name, state: isNodeReady(node) ? 'Ready' : 'NotReady', tags: node.metadata.labels ?? {},
+          metadata: {
+            internalIp: findNodeAddress(node, 'InternalIP'), externalIp: findNodeAddress(node, 'ExternalIP'),
+            hostname: findNodeAddress(node, 'Hostname'),
+            instanceType: node.metadata.labels?.['node.kubernetes.io/instance-type'],
+            zone: node.metadata.labels?.['topology.kubernetes.io/zone'],
+            capacityType: node.metadata.labels?.['eks.amazonaws.com/capacityType'],
+            kernelVersion: node.status?.nodeInfo?.kernelVersion, osImage: node.status?.nodeInfo?.osImage,
+            containerRuntimeVersion: node.status?.nodeInfo?.containerRuntimeVersion,
+            kubeletVersion: node.status?.nodeInfo?.kubeletVersion, architecture: node.status?.nodeInfo?.architecture,
+            operatingSystem: node.status?.nodeInfo?.operatingSystem,
+            capacityCpu: node.status?.capacity?.cpu, capacityMemory: node.status?.capacity?.memory, capacityPods: node.status?.capacity?.pods,
+            allocatableCpu: node.status?.allocatable?.cpu, allocatableMemory: node.status?.allocatable?.memory, allocatablePods: node.status?.allocatable?.pods,
+            annotations: node.metadata.annotations, createdAt: node.metadata.creationTimestamp,
+          },
           relationships: { clusterName: name },
         });
       }
