@@ -85,7 +85,7 @@ export const discoveryRoutes = new Hono<{ Bindings: Env }>();
  * region, so it gets exactly one step total — running it once per scan
  * region would just repeat the same AWS calls up to 17x for nothing.
  */
-const REGIONAL_SCANNERS: Record<string, ScannerFn> = {
+export const REGIONAL_SCANNERS: Record<string, ScannerFn> = {
   ec2: scanEc2,
   rds: scanRds,
   sns: scanSns,
@@ -115,7 +115,7 @@ const REGIONAL_SCANNERS: Record<string, ScannerFn> = {
   events: scanEvents,
   states: scanStates,
 };
-const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
+export const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
   iam: scanIam,
   s3: scanS3,
   route53: scanRoute53,
@@ -147,7 +147,7 @@ const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
  * REGIONAL_SCANNERS/GLOBAL_SCANNERS already have would fix this properly,
  * not done here to keep this change scoped to adding the three scanners.
  */
-const FINDING_SCANNERS: Record<string, FindingScannerFn> = {
+export const FINDING_SCANNERS: Record<string, FindingScannerFn> = {
   guardduty: scanGuardDutyFindings,
   securityhub: scanSecurityHubFindings,
   accessanalyzer: scanAccessAnalyzerFindings,
@@ -167,7 +167,7 @@ const FINDING_SCANNERS: Record<string, FindingScannerFn> = {
  * might need a genuinely different "which resources need this" query, not
  * just a different AWS call. See runMetricStep below.
  */
-const METRIC_STEP_NAME = 'ec2cpu';
+export const METRIC_STEP_NAME = 'ec2cpu';
 const EC2_METRICS_INSTANCE_CAP = 30;
 
 /**
@@ -215,12 +215,12 @@ const SCANNER_RESOURCE_TYPES: Record<string, readonly string[]> = {
 };
 const COVERED_RESOURCE_TYPES = Object.values(SCANNER_RESOURCE_TYPES).flat();
 
-interface ConnectionForDiscovery extends ResolvableConnection {
+export interface ConnectionForDiscovery extends ResolvableConnection {
   aws_account_id: string;
   scan_regions: string[] | null;
 }
 
-async function loadConnection(db: Db, orgId: string, id: string): Promise<ConnectionForDiscovery | null> {
+export async function loadConnection(db: Db, orgId: string, id: string): Promise<ConnectionForDiscovery | null> {
   const rows = await db.select<ConnectionForDiscovery[]>('cloud_connections', {
     select: 'id,aws_account_id,connection_method,credentials_encrypted,role_arn,external_id,default_region,scan_regions',
     filters: { id: `eq.${id}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
@@ -228,7 +228,7 @@ async function loadConnection(db: Db, orgId: string, id: string): Promise<Connec
   return rows[0] ?? null;
 }
 
-function regionsFor(connection: ConnectionForDiscovery): string[] {
+export function regionsFor(connection: ConnectionForDiscovery): string[] {
   return connection.scan_regions?.length ? connection.scan_regions : [connection.default_region];
 }
 
@@ -258,7 +258,7 @@ discoveryRoutes.get('/accounts/:id/discovery/steps', (c) =>
   }),
 );
 
-interface StepResult {
+export interface StepResult {
   stepId: string;
   resourceCount: number;
   created: number;
@@ -285,7 +285,7 @@ interface CatalogRow { key: string; category: string; service: string }
  * AWS (PostgREST's `resolution=merge-duplicates` only touches columns
  * actually present in the payload).
  */
-async function runFindingStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+export async function runFindingStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
   const rest = stepId.slice('finding:'.length);
   const sep = rest.indexOf(':');
   if (sep === -1) return { stepId, resourceCount: 0, created: 0, error: `Malformed stepId "${stepId}"`, errorSeverity: 'error' };
@@ -344,7 +344,7 @@ async function runFindingStep(db: Db, orgId: string, env: Env, connectionId: str
  * instance that isn't running, so pulling their metrics would just waste
  * subrequests on empty responses.
  */
-async function runMetricStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+export async function runMetricStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
   const rest = stepId.slice('metric:'.length);
   const sep = rest.indexOf(':');
   if (sep === -1) return { stepId, resourceCount: 0, created: 0, error: `Malformed stepId "${stepId}"`, errorSeverity: 'error' };
@@ -384,6 +384,88 @@ async function runMetricStep(db: Db, orgId: string, env: Env, connectionId: stri
 }
 
 /**
+ * Handles `regional:`/`global:` resource-scanning steps — extracted from
+ * the POST /run-step handler below (pure extraction, no behavior change) so
+ * routes/internalScan.ts's scheduled-scan path can drive the exact same
+ * upsert logic server-side instead of duplicating it.
+ */
+export async function runResourceStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+  let scanner: ScannerFn | undefined;
+  let region: string;
+  if (stepId.startsWith('regional:')) {
+    const rest = stepId.slice('regional:'.length);
+    const sep = rest.indexOf(':');
+    if (sep === -1) return { stepId, resourceCount: 0, created: 0, error: `Malformed stepId "${stepId}"`, errorSeverity: 'error' };
+    const scannerName = rest.slice(0, sep);
+    region = rest.slice(sep + 1);
+    scanner = REGIONAL_SCANNERS[scannerName];
+  } else if (stepId.startsWith('global:')) {
+    const scannerName = stepId.slice('global:'.length);
+    region = 'global';
+    scanner = GLOBAL_SCANNERS[scannerName];
+  } else {
+    return { stepId, resourceCount: 0, created: 0, error: `Malformed stepId "${stepId}"`, errorSeverity: 'error' };
+  }
+  if (!scanner) return { stepId, resourceCount: 0, created: 0, error: `Unknown scanner in stepId "${stepId}"`, errorSeverity: 'error' };
+
+  const connection = await loadConnection(db, orgId, connectionId);
+  if (!connection) return { stepId, resourceCount: 0, created: 0, error: 'Account not found', errorSeverity: 'error' };
+
+  const resolved = await resolveCredentials(env, connection);
+  if ('error' in resolved) return { stepId, resourceCount: 0, created: 0, error: resolved.error, errorSeverity: 'error' };
+
+  let scanned: ScannedResource[];
+  try {
+    scanned = await scanner({ creds: resolved.creds, region });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Scan failed';
+    return { stepId, resourceCount: 0, created: 0, error: message, errorSeverity: classifyError(message) };
+  }
+  if (scanned.length === 0) return { stepId, resourceCount: 0, created: 0 };
+
+  const typeKeys = [...new Set(scanned.map((r) => r.resourceTypeKey))];
+  const [catalogRows, existing] = await Promise.all([
+    db.select<CatalogRow[]>('resource_type_catalog', { select: 'key,category,service', filters: { key: inFilter(typeKeys) } }),
+    db.select<{ resource_type_key: string; resource_id: string; deleted_at: string | null }[]>('cloud_resources', {
+      select: 'resource_type_key,resource_id,deleted_at',
+      filters: { connection_id: `eq.${connection.id}`, resource_type_key: inFilter(typeKeys) },
+    }),
+  ]);
+  const catalogByKey = new Map(catalogRows.map((r) => [r.key, r]));
+  const existingByKey = new Map(existing.map((r) => [`${r.resource_type_key}:${r.resource_id}`, r]));
+
+  const now = new Date().toISOString();
+  const createdEvents: Record<string, unknown>[] = [];
+  const rows = scanned.map((r) => {
+    const catalog = catalogByKey.get(r.resourceTypeKey);
+    const key = `${r.resourceTypeKey}:${r.resourceId}`;
+    const prior = existingByKey.get(key);
+    if (!prior || prior.deleted_at) {
+      createdEvents.push({ connection_id: connection.id, resource_type_key: r.resourceTypeKey, aws_resource_id: r.resourceId, event_type: 'created' });
+    }
+    return {
+      connection_id: connection.id, account_id: connection.aws_account_id, resource_type_key: r.resourceTypeKey,
+      resource_id: r.resourceId, resource_name: r.resourceName ?? null, region: r.region,
+      category: catalog?.category ?? 'Others', service: catalog?.service ?? r.resourceTypeKey.split('_')[0],
+      state: r.state ?? null, status: r.state === 'terminated' ? 'terminated' : r.state === 'stopped' ? 'stopped' : 'active',
+      is_default: r.isDefault ?? false, tags: r.tags ?? {}, metadata: r.metadata ?? {}, relationships: r.relationships ?? {},
+      last_seen_at: now, deleted_at: null,
+    };
+  });
+
+  // cloud_resources has a unique constraint on (connection_id, resource_type_key,
+  // resource_id) — upsert via on_conflict rather than delete+insert, so a
+  // resource's first_seen_at/created_at (and its row id, which lifecycle
+  // events elsewhere may reference) survive a re-scan.
+  await db.insert('cloud_resources?on_conflict=connection_id,resource_type_key,resource_id', rows, 'resolution=merge-duplicates,return=minimal');
+  if (createdEvents.length > 0) {
+    await db.insert('resource_lifecycle_events', createdEvents, 'return=minimal');
+  }
+
+  return { stepId, resourceCount: rows.length, created: createdEvents.length };
+}
+
+/**
  * POST /api/aws-accounts/accounts/:id/discovery/run-step — runs exactly one
  * scanner against one region and upserts just its results. Small enough to
  * always fit inside one invocation's CPU/subrequest budget regardless of
@@ -406,92 +488,11 @@ discoveryRoutes.post('/accounts/:id/discovery/run-step', (c) =>
     if (stepId.startsWith('metric:')) {
       return okJson(await runMetricStep(db, orgId, c.env, c.req.param('id'), stepId));
     }
-
-    let scanner: ScannerFn | undefined;
-    let region: string;
-    if (stepId.startsWith('regional:')) {
-      const rest = stepId.slice('regional:'.length);
-      const sep = rest.indexOf(':');
-      if (sep === -1) return errJson(400, `Malformed stepId "${stepId}"`);
-      const scannerName = rest.slice(0, sep);
-      region = rest.slice(sep + 1);
-      scanner = REGIONAL_SCANNERS[scannerName];
-    } else if (stepId.startsWith('global:')) {
-      const scannerName = stepId.slice('global:'.length);
-      region = 'global';
-      scanner = GLOBAL_SCANNERS[scannerName];
-    } else {
-      return errJson(400, `Malformed stepId "${stepId}"`);
-    }
-    if (!scanner) return errJson(400, `Unknown scanner in stepId "${stepId}"`);
-
-    const connection = await loadConnection(db, orgId, c.req.param('id'));
-    if (!connection) return errJson(404, 'Account not found');
-
-    const resolved = await resolveCredentials(c.env, connection);
-    if ('error' in resolved) {
-      const result: StepResult = { stepId, resourceCount: 0, created: 0, error: resolved.error, errorSeverity: 'error' };
-      return okJson(result);
-    }
-
-    let scanned: ScannedResource[];
-    try {
-      scanned = await scanner({ creds: resolved.creds, region });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Scan failed';
-      const result: StepResult = { stepId, resourceCount: 0, created: 0, error: message, errorSeverity: classifyError(message) };
-      return okJson(result);
-    }
-    if (scanned.length === 0) {
-      const result: StepResult = { stepId, resourceCount: 0, created: 0 };
-      return okJson(result);
-    }
-
-    const typeKeys = [...new Set(scanned.map((r) => r.resourceTypeKey))];
-    const [catalogRows, existing] = await Promise.all([
-      db.select<CatalogRow[]>('resource_type_catalog', { select: 'key,category,service', filters: { key: inFilter(typeKeys) } }),
-      db.select<{ resource_type_key: string; resource_id: string; deleted_at: string | null }[]>('cloud_resources', {
-        select: 'resource_type_key,resource_id,deleted_at',
-        filters: { connection_id: `eq.${connection.id}`, resource_type_key: inFilter(typeKeys) },
-      }),
-    ]);
-    const catalogByKey = new Map(catalogRows.map((r) => [r.key, r]));
-    const existingByKey = new Map(existing.map((r) => [`${r.resource_type_key}:${r.resource_id}`, r]));
-
-    const now = new Date().toISOString();
-    const createdEvents: Record<string, unknown>[] = [];
-    const rows = scanned.map((r) => {
-      const catalog = catalogByKey.get(r.resourceTypeKey);
-      const key = `${r.resourceTypeKey}:${r.resourceId}`;
-      const prior = existingByKey.get(key);
-      if (!prior || prior.deleted_at) {
-        createdEvents.push({ connection_id: connection.id, resource_type_key: r.resourceTypeKey, aws_resource_id: r.resourceId, event_type: 'created' });
-      }
-      return {
-        connection_id: connection.id, account_id: connection.aws_account_id, resource_type_key: r.resourceTypeKey,
-        resource_id: r.resourceId, resource_name: r.resourceName ?? null, region: r.region,
-        category: catalog?.category ?? 'Others', service: catalog?.service ?? r.resourceTypeKey.split('_')[0],
-        state: r.state ?? null, status: r.state === 'terminated' ? 'terminated' : r.state === 'stopped' ? 'stopped' : 'active',
-        is_default: r.isDefault ?? false, tags: r.tags ?? {}, metadata: r.metadata ?? {}, relationships: r.relationships ?? {},
-        last_seen_at: now, deleted_at: null,
-      };
-    });
-
-    // cloud_resources has a unique constraint on (connection_id, resource_type_key,
-    // resource_id) — upsert via on_conflict rather than delete+insert, so a
-    // resource's first_seen_at/created_at (and its row id, which lifecycle
-    // events elsewhere may reference) survive a re-scan.
-    await db.insert('cloud_resources?on_conflict=connection_id,resource_type_key,resource_id', rows, 'resolution=merge-duplicates,return=minimal');
-    if (createdEvents.length > 0) {
-      await db.insert('resource_lifecycle_events', createdEvents, 'return=minimal');
-    }
-
-    const result: StepResult = { stepId, resourceCount: rows.length, created: createdEvents.length };
-    return okJson(result);
+    return okJson(await runResourceStep(db, orgId, c.env, c.req.param('id'), stepId));
   }),
 );
 
-interface StepErrorInput { message: string; severity: 'error' | 'info' }
+export interface StepErrorInput { message: string; severity: 'error' | 'info' }
 
 /**
  * POST /api/aws-accounts/accounts/:id/discovery/finalize — runs after every
@@ -505,6 +506,64 @@ interface StepErrorInput { message: string; severity: 'error' | 'info' }
  * Then rolls up cloud_connections.resource_summary the way the AWS
  * Accounts dashboard/inventory already expect to read it.
  */
+export interface FinalizeOutcome { totalResources: number; deleted: number; findingsResolved: number; categoryCounts: Record<string, number>; errors: StepErrorInput[] }
+
+/**
+ * Shared by the HTTP finalize handler and the scheduled-scan path (see
+ * routes/internalScan.ts) — extracted the same way runResourceStep was,
+ * pure extraction of the existing behavior, actorId nullable since a
+ * scheduled run has no human user to attribute the audit log entry to.
+ */
+export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[]): Promise<FinalizeOutcome> {
+  const existing = await db.select<{ id: string; resource_type_key: string; category: string; last_seen_at: string; deleted_at: string | null }[]>('cloud_resources', {
+    select: 'id,resource_type_key,category,last_seen_at,deleted_at',
+    filters: { connection_id: `eq.${connection.id}` },
+    limit: 10000,
+  });
+
+  // Only resource types a currently-implemented scanner actually checked
+  // this run are eligible to be marked vanished — see COVERED_RESOURCE_TYPES
+  // and lib/discoveryFinalize.ts (extracted so this is unit-testable).
+  const { vanishedIds, activeCategoryCounts, activeCount } = computeFinalizeResult(existing, COVERED_RESOURCE_TYPES, runStartedAt);
+  const now = new Date().toISOString();
+  if (vanishedIds.length > 0) {
+    await db.update('cloud_resources', { id: `in.(${vanishedIds.join(',')})` }, { deleted_at: now, status: 'deleted' }, 'return=minimal');
+  }
+
+  // Same vanish reasoning as cloud_resources above, scoped to the finding
+  // sources FINDING_SCANNERS actually covers this run — a finding
+  // AWS itself stopped returning (fixed, archived, or its resource gone)
+  // is marked resolved rather than left open forever. Only 'open' rows are
+  // touched, so a finding a user already suppressed stays suppressed.
+  const resolvedFindings = await db.update<{ id: string }[]>(
+    'vulnerability_findings',
+    { connection_id: `eq.${connection.id}`, status: 'eq.open', finding_source: 'in.(guardduty,security_hub,iam_access_analyzer,inspector,aws_config,trusted_advisor)', last_seen_at: `lt.${runStartedAt}` },
+    { status: 'resolved', resolved_at: now },
+  );
+
+  const realErrors = stepErrors.filter((e) => e.severity !== 'info');
+  const summary = {
+    scannedAt: now, totalResources: activeCount, categoryCounts: activeCategoryCounts,
+    servicesTotal: `${Object.keys(REGIONAL_SCANNERS).length + Object.keys(GLOBAL_SCANNERS).length} live / 241 catalogued`,
+    regionsScanned: regionsFor(connection), errors: stepErrors.slice(0, 20),
+  };
+
+  await db.update(
+    'cloud_connections',
+    { id: `eq.${connection.id}` },
+    {
+      last_discovery_at: now, last_full_scan_at: now, last_sync_at: now, resource_summary: summary,
+      status: realErrors.length > 0 ? 'error' : 'connected',
+      error_message: realErrors.length > 0 ? `${realErrors.length} scan step(s) failed: ${realErrors.slice(0, 3).map((e) => e.message).join('; ')}` : null,
+    },
+    'return=minimal',
+  );
+
+  await writeAuditLog(db, { orgId, actorId, action: 'aws_account.discovery_completed', targetType: 'cloud_connection', targetId: connection.id, metadata: { totalResources: activeCount, deleted: vanishedIds.length, findingsResolved: resolvedFindings.length, errors: realErrors.length } });
+
+  return { totalResources: activeCount, deleted: vanishedIds.length, findingsResolved: resolvedFindings.length, categoryCounts: activeCategoryCounts, errors: stepErrors };
+}
+
 discoveryRoutes.post('/accounts/:id/discovery/finalize', (c) =>
   guarded(async () => {
     const auth = getAuthContext(c.req.raw);
@@ -514,57 +573,11 @@ discoveryRoutes.post('/accounts/:id/discovery/finalize', (c) =>
 
     const body = (await c.req.json().catch(() => ({}))) as { runStartedAt?: string; stepErrors?: StepErrorInput[] };
     if (!body.runStartedAt) return errJson(400, 'runStartedAt is required');
-    const stepErrors = body.stepErrors ?? [];
 
     const connection = await loadConnection(db, orgId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
 
-    const existing = await db.select<{ id: string; resource_type_key: string; category: string; last_seen_at: string; deleted_at: string | null }[]>('cloud_resources', {
-      select: 'id,resource_type_key,category,last_seen_at,deleted_at',
-      filters: { connection_id: `eq.${connection.id}` },
-      limit: 10000,
-    });
-
-    // Only resource types a currently-implemented scanner actually checked
-    // this run are eligible to be marked vanished — see COVERED_RESOURCE_TYPES
-    // and lib/discoveryFinalize.ts (extracted so this is unit-testable).
-    const { vanishedIds, activeCategoryCounts, activeCount } = computeFinalizeResult(existing, COVERED_RESOURCE_TYPES, body.runStartedAt);
-    const now = new Date().toISOString();
-    if (vanishedIds.length > 0) {
-      await db.update('cloud_resources', { id: `in.(${vanishedIds.join(',')})` }, { deleted_at: now, status: 'deleted' }, 'return=minimal');
-    }
-
-    // Same vanish reasoning as cloud_resources above, scoped to the finding
-    // sources FINDING_SCANNERS actually covers this run — a finding
-    // AWS itself stopped returning (fixed, archived, or its resource gone)
-    // is marked resolved rather than left open forever. Only 'open' rows are
-    // touched, so a finding a user already suppressed stays suppressed.
-    const resolvedFindings = await db.update<{ id: string }[]>(
-      'vulnerability_findings',
-      { connection_id: `eq.${connection.id}`, status: 'eq.open', finding_source: 'in.(guardduty,security_hub,iam_access_analyzer,inspector,aws_config,trusted_advisor)', last_seen_at: `lt.${body.runStartedAt}` },
-      { status: 'resolved', resolved_at: now },
-    );
-
-    const realErrors = stepErrors.filter((e) => e.severity !== 'info');
-    const summary = {
-      scannedAt: now, totalResources: activeCount, categoryCounts: activeCategoryCounts,
-      servicesTotal: `${Object.keys(REGIONAL_SCANNERS).length + Object.keys(GLOBAL_SCANNERS).length} live / 241 catalogued`,
-      regionsScanned: regionsFor(connection), errors: stepErrors.slice(0, 20),
-    };
-
-    await db.update(
-      'cloud_connections',
-      { id: `eq.${connection.id}` },
-      {
-        last_discovery_at: now, last_full_scan_at: now, last_sync_at: now, resource_summary: summary,
-        status: realErrors.length > 0 ? 'error' : 'connected',
-        error_message: realErrors.length > 0 ? `${realErrors.length} scan step(s) failed: ${realErrors.slice(0, 3).map((e) => e.message).join('; ')}` : null,
-      },
-      'return=minimal',
-    );
-
-    await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.discovery_completed', targetType: 'cloud_connection', targetId: connection.id, metadata: { totalResources: activeCount, deleted: vanishedIds.length, findingsResolved: resolvedFindings.length, errors: realErrors.length } });
-
-    return okJson({ totalResources: activeCount, deleted: vanishedIds.length, findingsResolved: resolvedFindings.length, categoryCounts: activeCategoryCounts, errors: stepErrors });
+    const outcome = await runFinalize(db, orgId, auth.userId, connection, body.runStartedAt, body.stepErrors ?? []);
+    return okJson(outcome);
   }),
 );

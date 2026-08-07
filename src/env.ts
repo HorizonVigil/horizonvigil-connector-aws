@@ -18,4 +18,9 @@ export interface Env extends BaseEnv {
   // remediation completion) — not sensitive, same convention as every other
   // cross-service URL in this app.
   AUTOMATION_API_URL?: string;
+  // Shared secret a Cloud Scheduler job presents (X-Internal-Scan-Secret
+  // header) to call POST /internal/run-due-scans — see routes/internalScan.ts.
+  // Not currently provisioned in any environment; that route returns an
+  // honest 503 rather than running with no auth check when this is unset.
+  INTERNAL_SCAN_SECRET?: string;
 }
