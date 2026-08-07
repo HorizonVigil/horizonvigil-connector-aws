@@ -36,6 +36,9 @@ import { scanStates, STATES_RESOURCE_TYPES } from '../lib/scanners/states';
 import { scanGuardDutyFindings } from '../lib/scanners/guarddutyFindings';
 import { scanSecurityHubFindings } from '../lib/scanners/securityhubFindings';
 import { scanAccessAnalyzerFindings } from '../lib/scanners/accessAnalyzerFindings';
+import { scanInspectorFindings } from '../lib/scanners/inspectorFindings';
+import { scanAwsConfigFindings } from '../lib/scanners/awsConfigFindings';
+import { scanTrustedAdvisorFindings } from '../lib/scanners/trustedAdvisorFindings';
 import { scanEc2CpuMetrics } from '../lib/scanners/ec2Metrics';
 import type { ScannedResource, ScannerFn } from '../lib/scanners/types';
 import type { ScannedFinding, FindingScannerFn } from '../lib/scanners/findingTypes';
@@ -128,14 +131,29 @@ const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
  * `finding:` step per scan region, same fan-out as REGIONAL_SCANNERS.
  * vulnerability_findings.finding_source's check constraint already allows
  * ('internal','security_hub','guardduty','inspector','iam_access_analyzer',
- * 'aws_config','trusted_advisor') — inspector/aws_config/trusted_advisor
- * are intentionally not covered yet, a real tracked gap like 'planned'
- * resource types above, not silently skipped.
+ * 'aws_config','trusted_advisor') — all seven are now covered (inspector/
+ * aws_config/trusted_advisor added after guardduty/securityhub/
+ * accessanalyzer; see each scanner file's own "UNVERIFIED" doc comment,
+ * since these three haven't been exercised against a real account with the
+ * relevant service/support-plan enabled the way the first three were).
+ *
+ * trustedadvisor is a real inefficiency here, not just a naming quirk: the
+ * Support API only exists in us-east-1 (trustedAdvisorFindings.ts hardcodes
+ * it, ignoring ctx.region), but this map fans every scanner out per scan
+ * region same as the other two — so a connection scanning 5 regions calls
+ * Trusted Advisor 5 times against the same us-east-1 endpoint. Harmless
+ * (findings upsert idempotently on their own id) but wasteful; giving
+ * FINDING_SCANNERS a per-scanner "regional vs global" flag like
+ * REGIONAL_SCANNERS/GLOBAL_SCANNERS already have would fix this properly,
+ * not done here to keep this change scoped to adding the three scanners.
  */
 const FINDING_SCANNERS: Record<string, FindingScannerFn> = {
   guardduty: scanGuardDutyFindings,
   securityhub: scanSecurityHubFindings,
   accessanalyzer: scanAccessAnalyzerFindings,
+  inspector: scanInspectorFindings,
+  awsconfig: scanAwsConfigFindings,
+  trustedadvisor: scanTrustedAdvisorFindings,
 };
 
 /**
@@ -523,7 +541,7 @@ discoveryRoutes.post('/accounts/:id/discovery/finalize', (c) =>
     // touched, so a finding a user already suppressed stays suppressed.
     const resolvedFindings = await db.update<{ id: string }[]>(
       'vulnerability_findings',
-      { connection_id: `eq.${connection.id}`, status: 'eq.open', finding_source: 'in.(guardduty,security_hub,iam_access_analyzer)', last_seen_at: `lt.${body.runStartedAt}` },
+      { connection_id: `eq.${connection.id}`, status: 'eq.open', finding_source: 'in.(guardduty,security_hub,iam_access_analyzer,inspector,aws_config,trusted_advisor)', last_seen_at: `lt.${body.runStartedAt}` },
       { status: 'resolved', resolved_at: now },
     );
 
