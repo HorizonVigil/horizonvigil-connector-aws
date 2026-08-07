@@ -123,16 +123,59 @@ interface K8sObjectMeta {
   name: string; namespace?: string; uid?: string; creationTimestamp?: string;
   labels?: Record<string, string>;
 }
+
+// Container-level state as reported by kubelet — this is the actual source
+// of "why did it fail" (CrashLoopBackOff/OOMKilled/ImagePullBackOff all
+// surface here, on the *container*, not the pod-level phase/reason, which
+// is why the old scanner's pod.status?.phase alone couldn't answer it).
+interface K8sContainerState {
+  running?: { startedAt?: string };
+  waiting?: { reason?: string; message?: string };
+  terminated?: { reason?: string; exitCode?: number; signal?: number; message?: string; startedAt?: string; finishedAt?: string };
+}
+interface K8sContainerStatus {
+  name: string; image: string; ready: boolean; started?: boolean; restartCount: number;
+  state?: K8sContainerState; lastState?: K8sContainerState;
+}
 interface K8sPod {
   metadata: K8sObjectMeta;
-  spec?: { nodeName?: string; containers?: { name: string; image: string }[] };
-  status?: { phase?: string };
+  spec?: { nodeName?: string; containers?: { name: string; image: string }[]; nodeSelector?: Record<string, string>; tolerations?: { key?: string; operator?: string; value?: string; effect?: string }[] };
+  status?: {
+    phase?: string; reason?: string; message?: string; podIP?: string; hostIP?: string; qosClass?: string;
+    containerStatuses?: K8sContainerStatus[];
+    conditions?: { type: string; status: string; reason?: string; message?: string }[];
+  };
 }
 interface K8sPodList { items?: K8sPod[] }
+
+interface K8sProbe {
+  httpGet?: { path?: string; port?: number | string; scheme?: string };
+  tcpSocket?: { port?: number | string };
+  exec?: { command?: string[] };
+  initialDelaySeconds?: number; periodSeconds?: number; timeoutSeconds?: number; failureThreshold?: number; successThreshold?: number;
+}
+interface K8sEnvVar {
+  name: string; value?: string;
+  valueFrom?: { secretKeyRef?: { name: string; key: string }; configMapKeyRef?: { name: string; key: string }; fieldRef?: { fieldPath: string } };
+}
+interface K8sContainerSpec {
+  name: string; image: string; imagePullPolicy?: string;
+  command?: string[]; args?: string[];
+  ports?: { containerPort: number; protocol?: string; name?: string }[];
+  env?: K8sEnvVar[];
+  resources?: { requests?: { cpu?: string; memory?: string }; limits?: { cpu?: string; memory?: string } };
+  volumeMounts?: { name: string; mountPath: string; readOnly?: boolean }[];
+  readinessProbe?: K8sProbe; livenessProbe?: K8sProbe; startupProbe?: K8sProbe;
+}
 interface K8sDeployment {
   metadata: K8sObjectMeta;
-  spec?: { replicas?: number; template?: { spec?: { containers?: { name: string; image: string }[] } } };
-  status?: { readyReplicas?: number; availableReplicas?: number };
+  spec?: {
+    replicas?: number;
+    strategy?: { type?: string; rollingUpdate?: { maxSurge?: string | number; maxUnavailable?: string | number } };
+    revisionHistoryLimit?: number;
+    template?: { spec?: { containers?: K8sContainerSpec[]; initContainers?: K8sContainerSpec[]; serviceAccountName?: string; nodeSelector?: Record<string, string> } };
+  };
+  status?: { readyReplicas?: number; availableReplicas?: number; updatedReplicas?: number; unavailableReplicas?: number; conditions?: { type: string; status: string; reason?: string; message?: string }[] };
 }
 interface K8sDeploymentList { items?: K8sDeployment[] }
 interface K8sNamespace {
@@ -147,6 +190,7 @@ interface K8sNodeObjectMeta {
 }
 interface K8sNode {
   metadata: K8sNodeObjectMeta;
+  spec?: { taints?: { key: string; value?: string; effect: string }[]; unschedulable?: boolean };
   status?: {
     addresses?: { type: string; address: string }[];
     nodeInfo?: {
@@ -155,7 +199,7 @@ interface K8sNode {
     };
     capacity?: Record<string, string>;
     allocatable?: Record<string, string>;
-    conditions?: { type: string; status: string }[];
+    conditions?: { type: string; status: string; reason?: string; message?: string }[];
   };
 }
 interface K8sNodeList { items?: K8sNode[] }
@@ -227,12 +271,18 @@ export async function scanEksWorkloads(ctx: ScannerContext): Promise<ScannedReso
       else throw new Error(`EKS pod list failed for cluster ${clusterId}: HTTP ${podsResult.status} ${JSON.stringify(podsResult.body).slice(0, 200)}`);
     } else {
       for (const pod of (podsResult.body as K8sPodList).items ?? []) {
+        const statuses = pod.status?.containerStatuses ?? [];
         out.push({
           resourceTypeKey: 'eks_pod', resourceId: `${clusterId}/${pod.metadata.namespace}/${pod.metadata.name}`, region: ctx.region,
           resourceName: pod.metadata.name, state: pod.status?.phase, tags: pod.metadata.labels ?? {},
           metadata: {
             namespace: pod.metadata.namespace, nodeName: pod.spec?.nodeName,
             images: pod.spec?.containers?.map((c) => c.image), createdAt: pod.metadata.creationTimestamp,
+            podIP: pod.status?.podIP, hostIP: pod.status?.hostIP, qosClass: pod.status?.qosClass,
+            podReason: pod.status?.reason, podMessage: pod.status?.message,
+            restartCount: statuses.reduce((sum, s) => sum + (s.restartCount ?? 0), 0),
+            containerStatuses: statuses, conditions: pod.status?.conditions,
+            tolerations: pod.spec?.tolerations, nodeSelector: pod.spec?.nodeSelector,
           },
           relationships: { clusterName: name },
         });
@@ -245,13 +295,25 @@ export async function scanEksWorkloads(ctx: ScannerContext): Promise<ScannedReso
       else throw new Error(`EKS deployment list failed for cluster ${clusterId}: HTTP ${deploysResult.status} ${JSON.stringify(deploysResult.body).slice(0, 200)}`);
     } else {
       for (const dep of (deploysResult.body as K8sDeploymentList).items ?? []) {
+        const containers = dep.spec?.template?.spec?.containers ?? [];
         out.push({
           resourceTypeKey: 'eks_deployment', resourceId: `${clusterId}/${dep.metadata.namespace}/${dep.metadata.name}`, region: ctx.region,
           resourceName: dep.metadata.name, tags: dep.metadata.labels ?? {},
           metadata: {
             namespace: dep.metadata.namespace, replicas: dep.spec?.replicas, readyReplicas: dep.status?.readyReplicas,
-            availableReplicas: dep.status?.availableReplicas, images: dep.spec?.template?.spec?.containers?.map((c) => c.image),
-            createdAt: dep.metadata.creationTimestamp,
+            availableReplicas: dep.status?.availableReplicas, updatedReplicas: dep.status?.updatedReplicas,
+            unavailableReplicas: dep.status?.unavailableReplicas,
+            images: containers.map((c) => c.image), createdAt: dep.metadata.creationTimestamp,
+            // Full pod-template container spec — everything from the deployment
+            // manifest's spec.template.spec.containers, at the same visibility a
+            // "view"-RBAC kubectl user already has (env values that come from a
+            // Secret are reported as a reference only, e.g. "from secret db-creds.password"
+            // — we never call the Secrets API to resolve the actual value).
+            containers, initContainers: dep.spec?.template?.spec?.initContainers,
+            serviceAccountName: dep.spec?.template?.spec?.serviceAccountName,
+            nodeSelector: dep.spec?.template?.spec?.nodeSelector,
+            strategy: dep.spec?.strategy, revisionHistoryLimit: dep.spec?.revisionHistoryLimit,
+            conditions: dep.status?.conditions,
           },
           relationships: { clusterName: name },
         });
@@ -307,6 +369,7 @@ export async function scanEksWorkloads(ctx: ScannerContext): Promise<ScannedReso
             capacityCpu: node.status?.capacity?.cpu, capacityMemory: node.status?.capacity?.memory, capacityPods: node.status?.capacity?.pods,
             allocatableCpu: node.status?.allocatable?.cpu, allocatableMemory: node.status?.allocatable?.memory, allocatablePods: node.status?.allocatable?.pods,
             annotations: node.metadata.annotations, createdAt: node.metadata.creationTimestamp,
+            taints: node.spec?.taints, unschedulable: node.spec?.unschedulable, conditions: node.status?.conditions,
           },
           relationships: { clusterName: name },
         });
