@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMember, requireRole, writeAuditLog, guarded, okJson, errJson, enforceRateLimit, type Db } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, writeAuditLog, guarded, okJson, errJson, enforceRateLimit, type Db } from '@cloudops360/shared-lib';
 import type { Env } from '../env';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
 import {
@@ -116,7 +116,7 @@ remediationRoutes.post('/remediation/request', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'automation', 'write');
 
     const body = (await c.req.json().catch(() => ({}))) as RequestBody;
     if (!body.connectionId || !body.resourceId || !body.actionType) return errJson(400, 'connectionId, resourceId, and actionType are required');
@@ -160,7 +160,7 @@ remediationRoutes.post('/remediation/:id/approve', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['admin'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'automation', 'admin');
     await enforceRateLimit(db, `remediation:approve:${orgId}`, 20, 60);
 
     const existing = await loadRequest(db, orgId, c.req.param('id'));
@@ -188,7 +188,7 @@ remediationRoutes.post('/remediation/:id/reject', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['admin'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'automation', 'admin');
 
     const existing = await loadRequest(db, orgId, c.req.param('id'));
     if (!existing) return errJson(404, 'Remediation request not found');
@@ -212,7 +212,7 @@ remediationRoutes.post('/remediation/:id/dry-run', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'automation', 'write');
 
     const existing = await loadRequest(db, orgId, c.req.param('id'));
     if (!existing) return errJson(404, 'Remediation request not found');
@@ -250,7 +250,7 @@ remediationRoutes.post('/remediation/:id/execute', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['admin'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'automation', 'admin');
     // The one check on this file that matters most — this is the endpoint
     // that actually mutates real customer infrastructure (stop/start/
     // delete/resize). 10/60s per org is generous for legitimate bulk
@@ -382,7 +382,7 @@ remediationRoutes.post('/remediation/:id/finish-resize', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['admin'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'automation', 'admin');
 
     const existing = await loadRequest(db, orgId, c.req.param('id'));
     if (!existing) return errJson(404, 'Remediation request not found');
@@ -446,7 +446,7 @@ remediationRoutes.post('/remediation/:id/rollback', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['admin'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'automation', 'admin');
     await enforceRateLimit(db, `remediation:execute:${orgId}`, 10, 60);
 
     const existing = await loadRequest(db, orgId, c.req.param('id'));
@@ -493,7 +493,7 @@ remediationRoutes.get('/remediation', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'automation', 'read');
 
     const url = new URL(c.req.url);
     const filters: Record<string, string> = { org_id: `eq.${orgId}` };

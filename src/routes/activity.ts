@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMember, guarded, okJson, parsePagination, paginatedEnvelope, type Env } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, guarded, okJson, parsePagination, paginatedEnvelope, type Env } from '@cloudops360/shared-lib';
 
 export const activityRoutes = new Hono<{ Bindings: Env }>();
 
@@ -37,7 +37,7 @@ activityRoutes.get('/accounts/:id/activity', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const url = new URL(c.req.url);
     const pagination = parsePagination(url);
@@ -69,7 +69,7 @@ activityRoutes.get('/activity', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const url = new URL(c.req.url);
     const pagination = parsePagination(url);

@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMember, requireRole, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson } from '@cloudops360/shared-lib';
 import type { Env } from '../env';
 import { callJsonApi } from '../lib/awsApi';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
@@ -40,7 +40,7 @@ costRoutes.post('/accounts/:id/cost/sync', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const rows = await db.select<(ResolvableConnection & { aws_account_id: string })[]>('cloud_connections', {
       select: 'id,aws_account_id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
@@ -112,7 +112,7 @@ costRoutes.get('/accounts/:id/cost', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const rows = await db.select<{ service: string; unblended_cost: string; usage_date: string }[]>('cost_snapshots', {
       select: 'service,unblended_cost,usage_date',
@@ -138,7 +138,7 @@ costRoutes.get('/cost-summary', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const connectionIds = await getOrgConnectionIds(db, orgId);
     const [connections, costRows] = await Promise.all([

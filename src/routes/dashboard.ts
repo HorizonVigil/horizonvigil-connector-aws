@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMember, getOrgConnectionIds, inFilter, guarded, okJson } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson } from '@cloudops360/shared-lib';
 import type { Env } from '../env';
 import { notCurrentlyExcludedFilter } from '../lib/exclusions';
 
@@ -41,7 +41,7 @@ dashboardRoutes.get('/dashboard', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const connections = await db.select<ConnectionRow[]>('cloud_connections', {
       select: 'id,connection_name,status,environment,scan_regions,last_sync_at,last_discovery_at,last_permission_check_at,error_message,resource_summary,key_rotated_at',
@@ -164,7 +164,7 @@ dashboardRoutes.get('/sync-status', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const rows = await db.select<ConnectionRow[]>('cloud_connections', {
       select: 'id,connection_name,status,last_sync_at,last_discovery_at,last_permission_check_at,error_message',
@@ -181,7 +181,7 @@ dashboardRoutes.get('/health', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const rows = await db.select<ConnectionRow[]>('cloud_connections', {
       select: 'id,connection_name,status,error_message,resource_summary,last_discovery_at',

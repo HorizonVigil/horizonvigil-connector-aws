@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireRole, writeAuditLog, guarded, okJson, errJson, type Db } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, writeAuditLog, guarded, okJson, errJson, type Db } from '@cloudops360/shared-lib';
 import type { Env } from '../env';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
 import { discoverCurReport, fetchCurManifest, parseCurBatch, type CurConnectionConfig } from '../lib/curIngest';
@@ -26,7 +26,7 @@ curRoutes.post('/accounts/:id/cur/discover', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const connection = await loadConnection(db, orgId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
@@ -52,7 +52,7 @@ curRoutes.get('/accounts/:id/cur/manifest', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const connection = await loadConnection(db, orgId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
@@ -89,7 +89,7 @@ curRoutes.post('/accounts/:id/cur/ingest-step', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const body = (await c.req.json().catch(() => ({}))) as IngestStepBody;
     if (!body.reportKey) return errJson(400, 'reportKey is required');
@@ -126,7 +126,7 @@ curRoutes.post('/accounts/:id/cur/finalize', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const connection = await loadConnection(db, orgId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');

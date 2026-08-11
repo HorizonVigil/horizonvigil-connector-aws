@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMember, getOrgConnectionIds, inFilter, guarded, okJson, type Env } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson, type Env } from '@cloudops360/shared-lib';
 import { notCurrentlyExcludedFilter } from '../lib/exclusions';
 
 export const recommendationsRoutes = new Hono<{ Bindings: Env }>();
@@ -9,7 +9,7 @@ recommendationsRoutes.get('/accounts/:id/recommendations', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'optimization', 'read');
 
     const rows = await db.select('cost_recommendations', {
       select: 'id,category,issue,recommended_action,potential_monthly_savings,priority,status',
@@ -27,7 +27,7 @@ recommendationsRoutes.get('/recommendations', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'optimization', 'read');
 
     const connectionIds = await getOrgConnectionIds(db, orgId);
     const rows = await db.select<{ potential_monthly_savings: string }[]>('cost_recommendations', {

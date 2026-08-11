@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMember, getOrgConnectionIds, inFilter, guarded, okJson, errJson, type Env } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson, errJson, type Env } from '@cloudops360/shared-lib';
 
 export const regionsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -21,7 +21,7 @@ regionsRoutes.get('/regions', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const connections = await db.select<{ id: string; scan_regions: string[] }[]>('cloud_connections', {
       select: 'id,scan_regions',
@@ -68,7 +68,7 @@ regionsRoutes.get('/accounts/:id/regions', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const rows = await db.select<{ id: string; scan_regions: string[]; default_region: string; last_discovery_at: string | null }[]>('cloud_connections', {
       select: 'id,scan_regions,default_region,last_discovery_at',

@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMember, getOrgConnectionIds, inFilter, guarded, errJson, type Env } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, errJson, type Env } from '@cloudops360/shared-lib';
 
 export const reportsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -28,7 +28,7 @@ reportsRoutes.get('/reports/:kind', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const connectionIds = await getOrgConnectionIds(db, orgId);
     const connections = await db.select<Record<string, unknown>[]>('cloud_connections', {

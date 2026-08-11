@@ -10,7 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@cloudops360/shared-lib": "github:kknr8367/cloudops-shared-lib#v1.0.7",
+    "@cloudops360/shared-lib": "github:kknr8367/cloudops-shared-lib#v1.0.10",
     "@hono/node-server": "^1.13.7",
     "aws4fetch": "^1.0.20",
     "hono": "^4.6.0",

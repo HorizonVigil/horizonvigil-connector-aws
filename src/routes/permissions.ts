@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireRole, requireMember, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson, type Db } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson, type Db } from '@cloudops360/shared-lib';
 import type { Env } from '../env';
 import { decryptCredentials } from '../lib/crypto';
 import { assumeConnectionRole } from '../lib/assumeRole';
@@ -46,7 +46,7 @@ permissionsRoutes.post('/accounts/:id/permissions/validate', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const rows = await db.select<ResolvableConnection[]>('cloud_connections', {
       select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
@@ -146,7 +146,7 @@ permissionsRoutes.get('/accounts/:id/permissions', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const latest = await latestRunFor(db, c.req.param('id'));
     return okJson(latest ?? { run: null, checks: [] });
@@ -159,7 +159,7 @@ permissionsRoutes.get('/accounts/:id/sync-history', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const runs = await db.select('connection_validation_runs', {
       select: 'id,status,identity_arn,identity_account_id,started_at,finished_at,error_message,triggered_by',
@@ -177,7 +177,7 @@ permissionsRoutes.get('/permissions', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const connectionIds = await getOrgConnectionIds(db, orgId);
     const connections = await db.select<{ id: string; connection_name: string; last_permission_check_at: string | null }[]>('cloud_connections', {

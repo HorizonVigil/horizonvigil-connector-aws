@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireRole, requireMember, inFilter, writeAuditLog, guarded, okJson, errJson, type Db } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, inFilter, writeAuditLog, guarded, okJson, errJson, type Db } from '@cloudops360/shared-lib';
 import type { Env } from '../env';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
 import { scanEc2, EC2_RESOURCE_TYPES } from '../lib/scanners/ec2';
@@ -238,7 +238,7 @@ discoveryRoutes.get('/accounts/:id/discovery/steps', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const connection = await loadConnection(db, orgId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
@@ -476,7 +476,7 @@ discoveryRoutes.post('/accounts/:id/discovery/run-step', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const body = (await c.req.json().catch(() => ({}))) as { stepId?: string };
     const stepId = body.stepId;
@@ -569,7 +569,7 @@ discoveryRoutes.post('/accounts/:id/discovery/finalize', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const body = (await c.req.json().catch(() => ({}))) as { runStartedAt?: string; stepErrors?: StepErrorInput[] };
     if (!body.runStartedAt) return errJson(400, 'runStartedAt is required');

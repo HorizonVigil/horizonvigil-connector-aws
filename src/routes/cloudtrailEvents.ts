@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMember, guarded, okJson, errJson } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, guarded, okJson, errJson } from '@cloudops360/shared-lib';
 import type { Env } from '../env';
 import { callJsonApi } from '../lib/awsApi';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
@@ -70,7 +70,7 @@ cloudtrailEventsRoutes.get('/accounts/:id/cloudtrail-events', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const rows = await db.select<ResolvableConnection[]>('cloud_connections', {
       select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',

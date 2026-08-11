@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireRole, requireMember, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError } from '@cloudops360/shared-lib';
 import type { Env } from '../env';
 import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '../lib/crypto';
 
@@ -13,7 +13,7 @@ accountsRoutes.get('/accounts', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const url = new URL(c.req.url);
     const pagination = parsePagination(url);
@@ -59,7 +59,7 @@ accountsRoutes.get('/accounts/:id', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const rows = await db.select('cloud_connections', {
       select: LIST_SELECT,
@@ -91,7 +91,7 @@ accountsRoutes.post('/accounts', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['admin', 'owner']);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'admin');
 
     const body = (await c.req.json().catch(() => ({}))) as ConnectBody;
     if (!body.connectionName) return errJson(400, 'connectionName is required');
@@ -160,7 +160,7 @@ accountsRoutes.put('/accounts/:id', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const body = (await c.req.json().catch(() => ({}))) as UpdateBody;
     const patch: Record<string, unknown> = {};
@@ -202,7 +202,7 @@ accountsRoutes.put('/accounts/:id/credentials', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const rows = await db.select<{ id: string; connection_method: string }[]>('cloud_connections', {
       select: 'id,connection_method',
@@ -260,7 +260,7 @@ accountsRoutes.put('/accounts/:id/role', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const rows = await db.select<{ id: string; connection_method: string }[]>('cloud_connections', {
       select: 'id,connection_method',
@@ -301,7 +301,7 @@ accountsRoutes.delete('/accounts/:id', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['admin', 'owner']);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'admin');
 
     const rows = await db.update<Record<string, unknown>[]>(
       'cloud_connections',
@@ -330,7 +330,7 @@ accountsRoutes.delete('/accounts/:id/permanently', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['admin', 'owner']);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'admin');
 
     const rows = await db.select<{ id: string; connection_name: string; aws_account_id: string }[]>('cloud_connections', {
       select: 'id,connection_name,aws_account_id',
@@ -366,7 +366,7 @@ accountsRoutes.post('/accounts/:id/test', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireRole(db, auth.userId, orgId, ['editor'], true);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const rows = await db.select<Record<string, unknown>[]>('cloud_connections', {
       select: 'id,connection_method,credentials_encrypted,role_arn,external_id',

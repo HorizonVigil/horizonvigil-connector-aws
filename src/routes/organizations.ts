@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMember, guarded, okJson, errJson } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, guarded, okJson, errJson } from '@cloudops360/shared-lib';
 import type { Env } from '../env';
 
 export const orgHierarchyRoutes = new Hono<{ Bindings: Env }>();
@@ -14,7 +14,7 @@ orgHierarchyRoutes.get('/organizations', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const rows = await db.select<{ aws_account_id: string; connection_name: string; environment: string; status: string }[]>('cloud_connections', {
       select: 'aws_account_id,connection_name,environment,status',
@@ -40,7 +40,7 @@ orgHierarchyRoutes.get('/cross-account-roles', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const rows = await db.select('cloud_connections', {
       select: 'id,connection_name,aws_account_id,role_arn,external_id,status,created_at',
@@ -56,7 +56,7 @@ orgHierarchyRoutes.get('/credentials/:id', (c) =>
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMember(db, auth.userId, orgId);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const rows = await db.select<
       { connection_method: string; masked_access_key: string | null; key_rotated_at: string | null; role_arn: string | null; external_id: string | null }[]
