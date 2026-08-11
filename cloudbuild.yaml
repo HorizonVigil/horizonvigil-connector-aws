@@ -1,0 +1,24 @@
+# Manual-deploy fallback for when `gcloud run deploy --source .` can't be
+# used (GitHub Actions CI is account-wide blocked on a billing failure this
+# session). Needed specifically because the shared-lib git dependency
+# requires an authenticated clone (see Dockerfile) and the plain
+# `gcloud run deploy --source` path has no way to inject a build secret
+# without BuildKit, which this project's default Cloud Build docker builder
+# doesn't reliably have available.
+#
+# Usage: gcloud builds submit --config=cloudbuild.yaml --region=us-central1 .
+#        gcloud run deploy connector-aws --image=us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest --region=us-central1
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        docker build --build-arg GH_PAT="$$GH_PAT" -t us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest .
+    secretEnv: ['GH_PAT']
+availableSecrets:
+  secretManager:
+    - versionName: projects/cloudops360/secrets/gh_pat/versions/latest
+      env: 'GH_PAT'
+images:
+  - 'us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest'
