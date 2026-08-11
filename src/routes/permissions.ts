@@ -179,7 +179,7 @@ permissionsRoutes.get('/permissions', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
-    const connectionIds = await getOrgConnectionIds(db, orgId);
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
     const connections = await db.select<{ id: string; connection_name: string; last_permission_check_at: string | null }[]>('cloud_connections', {
       select: 'id,connection_name,last_permission_check_at',
       filters: { id: inFilter(connectionIds), provider: 'eq.aws' },

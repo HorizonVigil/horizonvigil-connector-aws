@@ -30,7 +30,7 @@ reportsRoutes.get('/reports/:kind', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
-    const connectionIds = await getOrgConnectionIds(db, orgId);
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
     const connections = await db.select<Record<string, unknown>[]>('cloud_connections', {
       select: 'id,connection_name,aws_account_id,status,environment,connection_method,default_region,last_sync_at,last_permission_check_at,error_message',
       filters: { id: inFilter(connectionIds), provider: 'eq.aws' },

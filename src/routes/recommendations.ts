@@ -29,7 +29,7 @@ recommendationsRoutes.get('/recommendations', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'optimization', 'read');
 
-    const connectionIds = await getOrgConnectionIds(db, orgId);
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
     const rows = await db.select<{ potential_monthly_savings: string }[]>('cost_recommendations', {
       select: 'potential_monthly_savings',
       filters: { connection_id: inFilter(connectionIds), status: 'eq.open', or: notCurrentlyExcludedFilter() },
