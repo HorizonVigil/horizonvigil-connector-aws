@@ -20,14 +20,14 @@ export const internalScanRoutes = new Hono<{ Bindings: Env }>();
  *
  * 1. A shared secret (INTERNAL_SCAN_SECRET) in the X-Internal-Scan-Secret
  *    header authenticates the caller as "this really is our own scheduler,
- *    not a public request" — not currently configured in any environment
- *    (see env.ts), same "not provisioned yet" honesty this codebase already
- *    uses for PLATFORM_AWS_ACCESS_KEY_ID/etc.
- * 2. SUPABASE_SERVICE_ROLE_KEY (also not currently configured anywhere —
- *    confirmed via `gcloud run services describe`, not assumed) authenticates
- *    to Postgres as a service, bypassing RLS, since there's no per-user
- *    access token to forward. Without it this handler fails cleanly with a
- *    503 rather than silently doing nothing or crashing.
+ *    not a public request". Configured as a Cloud Run env var and matched
+ *    against the Cloud Scheduler job `scheduled-scan-aws`, which fires this
+ *    endpoint daily at 00:00 IST (see cloud_connections.auto_scan_enabled/
+ *    scan_interval_hours, which default to true/24 for every connection).
+ * 2. SUPABASE_SERVICE_ROLE_KEY authenticates to Postgres as a service,
+ *    bypassing RLS, since there's no per-user access token to forward.
+ *    Without it this handler fails cleanly with a 503 rather than silently
+ *    doing nothing or crashing.
  *
  * Runs every step for each due connection sequentially in one request
  * (unlike the browser-driven loop, which fires each step as its own HTTP
