@@ -3,7 +3,7 @@ import { AwsV4Signer } from 'aws4fetch';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
-export const EKS_WORKLOAD_RESOURCE_TYPES = ['eks_pod', 'eks_deployment', 'eks_namespace', 'eks_node'] as const;
+export const EKS_WORKLOAD_RESOURCE_TYPES = ['eks_pod', 'eks_deployment', 'eks_namespace', 'eks_node', 'eks_auth_mapping'] as const;
 
 /**
  * VERIFIED against a real EKS cluster (2026-08-06) — deployed a real
@@ -222,6 +222,63 @@ function isNodeReady(node: K8sNode): boolean {
   return node.status?.conditions?.find((c) => c.type === 'Ready')?.status === 'True';
 }
 
+interface AuthMapEntry { arn: string; username?: string; groups: string[] }
+
+/**
+ * Minimal parser for aws-auth's mapRoles/mapUsers YAML strings -- not a
+ * general YAML parser (this codebase avoids heavy parsing dependencies the
+ * same way xmlList.ts hand-rolls XML extraction instead of pulling in a DOM
+ * parser), scoped exactly to the fixed, well-known block-list shape AWS's
+ * own aws-auth documentation always produces:
+ *   - rolearn: arn:...
+ *     username: ...
+ *     groups:
+ *       - system:masters
+ * Relies on indentation (0 = new entry, >0 = a field of the current entry,
+ * a further-indented "- " = a groups member) rather than a real YAML
+ * grammar. A hand-edited ConfigMap with flow-style groups (`groups:
+ * [a, b]`) or unusual indentation won't parse correctly -- rare in
+ * practice (every AWS/eksctl-generated aws-auth uses exactly this shape),
+ * and a partial/empty result here is far less costly than it would be for
+ * pods/deployments, since this is additive IAM-mapping context, not core
+ * workload discovery.
+ */
+function parseAuthMapYaml(yaml: string): AuthMapEntry[] {
+  const entries: AuthMapEntry[] = [];
+  let current: AuthMapEntry | null = null;
+  let inGroups = false;
+  const stripQuotes = (s: string) => s.replace(/^['"]|['"]$/g, '');
+  const applyField = (entry: AuthMapEntry, fieldLine: string) => {
+    const colonIdx = fieldLine.indexOf(':');
+    if (colonIdx === -1) return;
+    const key = fieldLine.slice(0, colonIdx).trim();
+    const value = stripQuotes(fieldLine.slice(colonIdx + 1).trim());
+    if (key === 'rolearn' || key === 'userarn') entry.arn = value;
+    else if (key === 'username') entry.username = value;
+  };
+
+  for (const rawLine of yaml.split('\n')) {
+    const line = rawLine.replace(/\r$/, '');
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const leadingSpaces = line.length - line.trimStart().length;
+    const content = line.trim();
+
+    if (leadingSpaces === 0 && content.startsWith('- ')) {
+      if (current) entries.push(current);
+      current = { arn: '', groups: [] };
+      inGroups = false;
+      applyField(current, content.slice(2));
+    } else if (current && content.startsWith('- ')) {
+      if (inGroups) current.groups.push(stripQuotes(content.slice(2).trim()));
+    } else if (current) {
+      inGroups = content.startsWith('groups:');
+      if (!inGroups) applyField(current, content);
+    }
+  }
+  if (current) entries.push(current);
+  return entries.filter(e => e.arn);
+}
+
 async function callK8sApi(endpoint: string, caCertPem: string, bearerToken: string, path: string): Promise<{ ok: boolean; status: number; body: unknown; forbidden: boolean }> {
   const agent = new Agent({ connect: { ca: caCertPem } });
   const res = await undiciFetch(`${endpoint}${path}`, {
@@ -374,6 +431,35 @@ export async function scanEksWorkloads(ctx: ScannerContext): Promise<ScannedReso
           relationships: { clusterName: name },
         });
       }
+    }
+
+    // The legacy (pre-2023) auth mechanism, still the only one on
+    // CONFIG_MAP-only clusters and often present alongside access entries
+    // (eks.ts) on API_AND_CONFIG_MAP ones. Best-effort and additive, not
+    // folded into forbiddenClusters/thrown like pods/deployments/
+    // namespaces/nodes above: a cluster on pure "API" auth mode
+    // legitimately has no aws-auth ConfigMap at all (404, not an error),
+    // and losing this one piece of IAM-mapping context shouldn't cost the
+    // real workload data already collected for this cluster this run.
+    const authMapResult = await callK8sApi(detail.endpoint, caCertPem, token, '/api/v1/namespaces/kube-system/configmaps/aws-auth');
+    if (authMapResult.ok) {
+      const cm = authMapResult.body as { data?: { mapRoles?: string; mapUsers?: string } };
+      for (const entry of parseAuthMapYaml(cm.data?.mapRoles ?? '')) {
+        out.push({
+          resourceTypeKey: 'eks_auth_mapping', resourceId: `${clusterId}/role/${entry.arn}`, region: ctx.region, resourceName: entry.arn.split('/').pop(),
+          metadata: { kind: 'role', arn: entry.arn, username: entry.username, groups: entry.groups },
+          relationships: { clusterName: name },
+        });
+      }
+      for (const entry of parseAuthMapYaml(cm.data?.mapUsers ?? '')) {
+        out.push({
+          resourceTypeKey: 'eks_auth_mapping', resourceId: `${clusterId}/user/${entry.arn}`, region: ctx.region, resourceName: entry.arn.split('/').pop(),
+          metadata: { kind: 'user', arn: entry.arn, username: entry.username, groups: entry.groups },
+          relationships: { clusterName: name },
+        });
+      }
+    } else if (authMapResult.status !== 404 && !authMapResult.forbidden) {
+      console.error(`aws-auth ConfigMap fetch failed for cluster ${clusterId} (continuing without it): HTTP ${authMapResult.status}`);
     }
   }
 

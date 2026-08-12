@@ -2,7 +2,7 @@ import { createAwsClient } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
-export const EKS_RESOURCE_TYPES = ['eks_cluster', 'eks_nodegroup', 'eks_addon', 'eks_fargate_profile', 'eks_identity_provider_config'] as const;
+export const EKS_RESOURCE_TYPES = ['eks_cluster', 'eks_nodegroup', 'eks_addon', 'eks_fargate_profile', 'eks_identity_provider_config', 'eks_access_entry'] as const;
 
 interface EksClusterDetail {
   name: string; arn?: string; status?: string; version?: string; endpoint?: string;
@@ -15,6 +15,16 @@ interface EksClusterDetail {
   encryptionConfig?: { resources?: string[]; provider?: { keyArn?: string } }[];
   health?: { issues?: { code?: string; message?: string; resourceIds?: string[] }[] };
   accessConfig?: { authenticationMode?: string };
+  // IRSA (IAM Roles for Service Accounts) hinges on this issuer being
+  // registered as an IAM OIDC identity provider (a separate, account-wide
+  // IAM object, already captured by iam.ts's own scanner as
+  // iam_oidc_provider) -- not re-fetched here, the frontend cross-references
+  // this URL against those existing rows instead of duplicating the IAM call.
+  identity?: { oidc?: { issuer?: string } };
+}
+interface EksAccessEntryDetail {
+  principalArn?: string; kubernetesGroups?: string[]; username?: string; type?: string;
+  createdAt?: string; modifiedAt?: string;
 }
 interface EksNodegroupDetail {
   nodegroupName: string; status?: string; instanceTypes?: string[]; amiType?: string; createdAt?: string;
@@ -94,6 +104,7 @@ export async function scanEks(ctx: ScannerContext): Promise<ScannedResource[]> {
           secretsEncryptionKeyArn: cluster.encryptionConfig?.find(e => e.resources?.includes('secrets'))?.provider?.keyArn ?? null,
           healthIssues: cluster.health?.issues ?? [],
           authenticationMode: cluster.accessConfig?.authenticationMode,
+          oidcIssuerUrl: cluster.identity?.oidc?.issuer,
         },
         relationships: { roleArn: cluster.roleArn, vpcId: vpcConfig?.vpcId },
       });
@@ -139,6 +150,34 @@ export async function scanEks(ctx: ScannerContext): Promise<ScannedResource[]> {
     const idpList = await getJson(`/clusters/${encodeURIComponent(name)}/identity-provider-configs`);
     for (const idp of (idpList?.identityProviderConfigs as { name: string; type: string }[] | undefined) ?? []) {
       out.push({ resourceTypeKey: 'eks_identity_provider_config', resourceId: `${name}/${idp.name}`, region: ctx.region, resourceName: idp.name, metadata: { type: idp.type }, relationships: { clusterName: name } });
+    }
+
+    // Access entries — the modern (2023+) replacement for the aws-auth
+    // ConfigMap, only present on clusters using API/API_AND_CONFIG_MAP
+    // authentication mode (accessConfig.authenticationMode, already
+    // captured above). A cluster in CONFIG_MAP-only mode legitimately has
+    // zero of these; eksworkloads.ts separately parses the ConfigMap itself
+    // for that case, since the two mechanisms are mutually exclusive per
+    // principal but a cluster can genuinely use both at once.
+    const entriesList = await getJson(`/clusters/${encodeURIComponent(name)}/access-entries`);
+    const entryArns = ((entriesList?.accessEntries as string[] | undefined) ?? []).slice(0, 20);
+    for (const principalArn of entryArns) {
+      const encodedArn = encodeURIComponent(principalArn);
+      const [entryDetail, policiesResult] = await Promise.all([
+        getJson(`/clusters/${encodeURIComponent(name)}/access-entries/${encodedArn}`),
+        getJson(`/clusters/${encodeURIComponent(name)}/access-entries/${encodedArn}/access-policies`),
+      ]);
+      const entry = entryDetail?.accessEntry as EksAccessEntryDetail | undefined;
+      const policies = (policiesResult?.associatedAccessPolicies as { policyArn?: string; accessScope?: { type?: string; namespaces?: string[] } }[] | undefined) ?? [];
+      out.push({
+        resourceTypeKey: 'eks_access_entry', resourceId: `${name}/${principalArn}`, region: ctx.region, resourceName: principalArn.split('/').pop(),
+        metadata: {
+          principalArn, type: entry?.type, kubernetesGroups: entry?.kubernetesGroups ?? [], username: entry?.username,
+          createdAt: entry?.createdAt, modifiedAt: entry?.modifiedAt,
+          associatedPolicies: policies.map(p => ({ policyArn: p.policyArn, scopeType: p.accessScope?.type, namespaces: p.accessScope?.namespaces })),
+        },
+        relationships: { clusterName: name },
+      });
     }
   }
 
