@@ -36,9 +36,25 @@ export const internalScanRoutes = new Hono<{ Bindings: Env }>();
  * reached this cycle are picked up on Cloud Scheduler's next tick, at worst
  * a bit later than their configured interval, never skipped entirely (their
  * next_scheduled_scan_at isn't advanced until they're actually run).
+ *
+ * MAX_STEPS_PER_CONNECTION was originally 60, sized for Cloudflare Workers'
+ * free-tier CPU/subrequest budget per invocation — stale now that this runs
+ * on Cloud Run (1800s request timeout, no such per-invocation cap). At 60,
+ * a 17-region connection with ~55 regional scanners couldn't even finish a
+ * single region before hitting the cap, since `steps` always starts at
+ * regions[0] with no persisted cross-run cursor — meaning the scheduled
+ * path would scan the exact same handful of region-1 scanners every single
+ * day, forever, and never reach the other 16 regions at all. Raised to
+ * comfortably cover a full sweep (17 regions x ~55 scanners + globals +
+ * findings + metrics is roughly 1,100 steps) for one connection well within
+ * the request timeout even at a pessimistic ~300ms/call.
  */
-const MAX_CONNECTIONS_PER_RUN = 5;
-const MAX_STEPS_PER_CONNECTION = 60;
+// MAX_CONNECTIONS_PER_RUN lowered from 5 to keep the worst case (every due
+// connection needing a full sweep in the same invocation) safely under the
+// 1800s Cloud Run request timeout: 3 x 1500 x ~300ms ~= 1350s, versus
+// 5 x 1500 that could exceed it.
+const MAX_CONNECTIONS_PER_RUN = 3;
+const MAX_STEPS_PER_CONNECTION = 1500;
 
 interface ConnectionDue { id: string; org_id: string; scan_interval_hours: number }
 
