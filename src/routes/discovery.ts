@@ -586,7 +586,7 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   const realErrors = stepErrors.filter((e) => e.severity !== 'info');
   const summary = {
     scannedAt: now, totalResources: activeCount, categoryCounts: activeCategoryCounts,
-    servicesTotal: `${Object.keys(REGIONAL_SCANNERS).length + Object.keys(GLOBAL_SCANNERS).length} live / 241 catalogued`,
+    servicesTotal: `${Object.keys(REGIONAL_SCANNERS).length + Object.keys(GLOBAL_SCANNERS).length} live / 245 catalogued`,
     regionsScanned: regionsFor(connection), errors: stepErrors.slice(0, 20),
   };
 
