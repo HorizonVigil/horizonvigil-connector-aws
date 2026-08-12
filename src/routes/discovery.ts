@@ -47,6 +47,24 @@ import { scanGlue, GLUE_RESOURCE_TYPES } from '../lib/scanners/glue';
 import { scanKafka, KAFKA_RESOURCE_TYPES } from '../lib/scanners/kafka';
 import { scanSageMaker, SAGEMAKER_RESOURCE_TYPES } from '../lib/scanners/sagemaker';
 import { scanApiGateway, APIGATEWAY_RESOURCE_TYPES } from '../lib/scanners/apigateway';
+import { scanAccessAnalyzer, ACCESSANALYZER_RESOURCE_TYPES } from '../lib/scanners/accessanalyzer';
+import { scanConfig, CONFIG_RESOURCE_TYPES } from '../lib/scanners/config';
+import { scanFms, FMS_RESOURCE_TYPES } from '../lib/scanners/fms';
+import { scanNetworkFirewall, NETWORKFIREWALL_RESOURCE_TYPES } from '../lib/scanners/networkfirewall';
+import { scanDirectoryService, DIRECTORYSERVICE_RESOURCE_TYPES } from '../lib/scanners/directoryservice';
+import { scanRam, RAM_RESOURCE_TYPES } from '../lib/scanners/ram';
+import { scanCloudHsm, CLOUDHSM_RESOURCE_TYPES } from '../lib/scanners/cloudhsm';
+import { scanDetective, DETECTIVE_RESOURCE_TYPES } from '../lib/scanners/detective';
+import { scanControlTower, CONTROLTOWER_RESOURCE_TYPES } from '../lib/scanners/controltower';
+import { scanResilienceHub, RESILIENCEHUB_RESOURCE_TYPES } from '../lib/scanners/resiliencehub';
+import { scanResourceGroups, RESOURCEGROUPS_RESOURCE_TYPES } from '../lib/scanners/resourcegroups';
+import { scanWellArchitected, WELLARCHITECTED_RESOURCE_TYPES } from '../lib/scanners/wellarchitected';
+import { scanComputeOptimizer, COMPUTEOPTIMIZER_RESOURCE_TYPES } from '../lib/scanners/computeoptimizer';
+import { scanServiceCatalog, SERVICECATALOG_RESOURCE_TYPES } from '../lib/scanners/servicecatalog';
+import { scanTrustedAdvisorResource, TRUSTEDADVISOR_RESOURCE_TYPES } from '../lib/scanners/trustedAdvisorResource';
+import { scanShield, SHIELD_RESOURCE_TYPES } from '../lib/scanners/shield';
+import { scanOrganizations, ORGANIZATIONS_RESOURCE_TYPES } from '../lib/scanners/organizations';
+import { scanHealth, HEALTH_RESOURCE_TYPES } from '../lib/scanners/health';
 import { scanGuardDutyFindings } from '../lib/scanners/guarddutyFindings';
 import { scanSecurityHubFindings } from '../lib/scanners/securityhubFindings';
 import { scanAccessAnalyzerFindings } from '../lib/scanners/accessAnalyzerFindings';
@@ -142,12 +160,30 @@ export const REGIONAL_SCANNERS: Record<string, ScannerFn> = {
   kafka: scanKafka,
   sagemaker: scanSageMaker,
   apigateway: scanApiGateway,
+  accessanalyzer: scanAccessAnalyzer,
+  config: scanConfig,
+  fms: scanFms,
+  networkfirewall: scanNetworkFirewall,
+  ds: scanDirectoryService,
+  ram: scanRam,
+  cloudhsm: scanCloudHsm,
+  detective: scanDetective,
+  controltower: scanControlTower,
+  resiliencehub: scanResilienceHub,
+  resourcegroups: scanResourceGroups,
+  wellarchitected: scanWellArchitected,
+  computeoptimizer: scanComputeOptimizer,
+  servicecatalog: scanServiceCatalog,
 };
 export const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
   iam: scanIam,
   s3: scanS3,
   route53: scanRoute53,
   cloudfront: scanCloudFront,
+  trustedadvisorresource: scanTrustedAdvisorResource,
+  shield: scanShield,
+  organizations: scanOrganizations,
+  health: scanHealth,
 };
 
 /**
@@ -254,6 +290,24 @@ export const SCANNER_RESOURCE_TYPES: Record<string, readonly string[]> = {
   kafka: KAFKA_RESOURCE_TYPES,
   sagemaker: SAGEMAKER_RESOURCE_TYPES,
   apigateway: APIGATEWAY_RESOURCE_TYPES,
+  accessanalyzer: ACCESSANALYZER_RESOURCE_TYPES,
+  config: CONFIG_RESOURCE_TYPES,
+  fms: FMS_RESOURCE_TYPES,
+  networkfirewall: NETWORKFIREWALL_RESOURCE_TYPES,
+  ds: DIRECTORYSERVICE_RESOURCE_TYPES,
+  ram: RAM_RESOURCE_TYPES,
+  cloudhsm: CLOUDHSM_RESOURCE_TYPES,
+  detective: DETECTIVE_RESOURCE_TYPES,
+  controltower: CONTROLTOWER_RESOURCE_TYPES,
+  resiliencehub: RESILIENCEHUB_RESOURCE_TYPES,
+  resourcegroups: RESOURCEGROUPS_RESOURCE_TYPES,
+  wellarchitected: WELLARCHITECTED_RESOURCE_TYPES,
+  computeoptimizer: COMPUTEOPTIMIZER_RESOURCE_TYPES,
+  servicecatalog: SERVICECATALOG_RESOURCE_TYPES,
+  trustedadvisorresource: TRUSTEDADVISOR_RESOURCE_TYPES,
+  shield: SHIELD_RESOURCE_TYPES,
+  organizations: ORGANIZATIONS_RESOURCE_TYPES,
+  health: HEALTH_RESOURCE_TYPES,
 };
 const COVERED_RESOURCE_TYPES = Object.values(SCANNER_RESOURCE_TYPES).flat();
 
