@@ -35,7 +35,19 @@ export async function scanEks(ctx: ScannerContext): Promise<ScannedResource[]> {
   };
 
   const out: ScannedResource[] = [];
-  const list = await getJson('/clusters');
+  // Unlike every per-cluster detail call below (best-effort, one bad
+  // cluster shouldn't lose the others), a failed ListClusters itself must
+  // not be swallowed to []: that's indistinguishable from an honest
+  // zero-cluster account, and is exactly the failure mode reported when
+  // eksworkloads.ts's own independent ListClusters call (verified working
+  // against a real cluster) found real nodes/namespaces the same run this
+  // scanner reported zero clusters -- a scan-time permission or transient
+  // API issue on this specific call would explain that gap; silently
+  // returning [] here made it undiagnosable.
+  const listRes = await client.fetch(`${base}/clusters`, { method: 'GET' });
+  const listText = await listRes.text();
+  if (!listRes.ok) throw new Error(`EKS ListClusters failed in ${ctx.region}: HTTP ${listRes.status} ${listText.slice(0, 300)}`);
+  const list = listText ? (JSON.parse(listText) as Record<string, unknown>) : {};
   const names = ((list?.clusters as string[] | undefined) ?? []).slice(0, 10);
 
   for (const name of names) {
