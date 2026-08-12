@@ -33,6 +33,20 @@ import { scanCloudTrail, CLOUDTRAIL_RESOURCE_TYPES } from '../lib/scanners/cloud
 import { scanSsm, SSM_RESOURCE_TYPES } from '../lib/scanners/ssm';
 import { scanEvents, EVENTS_RESOURCE_TYPES } from '../lib/scanners/events';
 import { scanStates, STATES_RESOURCE_TYPES } from '../lib/scanners/states';
+import { scanKinesis, KINESIS_RESOURCE_TYPES } from '../lib/scanners/kinesis';
+import { scanAthena, ATHENA_RESOURCE_TYPES } from '../lib/scanners/athena';
+import { scanBatch, BATCH_RESOURCE_TYPES } from '../lib/scanners/batch';
+import { scanCodeBuild, CODEBUILD_RESOURCE_TYPES } from '../lib/scanners/codebuild';
+import { scanCodePipeline, CODEPIPELINE_RESOURCE_TYPES } from '../lib/scanners/codepipeline';
+import { scanCognito, COGNITO_RESOURCE_TYPES } from '../lib/scanners/cognito';
+import { scanDocDb, DOCDB_RESOURCE_TYPES } from '../lib/scanners/docdb';
+import { scanNeptune, NEPTUNE_RESOURCE_TYPES } from '../lib/scanners/neptune';
+import { scanElasticBeanstalk, ELASTICBEANSTALK_RESOURCE_TYPES } from '../lib/scanners/elasticbeanstalk';
+import { scanEmr, EMR_RESOURCE_TYPES } from '../lib/scanners/emr';
+import { scanGlue, GLUE_RESOURCE_TYPES } from '../lib/scanners/glue';
+import { scanKafka, KAFKA_RESOURCE_TYPES } from '../lib/scanners/kafka';
+import { scanSageMaker, SAGEMAKER_RESOURCE_TYPES } from '../lib/scanners/sagemaker';
+import { scanApiGateway, APIGATEWAY_RESOURCE_TYPES } from '../lib/scanners/apigateway';
 import { scanGuardDutyFindings } from '../lib/scanners/guarddutyFindings';
 import { scanSecurityHubFindings } from '../lib/scanners/securityhubFindings';
 import { scanAccessAnalyzerFindings } from '../lib/scanners/accessAnalyzerFindings';
@@ -114,6 +128,20 @@ export const REGIONAL_SCANNERS: Record<string, ScannerFn> = {
   ssm: scanSsm,
   events: scanEvents,
   states: scanStates,
+  kinesis: scanKinesis,
+  athena: scanAthena,
+  batch: scanBatch,
+  codebuild: scanCodeBuild,
+  codepipeline: scanCodePipeline,
+  cognito: scanCognito,
+  docdb: scanDocDb,
+  neptune: scanNeptune,
+  elasticbeanstalk: scanElasticBeanstalk,
+  emr: scanEmr,
+  glue: scanGlue,
+  kafka: scanKafka,
+  sagemaker: scanSageMaker,
+  apigateway: scanApiGateway,
 };
 export const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
   iam: scanIam,
@@ -212,6 +240,20 @@ const SCANNER_RESOURCE_TYPES: Record<string, readonly string[]> = {
   ssm: SSM_RESOURCE_TYPES,
   events: EVENTS_RESOURCE_TYPES,
   states: STATES_RESOURCE_TYPES,
+  kinesis: KINESIS_RESOURCE_TYPES,
+  athena: ATHENA_RESOURCE_TYPES,
+  batch: BATCH_RESOURCE_TYPES,
+  codebuild: CODEBUILD_RESOURCE_TYPES,
+  codepipeline: CODEPIPELINE_RESOURCE_TYPES,
+  cognito: COGNITO_RESOURCE_TYPES,
+  docdb: DOCDB_RESOURCE_TYPES,
+  neptune: NEPTUNE_RESOURCE_TYPES,
+  elasticbeanstalk: ELASTICBEANSTALK_RESOURCE_TYPES,
+  emr: EMR_RESOURCE_TYPES,
+  glue: GLUE_RESOURCE_TYPES,
+  kafka: KAFKA_RESOURCE_TYPES,
+  sagemaker: SAGEMAKER_RESOURCE_TYPES,
+  apigateway: APIGATEWAY_RESOURCE_TYPES,
 };
 const COVERED_RESOURCE_TYPES = Object.values(SCANNER_RESOURCE_TYPES).flat();
 
