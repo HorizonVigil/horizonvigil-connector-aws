@@ -162,7 +162,7 @@ permissionsRoutes.get('/accounts/:id/sync-history', (c) =>
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
     const runs = await db.select('connection_validation_runs', {
-      select: 'id,status,identity_arn,identity_account_id,started_at,finished_at,error_message,triggered_by',
+      select: 'id,run_type,status,identity_arn,identity_account_id,started_at,finished_at,error_message,triggered_by',
       filters: { connection_id: `eq.${c.req.param('id')}` },
       order: 'started_at.desc',
       limit: 50,

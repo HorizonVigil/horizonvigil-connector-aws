@@ -603,6 +603,21 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
 
   await writeAuditLog(db, { orgId, actorId, action: 'aws_account.discovery_completed', targetType: 'cloud_connection', targetId: connection.id, metadata: { totalResources: activeCount, deleted: vanishedIds.length, findingsResolved: resolvedFindings.length, errors: realErrors.length } });
 
+  // Sync History used to only ever show permission-validation runs (see
+  // permissions.ts) -- a Discover Resources run never left a trace there at
+  // all, which looked like discovery silently wasn't happening even when it
+  // was. run_type distinguishes the two kinds of row on the same table
+  // rather than needing a second history endpoint.
+  await db.insert(
+    'connection_validation_runs',
+    {
+      connection_id: connection.id, run_type: 'discovery', status: realErrors.length > 0 ? 'failed' : 'succeeded',
+      started_at: runStartedAt, finished_at: now, triggered_by: actorId,
+      error_message: realErrors.length > 0 ? `${realErrors.length} scan step(s) failed: ${realErrors.slice(0, 3).map((e) => e.message).join('; ')}` : null,
+    },
+    'return=minimal',
+  );
+
   return { totalResources: activeCount, deleted: vanishedIds.length, findingsResolved: resolvedFindings.length, categoryCounts: activeCategoryCounts, errors: stepErrors };
 }
 
