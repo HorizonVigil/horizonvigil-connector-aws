@@ -1,4 +1,4 @@
-import { callQueryApi, callJsonApi, extractXmlField, type AwsCreds } from './awsApi';
+import { callQueryApi, callJsonApi, createAwsClient, extractXmlField, type AwsCreds } from './awsApi';
 
 export type CheckStatus = 'granted' | 'denied' | 'error' | 'not_applicable';
 
@@ -137,6 +137,36 @@ export async function checkCostExplorer(creds: AwsCreds): Promise<PermissionChec
   }
 }
 
+/**
+ * EKS ListClusters — REST-JSON (plain signed GET, same shape as eks.ts's own
+ * scanner call), added specifically because that scanner's failures were
+ * previously invisible: it caught every error and silently returned an
+ * empty cluster list, indistinguishable from an honest zero-cluster
+ * account. This surfaces the same call's real status/error here instead,
+ * so an account with real EKS infrastructure that keeps showing "0
+ * clusters" has an actual answer instead of silence.
+ */
+export async function checkEks(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  try {
+    const client = createAwsClient(creds, 'eks', region);
+    const res = await client.fetch(`https://eks.${region}.amazonaws.com/clusters`, { method: 'GET' });
+    const text = await res.text();
+    if (!res.ok) {
+      let detail = text.slice(0, 300);
+      try {
+        const parsed = JSON.parse(text) as { message?: string };
+        if (parsed.message) detail = parsed.message;
+      } catch { /* not JSON, use raw text above */ }
+      return { service: 'eks', label: 'EKS', status: res.status === 403 ? 'denied' : 'error', detail, verified: false };
+    }
+    const parsed = text ? (JSON.parse(text) as { clusters?: string[] }) : {};
+    const count = parsed.clusters?.length ?? 0;
+    return { service: 'eks', label: 'EKS', status: 'granted', detail: `Read access to EKS confirmed — ${count} cluster${count === 1 ? '' : 's'} found in ${region}`, verified: false };
+  } catch (err) {
+    return { service: 'eks', label: 'EKS', status: 'error', detail: err instanceof Error ? err.message : 'Request failed', verified: false };
+  }
+}
+
 export interface FullValidationResult {
   identity: IdentitySummary | null;
   checks: PermissionCheckResult[];
@@ -153,14 +183,15 @@ export async function runFullValidation(creds: AwsCreds, region: string): Promis
     return { identity: null, checks: [stsResult] };
   }
 
-  const [iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer] = await Promise.all([
+  const [iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks] = await Promise.all([
     checkIam(creds),
     checkOrganizations(creds),
     checkCloudWatch(creds, region),
     checkCloudTrail(creds, region),
     checkTaggingApi(creds, region),
     checkCostExplorer(creds),
+    checkEks(creds, region),
   ]);
 
-  return { identity, checks: [stsResult, iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer] };
+  return { identity, checks: [stsResult, iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks] };
 }
