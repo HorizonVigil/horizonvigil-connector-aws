@@ -2,10 +2,13 @@ import { createAwsClient } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
-export const SECURITYHUB_RESOURCE_TYPES = ['securityhub_hub'] as const;
+export const SECURITYHUB_RESOURCE_TYPES = ['securityhub_hub', 'securityhub_standard'] as const;
 
 interface HubDetail {
   HubArn?: string; SubscribedAt?: string; AutoEnableControls?: boolean;
+}
+interface StandardsSubscription {
+  StandardsSubscriptionArn: string; StandardsArn?: string; StandardsStatus?: string; StandardsStatusReason?: { StatusReasonCode?: string };
 }
 
 /**
@@ -27,8 +30,29 @@ export async function scanSecurityHub(ctx: ScannerContext): Promise<ScannedResou
 
   const hub = text ? (JSON.parse(text) as HubDetail) : {};
   if (!hub.HubArn) return [];
-  return [{
+
+  const out: ScannedResource[] = [{
     resourceTypeKey: 'securityhub_hub', resourceId: hub.HubArn, region: ctx.region, resourceName: `Security Hub (${ctx.region})`,
     metadata: { subscribedAt: hub.SubscribedAt, autoEnableControls: hub.AutoEnableControls },
   }];
+
+  // GetEnabledStandards — only meaningful once a hub exists (same "not
+  // subscribed" shape as DescribeHub above), so skipped entirely when it doesn't.
+  const stdRes = await client.fetch(`https://securityhub.${ctx.region}.amazonaws.com/standards/get`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+  });
+  const stdText = await stdRes.text();
+  if (!stdRes.ok) {
+    console.error(`Security Hub GetEnabledStandards failed in ${ctx.region} (continuing without it): HTTP ${stdRes.status} ${stdText.slice(0, 200)}`);
+    return out;
+  }
+  const subs = ((stdText ? JSON.parse(stdText) : {}) as { StandardsSubscriptions?: StandardsSubscription[] }).StandardsSubscriptions ?? [];
+  for (const s of subs) {
+    out.push({
+      resourceTypeKey: 'securityhub_standard', resourceId: s.StandardsSubscriptionArn, region: ctx.region,
+      resourceName: s.StandardsArn?.split('/').slice(-2, -1)[0],
+      state: s.StandardsStatus, metadata: { standardsArn: s.StandardsArn, statusReason: s.StandardsStatusReason?.StatusReasonCode },
+    });
+  }
+  return out;
 }

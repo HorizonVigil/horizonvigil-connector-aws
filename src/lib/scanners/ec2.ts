@@ -9,7 +9,10 @@ export const EC2_RESOURCE_TYPES = [
   'ec2_instance', 'ec2_ami', 'ec2_key_pair', 'ebs_volume', 'ebs_snapshot', 'security_group', 'elastic_ip',
   'network_interface', 'vpc', 'subnet', 'route_table', 'internet_gateway', 'nat_gateway', 'network_acl',
   'vpc_endpoint', 'vpc_peering_connection', 'ec2_launch_template', 'vpc_flow_log', 'ec2_placement_group',
-  'prefix_list',
+  'prefix_list', 'transit_gateway', 'transit_gateway_attachment', 'vpn_gateway', 'vpn_connection',
+  'customer_gateway', 'client_vpn_endpoint', 'egress_only_igw', 'ec2_capacity_reservation',
+  'ec2_dedicated_host', 'ec2_fleet', 'ec2_spot_fleet_request', 'ec2_spot_instance_request',
+  'reserved_instance', 'elastic_gpu',
 ] as const;
 
 /**
@@ -38,6 +41,9 @@ export async function scanEc2(ctx: ScannerContext): Promise<ScannedResource[]> {
     instances, images, keyPairs, volumes, snapshots, sgs, addresses, enis,
     vpcs, subnets, routeTables, igws, natGateways, nacls, vpcEndpoints, peerings,
     launchTemplates, flowLogs, placementGroups, prefixLists,
+    transitGateways, transitGatewayAttachments, vpnGateways, vpnConnections, customerGateways,
+    clientVpnEndpoints, egressOnlyIgws, capacityReservations, hosts, fleets,
+    spotFleetRequests, spotInstanceRequests, reservedInstances, elasticGpus,
   ] = await Promise.all([
     call('DescribeInstances'),
     call('DescribeImages', listParams('Owner', ['self'])),
@@ -59,6 +65,20 @@ export async function scanEc2(ctx: ScannerContext): Promise<ScannedResource[]> {
     call('DescribeFlowLogs'),
     call('DescribePlacementGroups'),
     call('DescribeManagedPrefixLists'),
+    call('DescribeTransitGateways'),
+    call('DescribeTransitGatewayAttachments'),
+    call('DescribeVpnGateways'),
+    call('DescribeVpnConnections'),
+    call('DescribeCustomerGateways'),
+    call('DescribeClientVpnEndpoints'),
+    call('DescribeEgressOnlyInternetGateways'),
+    call('DescribeCapacityReservations'),
+    call('DescribeHosts'),
+    call('DescribeFleets'),
+    call('DescribeSpotFleetRequests'),
+    call('DescribeSpotInstanceRequests'),
+    call('DescribeReservedInstances'),
+    call('DescribeElasticGpus'),
   ]);
 
   const out: ScannedResource[] = [];
@@ -163,6 +183,66 @@ export async function scanEc2(ctx: ScannerContext): Promise<ScannedResource[]> {
     if (field(pl, 'ownerId') === 'AWS') continue;
     const tags = tagsFromSet(pl);
     out.push({ resourceTypeKey: 'prefix_list', resourceId: field(pl, 'prefixListId')!, region: ctx.region, resourceName: field(pl, 'prefixListName') ?? undefined, state: field(pl, 'state') ?? undefined, tags, metadata: { addressFamily: field(pl, 'addressFamily'), maxEntries: numField(pl, 'maxEntries'), ownerId: field(pl, 'ownerId') } });
+  }
+  for (const tgw of extractListItems(extractSection(transitGateways, 'transitGatewaySet'))) {
+    const tags = tagsFromSet(tgw);
+    out.push({ resourceTypeKey: 'transit_gateway', resourceId: field(tgw, 'transitGatewayId')!, region: ctx.region, resourceName: tags['Name'], state: field(tgw, 'state') ?? undefined, tags, metadata: { description: field(tgw, 'description'), ownerId: field(tgw, 'ownerId'), creationTime: field(tgw, 'creationTime') } });
+  }
+  // Response element is `transitGatewayAttachments`, not the usual `*Set` — confirmed against AWS's own API reference (unlike most EC2 Query-protocol list wrappers, this one breaks that naming convention).
+  for (const tga of extractListItems(extractSection(transitGatewayAttachments, 'transitGatewayAttachments'))) {
+    const tags = tagsFromSet(tga);
+    out.push({ resourceTypeKey: 'transit_gateway_attachment', resourceId: field(tga, 'transitGatewayAttachmentId')!, region: ctx.region, state: field(tga, 'state') ?? undefined, tags, metadata: { resourceType: field(tga, 'resourceType'), creationTime: field(tga, 'creationTime') }, relationships: { transitGatewayId: field(tga, 'transitGatewayId'), resourceId: field(tga, 'resourceId') } });
+  }
+  for (const vgw of extractListItems(extractSection(vpnGateways, 'vpnGatewaySet'))) {
+    const tags = tagsFromSet(vgw);
+    out.push({ resourceTypeKey: 'vpn_gateway', resourceId: field(vgw, 'vpnGatewayId')!, region: ctx.region, resourceName: tags['Name'], state: field(vgw, 'state') ?? undefined, tags, metadata: { type: field(vgw, 'type'), availabilityZone: field(vgw, 'availabilityZone'), amazonSideAsn: field(vgw, 'amazonSideAsn') }, relationships: { vpcIds: extractListItems(extractSection(vgw, 'attachments')).map(a => field(a, 'vpcId')) } });
+  }
+  for (const vpn of extractListItems(extractSection(vpnConnections, 'vpnConnectionSet'))) {
+    const tags = tagsFromSet(vpn);
+    out.push({ resourceTypeKey: 'vpn_connection', resourceId: field(vpn, 'vpnConnectionId')!, region: ctx.region, resourceName: tags['Name'], state: field(vpn, 'state') ?? undefined, tags, metadata: { type: field(vpn, 'type') }, relationships: { customerGatewayId: field(vpn, 'customerGatewayId'), vpnGatewayId: field(vpn, 'vpnGatewayId'), transitGatewayId: field(vpn, 'transitGatewayId') } });
+  }
+  for (const cgw of extractListItems(extractSection(customerGateways, 'customerGatewaySet'))) {
+    const tags = tagsFromSet(cgw);
+    out.push({ resourceTypeKey: 'customer_gateway', resourceId: field(cgw, 'customerGatewayId')!, region: ctx.region, resourceName: tags['Name'], state: field(cgw, 'state') ?? undefined, tags, metadata: { type: field(cgw, 'type'), ipAddress: field(cgw, 'ipAddress'), bgpAsn: field(cgw, 'bgpAsn') } });
+  }
+  // Response element is the singular `clientVpnEndpoint`, not `clientVpnEndpointSet` — confirmed against AWS's API reference.
+  for (const cvpn of extractListItems(extractSection(clientVpnEndpoints, 'clientVpnEndpoint'))) {
+    const tags = tagsFromSet(cvpn);
+    const status = extractSection(cvpn, 'status');
+    out.push({ resourceTypeKey: 'client_vpn_endpoint', resourceId: field(cvpn, 'clientVpnEndpointId')!, region: ctx.region, resourceName: field(cvpn, 'description') ?? undefined, state: status ? (field(status, 'code') ?? undefined) : undefined, tags, metadata: { clientCidrBlock: field(cvpn, 'clientCidrBlock'), dnsName: field(cvpn, 'dnsName'), transportProtocol: field(cvpn, 'transportProtocol'), creationTime: field(cvpn, 'creationTime') } });
+  }
+  for (const eoigw of extractListItems(extractSection(egressOnlyIgws, 'egressOnlyInternetGatewaySet'))) {
+    const tags = tagsFromSet(eoigw);
+    out.push({ resourceTypeKey: 'egress_only_igw', resourceId: field(eoigw, 'egressOnlyInternetGatewayId')!, region: ctx.region, resourceName: tags['Name'], tags, relationships: { vpcIds: extractListItems(extractSection(eoigw, 'attachmentSet')).map(a => field(a, 'vpcId')) } });
+  }
+  for (const cr of extractListItems(extractSection(capacityReservations, 'capacityReservationSet'))) {
+    const tags = tagsFromSet(cr);
+    out.push({ resourceTypeKey: 'ec2_capacity_reservation', resourceId: field(cr, 'capacityReservationId')!, region: ctx.region, state: field(cr, 'state') ?? undefined, tags, metadata: { instanceType: field(cr, 'instanceType'), availabilityZone: field(cr, 'availabilityZone'), totalInstanceCount: numField(cr, 'totalInstanceCount'), availableInstanceCount: numField(cr, 'availableInstanceCount'), tenancy: field(cr, 'tenancy'), createDate: field(cr, 'createDate'), endDate: field(cr, 'endDate') } });
+  }
+  for (const h of extractListItems(extractSection(hosts, 'hostSet'))) {
+    const props = extractSection(h, 'hostProperties');
+    out.push({ resourceTypeKey: 'ec2_dedicated_host', resourceId: field(h, 'hostId')!, region: ctx.region, state: field(h, 'state') ?? undefined, tags: tagsFromSet(h), metadata: { instanceType: props ? field(props, 'instanceType') : null, availabilityZone: field(h, 'availabilityZone'), autoPlacement: field(h, 'autoPlacement'), allocationTime: field(h, 'allocationTime') } });
+  }
+  for (const fl of extractListItems(extractSection(fleets, 'fleetSet'))) {
+    const tags = tagsFromSet(fl);
+    const spec = extractSection(fl, 'targetCapacitySpecification');
+    out.push({ resourceTypeKey: 'ec2_fleet', resourceId: field(fl, 'fleetId')!, region: ctx.region, state: field(fl, 'fleetState') ?? undefined, tags, metadata: { type: field(fl, 'type'), totalTargetCapacity: spec ? numField(spec, 'totalTargetCapacity') : undefined, createTime: field(fl, 'createTime') } });
+  }
+  for (const sfr of extractListItems(extractSection(spotFleetRequests, 'spotFleetRequestConfigSet'))) {
+    const cfg = extractSection(sfr, 'spotFleetRequestConfig');
+    out.push({ resourceTypeKey: 'ec2_spot_fleet_request', resourceId: field(sfr, 'spotFleetRequestId')!, region: ctx.region, state: field(sfr, 'spotFleetRequestState') ?? undefined, metadata: { spotPrice: cfg ? field(cfg, 'spotPrice') : null, targetCapacity: cfg ? numField(cfg, 'targetCapacity') : undefined, iamFleetRole: cfg ? field(cfg, 'iamFleetRole') : null } });
+  }
+  for (const sir of extractListItems(extractSection(spotInstanceRequests, 'spotInstanceRequestSet'))) {
+    const tags = tagsFromSet(sir);
+    out.push({ resourceTypeKey: 'ec2_spot_instance_request', resourceId: field(sir, 'spotInstanceRequestId')!, region: ctx.region, state: field(sir, 'state') ?? undefined, tags, metadata: { spotPrice: field(sir, 'spotPrice'), type: field(sir, 'type'), createTime: field(sir, 'createTime') }, relationships: { instanceId: field(sir, 'instanceId') } });
+  }
+  for (const ri of extractListItems(extractSection(reservedInstances, 'reservedInstancesSet'))) {
+    const tags = tagsFromSet(ri);
+    out.push({ resourceTypeKey: 'reserved_instance', resourceId: field(ri, 'reservedInstancesId')!, region: ctx.region, state: field(ri, 'state') ?? undefined, tags, metadata: { instanceType: field(ri, 'instanceType'), availabilityZone: field(ri, 'availabilityZone'), instanceCount: numField(ri, 'instanceCount'), start: field(ri, 'start'), end: field(ri, 'end'), offeringType: field(ri, 'offeringType'), productDescription: field(ri, 'productDescription') } });
+  }
+  // Amazon Elastic Graphics reached end-of-life 2024-01-08 — this will legitimately return empty on every account going forward (an AWS retirement, not a scanner bug), kept only because the catalog already tracks it and existing customers' historical accelerators (if any survived) should still surface.
+  for (const gpu of extractListItems(extractSection(elasticGpus, 'elasticGpuSet'))) {
+    out.push({ resourceTypeKey: 'elastic_gpu', resourceId: field(gpu, 'elasticGpuId')!, region: ctx.region, state: field(gpu, 'elasticGpuState') ?? undefined, metadata: { elasticGpuType: field(gpu, 'elasticGpuType'), elasticGpuHealth: field(gpu, 'elasticGpuHealth'), availabilityZone: field(gpu, 'availabilityZone') }, relationships: { instanceId: field(gpu, 'instanceId') } });
   }
 
   return out;

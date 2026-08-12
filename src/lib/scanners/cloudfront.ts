@@ -3,7 +3,7 @@ import { extractSection, extractListItems, field, boolField } from '../xmlList';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
-export const CLOUDFRONT_RESOURCE_TYPES = ['cloudfront_distribution'] as const;
+export const CLOUDFRONT_RESOURCE_TYPES = ['cloudfront_distribution', 'cloudfront_oai'] as const;
 
 /**
  * CloudFront is REST-XML, global — a GLOBAL_SCANNERS entry like
@@ -31,6 +31,25 @@ export async function scanCloudFront(ctx: ScannerContext): Promise<ScannedResour
         arn: field(dist, 'ARN'), enabled: boolField(dist, 'Enabled'), comment: field(dist, 'Comment'),
         priceClass: field(dist, 'PriceClass'), lastModifiedTime: field(dist, 'LastModifiedTime'),
       },
+    });
+  }
+
+  // Origin Access Identity — the legacy (pre-2022) mechanism for letting
+  // CloudFront read a private S3 origin bucket, superseded by Origin Access
+  // Control but still supported and still shown here since existing
+  // customers' distributions commonly still use it.
+  const oaiRes = await client.fetch('https://cloudfront.amazonaws.com/2020-05-31/origin-access-identity/cloudfront', { method: 'GET' });
+  const oaiText = await oaiRes.text();
+  if (!oaiRes.ok) {
+    console.error(`CloudFront ListCloudFrontOriginAccessIdentities failed (continuing without it): HTTP ${oaiRes.status} ${oaiText.slice(0, 200)}`);
+    return out;
+  }
+  for (const oai of extractListItems(extractSection(oaiText, 'Items'), 'CloudFrontOriginAccessIdentitySummary')) {
+    const id = field(oai, 'Id');
+    if (!id) continue;
+    out.push({
+      resourceTypeKey: 'cloudfront_oai', resourceId: id, region: null,
+      resourceName: field(oai, 'Comment') ?? undefined, metadata: { s3CanonicalUserId: field(oai, 'S3CanonicalUserId') },
     });
   }
   return out;

@@ -4,6 +4,7 @@ import type { ScannedResource, ScannerContext } from './types';
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
 export const SSM_RESOURCE_TYPES = [
   'ssm_parameter', 'ssm_automation', 'ssm_document', 'ssm_managed_instance', 'ssm_maintenance_window', 'ssm_patch_baseline',
+  'systems_manager_inventory',
 ] as const;
 
 interface SsmParameter {
@@ -98,6 +99,21 @@ export async function scanSsm(ctx: ScannerContext): Promise<ScannedResource[]> {
     out.push({
       resourceTypeKey: 'ssm_patch_baseline', resourceId: b.BaselineId, region: ctx.region, resourceName: b.BaselineName,
       metadata: { operatingSystem: b.OperatingSystem },
+    });
+  }
+
+  // Inventory is one entry per managed instance (AWS:InstanceInformation
+  // plus whatever other inventory types that instance's SSM Agent config
+  // collects), not a separate top-level catalog — GetInventory returns one
+  // Entities[] item per instance with a Data map keyed by inventory type
+  // name, summarized here to which types are present rather than dumping
+  // every field of every type.
+  const inventoryBody = await call('GetInventory', { MaxResults: 50 });
+  for (const e of (inventoryBody?.Entities as { Id?: string; Data?: Record<string, unknown> }[] | undefined) ?? []) {
+    if (!e.Id) continue;
+    out.push({
+      resourceTypeKey: 'systems_manager_inventory', resourceId: `${ctx.region}:${e.Id}`, region: ctx.region, resourceName: e.Id,
+      metadata: { inventoryTypes: Object.keys(e.Data ?? {}) }, relationships: { instanceId: e.Id },
     });
   }
 

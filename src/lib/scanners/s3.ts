@@ -1,9 +1,9 @@
-import { createAwsClient } from '../awsApi';
+import { callQueryApi, createAwsClient } from '../awsApi';
 import { extractSection, extractListItems, field } from '../xmlList';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
-export const S3_RESOURCE_TYPES = ['s3_bucket'] as const;
+export const S3_RESOURCE_TYPES = ['s3_bucket', 's3_access_point', 's3_multi_region_access_point'] as const;
 
 /**
  * S3's ListBuckets is REST-XML, not Query-protocol (no Action param, and
@@ -58,6 +58,57 @@ export async function scanS3(ctx: ScannerContext): Promise<ScannedResource[]> {
     out.push({
       resourceTypeKey: 's3_bucket', resourceId: name, region: regions[i], resourceName: name,
       metadata: { creationDate: field(bucketItems[i], 'CreationDate') },
+    });
+  }
+
+  // S3 Control (access points, multi-region access points) is a distinct
+  // account-scoped API needing the account ID as an x-amz-account-id
+  // header — fetched here via STS GetCallerIdentity (same call
+  // permissionChecks.ts already uses) since ScannerContext carries only
+  // region/credentials, not the account ID.
+  const stsResult = await callQueryApi(ctx.creds, { service: 'sts', region: 'us-east-1', host: 'sts.amazonaws.com', action: 'GetCallerIdentity', version: '2011-06-15' });
+  const accountId = stsResult.ok ? field(stsResult.body as string, 'Account') : null;
+  if (!accountId) {
+    console.error('S3 Control access-point scan skipped: could not resolve account ID via STS GetCallerIdentity.');
+    return out;
+  }
+
+  const s3ControlClient = createAwsClient(ctx.creds, 's3', 'us-east-1');
+  const apRes = await s3ControlClient.fetch('https://s3-control.us-east-1.amazonaws.com/v20180820/accesspoint', {
+    method: 'GET', headers: { 'x-amz-account-id': accountId },
+  });
+  const apText = await apRes.text();
+  if (!apRes.ok) {
+    console.error(`S3 ListAccessPoints failed (continuing without it): HTTP ${apRes.status} ${apText.slice(0, 200)}`);
+  } else {
+    for (const ap of extractListItems(extractSection(apText, 'AccessPointList'), 'AccessPoint')) {
+      const arn = field(ap, 'AccessPointArn');
+      if (!arn) continue;
+      out.push({
+        resourceTypeKey: 's3_access_point', resourceId: arn, region: 'us-east-1', resourceName: field(ap, 'Name') ?? undefined,
+        metadata: { bucket: field(ap, 'Bucket'), alias: field(ap, 'Alias'), networkOrigin: field(ap, 'NetworkOrigin') },
+      });
+    }
+  }
+
+  // Multi-Region Access Points are account-wide (not per-region) but the
+  // control-plane API is only reachable via the us-west-2 endpoint
+  // regardless of where the account's buckets actually live.
+  const mrapClient = createAwsClient(ctx.creds, 's3', 'us-west-2');
+  const mrapRes = await mrapClient.fetch('https://s3-control.us-west-2.amazonaws.com/v20180820/mrap/instances', {
+    method: 'GET', headers: { 'x-amz-account-id': accountId },
+  });
+  const mrapText = await mrapRes.text();
+  if (!mrapRes.ok) {
+    console.error(`S3 ListMultiRegionAccessPoints failed (continuing without it): HTTP ${mrapRes.status} ${mrapText.slice(0, 200)}`);
+    return out;
+  }
+  for (const mrap of extractListItems(extractSection(mrapText, 'AccessPoints'), 'MultiRegionAccessPointReport')) {
+    const name = field(mrap, 'Name');
+    if (!name) continue;
+    out.push({
+      resourceTypeKey: 's3_multi_region_access_point', resourceId: name, region: null, resourceName: name,
+      metadata: { alias: field(mrap, 'Alias'), status: field(mrap, 'Status'), createdAt: field(mrap, 'CreatedAt') },
     });
   }
   return out;

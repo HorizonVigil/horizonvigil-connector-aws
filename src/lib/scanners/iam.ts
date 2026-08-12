@@ -8,7 +8,7 @@ const REGION = 'us-east-1';
 const ENDPOINT = 'iam.amazonaws.com';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
-export const IAM_RESOURCE_TYPES = ['iam_user', 'iam_role', 'iam_policy', 'iam_group', 'iam_instance_profile', 'iam_oidc_provider', 'iam_saml_provider'] as const;
+export const IAM_RESOURCE_TYPES = ['iam_user', 'iam_role', 'iam_policy', 'iam_group', 'iam_instance_profile', 'iam_oidc_provider', 'iam_saml_provider', 'iam_credential_report'] as const;
 
 /**
  * Users, roles, customer-managed policies, and groups — one signer, 4
@@ -97,6 +97,44 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
     out.push({
       resourceTypeKey: 'iam_saml_provider', resourceId: arn, region: null, resourceName: arn.split('/').pop(),
       metadata: { arn, validUntil: field(saml, 'ValidUntil'), createDate: field(saml, 'CreateDate') },
+    });
+  }
+
+  // Credential report: a single account-wide security summary (MFA/access-key
+  // hygiene), not one row per user — AWS generates it asynchronously and
+  // caches it for ~4h, so GenerateCredentialReport is fired first and
+  // GetCredentialReport is tried once right after; if the report isn't ready
+  // yet (State STARTED/INPROGRESS on a first-ever call for this account) it's
+  // skipped this run rather than polled inline, and picked up cleanly on the
+  // next daily auto-scan once AWS has finished generating it.
+  await call('GenerateCredentialReport');
+  const reportXml = await call('GetCredentialReport');
+  const content = field(reportXml, 'Content');
+  if (content) {
+    const csv = atob(content);
+    const rows = csv.trim().split('\n').map((line) => line.split(','));
+    const header = rows[0];
+    const col = (name: string) => header.indexOf(name);
+    const dataRows = rows.slice(1);
+    const mfaCol = col('mfa_active');
+    const pwEnabledCol = col('password_enabled');
+    const key1ActiveCol = col('access_key_1_active');
+    const key1RotatedCol = col('access_key_1_last_rotated');
+    const key2ActiveCol = col('access_key_2_active');
+    const key2RotatedCol = col('access_key_2_last_rotated');
+    const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
+    const isStaleKey = (active: string | undefined, rotated: string | undefined) =>
+      active === 'true' && !!rotated && rotated !== 'N/A' && new Date(rotated).getTime() < ninetyDaysAgo;
+    let usersWithoutMfa = 0;
+    let usersWithStaleKeys = 0;
+    for (const row of dataRows) {
+      if (mfaCol >= 0 && pwEnabledCol >= 0 && row[pwEnabledCol] === 'true' && row[mfaCol] === 'false') usersWithoutMfa++;
+      if (isStaleKey(row[key1ActiveCol], row[key1RotatedCol]) || isStaleKey(row[key2ActiveCol], row[key2RotatedCol])) usersWithStaleKeys++;
+    }
+    out.push({
+      resourceTypeKey: 'iam_credential_report', resourceId: 'credential-report', region: null,
+      resourceName: 'IAM Credential Report',
+      metadata: { generatedTime: field(reportXml, 'GeneratedTime'), totalUsers: dataRows.length, usersWithoutMfa, usersWithStaleAccessKeys: usersWithStaleKeys },
     });
   }
 
