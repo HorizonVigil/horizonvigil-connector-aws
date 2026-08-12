@@ -65,6 +65,10 @@ export async function scanEks(ctx: ScannerContext): Promise<ScannedResource[]> {
   };
 
   const out: ScannedResource[] = [];
+  // Populated in the main per-cluster loop below, read back in the addons
+  // loop further down (a separate, more-capped loop) to know which k8s
+  // version to ask DescribeAddonVersions about for each cluster.
+  const clusterVersions = new Map<string, string>();
   // Unlike every per-cluster detail call below (best-effort, one bad
   // cluster shouldn't lose the others), a failed ListClusters itself must
   // not be swallowed to []: that's indistinguishable from an honest
@@ -84,6 +88,7 @@ export async function scanEks(ctx: ScannerContext): Promise<ScannedResource[]> {
     const detail = await getJson(`/clusters/${encodeURIComponent(name)}`);
     const cluster = detail?.cluster as EksClusterDetail | undefined;
     if (cluster) {
+      if (cluster.version) clusterVersions.set(name, cluster.version);
       const vpcConfig = cluster.resourcesVpcConfig;
       // AWS returns clusterLogging as one entry per (types, enabled) group,
       // not one row per log type -- flattened here into the 5 fixed type
@@ -138,8 +143,33 @@ export async function scanEks(ctx: ScannerContext): Promise<ScannedResource[]> {
   // per-cluster fan-out.
   for (const name of names.slice(0, 3)) {
     const addonList = await getJson(`/clusters/${encodeURIComponent(name)}/addons`);
-    for (const addonName of (addonList?.addons as string[] | undefined) ?? []) {
-      out.push({ resourceTypeKey: 'eks_addon', resourceId: `${name}/${addonName}`, region: ctx.region, resourceName: addonName, relationships: { clusterName: name } });
+    const addonNames = ((addonList?.addons as string[] | undefined) ?? []).slice(0, 15);
+    const k8sVersion = clusterVersions.get(name);
+    for (const addonName of addonNames) {
+      const [addonDetail, versionsResult] = await Promise.all([
+        getJson(`/clusters/${encodeURIComponent(name)}/addons/${encodeURIComponent(addonName)}`),
+        k8sVersion ? getJson(`/addons/supported-versions?addonName=${encodeURIComponent(addonName)}&kubernetesVersion=${encodeURIComponent(k8sVersion)}`) : Promise.resolve(null),
+      ]);
+      const addon = addonDetail?.addon as {
+        addonVersion?: string; status?: string; health?: { issues?: { code?: string; message?: string }[] };
+        serviceAccountRoleArn?: string; createdAt?: string; modifiedAt?: string; publisher?: string; owner?: string;
+      } | undefined;
+      // AWS lists addonVersions newest-first in practice (not formally
+      // documented as guaranteed ordering) -- treated as a best-effort
+      // "latest available for this cluster's k8s version" signal, same
+      // honesty caveat as EKS_LATEST_STANDARD_SUPPORT_VERSION above.
+      const addonsInfo = (versionsResult?.addons as { addonVersions?: { addonVersion?: string }[] }[] | undefined) ?? [];
+      const latestVersion = addonsInfo[0]?.addonVersions?.[0]?.addonVersion;
+      out.push({
+        resourceTypeKey: 'eks_addon', resourceId: `${name}/${addonName}`, region: ctx.region, resourceName: addonName,
+        state: addon?.status,
+        metadata: {
+          version: addon?.addonVersion, latestVersion, behindLatest: !!latestVersion && !!addon?.addonVersion && latestVersion !== addon.addonVersion,
+          healthIssues: addon?.health?.issues ?? [], serviceAccountRoleArn: addon?.serviceAccountRoleArn,
+          createdAt: addon?.createdAt, modifiedAt: addon?.modifiedAt, publisher: addon?.publisher, owner: addon?.owner,
+        },
+        relationships: { clusterName: name },
+      });
     }
 
     const fpList = await getJson(`/clusters/${encodeURIComponent(name)}/fargate-profiles`);

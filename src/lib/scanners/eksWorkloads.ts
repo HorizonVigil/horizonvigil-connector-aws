@@ -184,6 +184,13 @@ interface K8sNamespace {
 }
 interface K8sNamespaceList { items?: K8sNamespace[] }
 
+interface K8sResourceQuota {
+  metadata: { name: string };
+  spec?: { hard?: Record<string, string> };
+  status?: { hard?: Record<string, string>; used?: Record<string, string> };
+}
+interface K8sResourceQuotaList { items?: K8sResourceQuota[] }
+
 interface K8sNodeObjectMeta {
   name: string; uid?: string; creationTimestamp?: string;
   labels?: Record<string, string>; annotations?: Record<string, string>;
@@ -390,11 +397,26 @@ export async function scanEksWorkloads(ctx: ScannerContext): Promise<ScannedReso
       if (namespacesResult.forbidden) { if (!forbiddenClusters.includes(name)) forbiddenClusters.push(name); }
       else throw new Error(`EKS namespace list failed for cluster ${clusterId}: HTTP ${namespacesResult.status} ${JSON.stringify(namespacesResult.body).slice(0, 200)}`);
     } else {
-      for (const ns of (namespacesResult.body as K8sNamespaceList).items ?? []) {
+      const namespaces = ((namespacesResult.body as K8sNamespaceList).items ?? []).slice(0, 20);
+      // ResourceQuota is a standard read-only object (unlike Secrets, it's
+      // included in Kubernetes' own built-in "view" ClusterRole), so this
+      // doesn't need any broader RBAC grant than everything else this
+      // scanner already reads. One extra call per namespace -- capped to
+      // the first 20 above to bound the fan-out, same generous-but-capped
+      // shape as every other per-item loop in this file.
+      const endpoint = detail.endpoint;
+      const quotaResults = await Promise.all(namespaces.map(ns => callK8sApi(endpoint, caCertPem, token, `/api/v1/namespaces/${encodeURIComponent(ns.metadata.name)}/resourcequotas`)));
+      for (let i = 0; i < namespaces.length; i++) {
+        const ns = namespaces[i];
+        const quotaRes = quotaResults[i];
+        const quotas = quotaRes.ok ? ((quotaRes.body as K8sResourceQuotaList).items ?? []) : [];
         out.push({
           resourceTypeKey: 'eks_namespace', resourceId: `${clusterId}/${ns.metadata.name}`, region: ctx.region,
           resourceName: ns.metadata.name, state: ns.status?.phase, tags: ns.metadata.labels ?? {},
-          metadata: { createdAt: ns.metadata.creationTimestamp },
+          metadata: {
+            createdAt: ns.metadata.creationTimestamp,
+            resourceQuotas: quotas.map(q => ({ name: q.metadata.name, hard: q.status?.hard ?? q.spec?.hard, used: q.status?.used })),
+          },
           relationships: { clusterName: name },
         });
       }
