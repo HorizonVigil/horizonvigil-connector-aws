@@ -7,12 +7,32 @@ export const EKS_RESOURCE_TYPES = ['eks_cluster', 'eks_nodegroup', 'eks_addon', 
 interface EksClusterDetail {
   name: string; arn?: string; status?: string; version?: string; endpoint?: string;
   createdAt?: string; roleArn?: string; platformVersion?: string;
-  resourcesVpcConfig?: { vpcId?: string };
+  resourcesVpcConfig?: {
+    vpcId?: string; subnetIds?: string[]; securityGroupIds?: string[]; clusterSecurityGroupId?: string;
+    endpointPublicAccess?: boolean; endpointPrivateAccess?: boolean; publicAccessCidrs?: string[];
+  };
+  logging?: { clusterLogging?: { types?: string[]; enabled?: boolean }[] };
+  encryptionConfig?: { resources?: string[]; provider?: { keyArn?: string } }[];
+  health?: { issues?: { code?: string; message?: string; resourceIds?: string[] }[] };
+  accessConfig?: { authenticationMode?: string };
 }
 interface EksNodegroupDetail {
   nodegroupName: string; status?: string; instanceTypes?: string[]; amiType?: string; createdAt?: string;
   scalingConfig?: { minSize?: number; maxSize?: number; desiredSize?: number };
+  capacityType?: string; subnets?: string[]; diskSize?: number; releaseVersion?: string; version?: string;
+  nodeRole?: string; labels?: Record<string, string>; taints?: { key?: string; value?: string; effect?: string }[];
+  launchTemplate?: { id?: string; name?: string; version?: string };
+  health?: { issues?: { code?: string; message?: string; resourceIds?: string[] }[] };
 }
+
+// Hand-maintained, same "update when it changes" precedent as this
+// codebase's other drift-prone constants (e.g. discovery.ts's catalogued
+// count) — EKS's own standard-support policy keeps the newest ~4 minor
+// versions in standard support at any time; anything older is either
+// extended support (billed) or fully unsupported. Exact cutoffs shift as
+// AWS ships new versions, so this is a "roughly current" signal for the
+// UI, not an authoritative deprecation-date source.
+export const EKS_LATEST_STANDARD_SUPPORT_VERSION = '1.31';
 
 /**
  * EKS is REST-JSON, like lambda.ts — ListClusters only returns bare names,
@@ -54,11 +74,28 @@ export async function scanEks(ctx: ScannerContext): Promise<ScannedResource[]> {
     const detail = await getJson(`/clusters/${encodeURIComponent(name)}`);
     const cluster = detail?.cluster as EksClusterDetail | undefined;
     if (cluster) {
+      const vpcConfig = cluster.resourcesVpcConfig;
+      // AWS returns clusterLogging as one entry per (types, enabled) group,
+      // not one row per log type -- flattened here into the 5 fixed type
+      // names so the UI can just look up each one's enabled state directly.
+      const enabledLogTypes = new Set<string>();
+      for (const entry of cluster.logging?.clusterLogging ?? []) {
+        if (entry.enabled) for (const t of entry.types ?? []) enabledLogTypes.add(t);
+      }
       out.push({
         resourceTypeKey: 'eks_cluster', resourceId: cluster.arn ?? name, region: ctx.region, resourceName: name,
         state: cluster.status,
-        metadata: { version: cluster.version, endpoint: cluster.endpoint, createdAt: cluster.createdAt, platformVersion: cluster.platformVersion },
-        relationships: { roleArn: cluster.roleArn, vpcId: cluster.resourcesVpcConfig?.vpcId },
+        metadata: {
+          version: cluster.version, endpoint: cluster.endpoint, createdAt: cluster.createdAt, platformVersion: cluster.platformVersion,
+          latestStandardSupportVersion: EKS_LATEST_STANDARD_SUPPORT_VERSION,
+          subnetIds: vpcConfig?.subnetIds, securityGroupIds: vpcConfig?.securityGroupIds, clusterSecurityGroupId: vpcConfig?.clusterSecurityGroupId,
+          endpointPublicAccess: vpcConfig?.endpointPublicAccess, endpointPrivateAccess: vpcConfig?.endpointPrivateAccess, publicAccessCidrs: vpcConfig?.publicAccessCidrs,
+          logTypes: ['api', 'audit', 'authenticator', 'controllerManager', 'scheduler'].map(t => ({ type: t, enabled: enabledLogTypes.has(t) })),
+          secretsEncryptionKeyArn: cluster.encryptionConfig?.find(e => e.resources?.includes('secrets'))?.provider?.keyArn ?? null,
+          healthIssues: cluster.health?.issues ?? [],
+          authenticationMode: cluster.accessConfig?.authenticationMode,
+        },
+        relationships: { roleArn: cluster.roleArn, vpcId: vpcConfig?.vpcId },
       });
     }
 
@@ -73,8 +110,12 @@ export async function scanEks(ctx: ScannerContext): Promise<ScannedResource[]> {
         metadata: {
           instanceTypes: ng?.instanceTypes, amiType: ng?.amiType, createdAt: ng?.createdAt,
           minSize: ng?.scalingConfig?.minSize, maxSize: ng?.scalingConfig?.maxSize, desiredSize: ng?.scalingConfig?.desiredSize,
+          capacityType: ng?.capacityType, subnets: ng?.subnets, diskSizeGiB: ng?.diskSize,
+          releaseVersion: ng?.releaseVersion, kubernetesVersion: ng?.version,
+          labels: ng?.labels ?? {}, taints: ng?.taints ?? [],
+          launchTemplate: ng?.launchTemplate, healthIssues: ng?.health?.issues ?? [],
         },
-        relationships: { clusterName: name },
+        relationships: { clusterName: name, nodeRoleArn: ng?.nodeRole },
       });
     }
   }
