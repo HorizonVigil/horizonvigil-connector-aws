@@ -1,7 +1,7 @@
 import { Hono, createDb, guarded, okJson, errJson, type Db } from '@cloudops360/shared-lib';
 import type { Env } from '../env';
 import {
-  REGIONAL_SCANNERS, GLOBAL_SCANNERS, FINDING_SCANNERS, METRIC_STEP_NAME,
+  REGIONAL_SCANNERS, GLOBAL_SCANNERS, FINDING_SCANNERS, METRIC_STEP_NAME, SCANNER_RESOURCE_TYPES,
   loadConnection, regionsFor, runResourceStep, runFindingStep, runMetricStep, runFinalize,
   type StepErrorInput,
 } from './discovery';
@@ -88,7 +88,22 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
         if (result.error) stepErrors.push({ message: `${stepId}: ${result.error}`, severity: result.errorSeverity ?? 'error' });
       }
 
-      const outcome = await runFinalize(db, row.org_id, null, connection, runStartedAt, stepErrors);
+      // A scanner's resource types are only safe to vanish-check if EVERY
+      // one of the connection's regions for that scanner actually ran this
+      // invocation — MAX_STEPS_PER_CONNECTION means a typical multi-region
+      // connection only completes a fraction of its regional scanners per
+      // cycle, so naively treating "this scanner ran for step 1" as "fully
+      // checked" caused a real bug (2026-08-12): resources in regions not
+      // yet reached this cycle got mass-deleted as "vanished" even though
+      // they were simply unchecked, not actually gone from AWS. Global
+      // scanners always fully cover themselves in one step when they run.
+      const stepSet = new Set(steps);
+      const coveredResourceTypes = [
+        ...Object.keys(GLOBAL_SCANNERS).filter((name) => stepSet.has(`global:${name}`)).flatMap((name) => SCANNER_RESOURCE_TYPES[name] ?? []),
+        ...Object.keys(REGIONAL_SCANNERS).filter((name) => regions.every((r) => stepSet.has(`regional:${name}:${r}`))).flatMap((name) => SCANNER_RESOURCE_TYPES[name] ?? []),
+      ];
+
+      const outcome = await runFinalize(db, row.org_id, null, connection, runStartedAt, stepErrors, coveredResourceTypes);
       const nextScan = new Date(Date.now() + row.scan_interval_hours * 60 * 60 * 1000).toISOString();
       await db.update('cloud_connections', { id: `eq.${row.id}` }, { next_scheduled_scan_at: nextScan }, 'return=minimal');
 

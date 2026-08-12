@@ -207,7 +207,7 @@ const EC2_METRICS_INSTANCE_CAP = 30;
  * alone: a run that never checked them can't honestly claim to know
  * whether they still exist, so it must never mark them deleted.
  */
-const SCANNER_RESOURCE_TYPES: Record<string, readonly string[]> = {
+export const SCANNER_RESOURCE_TYPES: Record<string, readonly string[]> = {
   ec2: EC2_RESOURCE_TYPES,
   rds: RDS_RESOURCE_TYPES,
   iam: IAM_RESOURCE_TYPES,
@@ -555,8 +555,18 @@ export interface FinalizeOutcome { totalResources: number; deleted: number; find
  * routes/internalScan.ts) — extracted the same way runResourceStep was,
  * pure extraction of the existing behavior, actorId nullable since a
  * scheduled run has no human user to attribute the audit log entry to.
+ *
+ * `coveredResourceTypes` defaults to every type any live scanner can ever
+ * produce (COVERED_RESOURCE_TYPES) — correct for the manual HTTP route
+ * below, which only ever calls this after the frontend's step loop has run
+ * every scanner for every one of the connection's scan_regions. The
+ * scheduled path (internalScan.ts) caps how many steps run per invocation
+ * and must pass a narrower set — see that file for why: naively reusing
+ * COVERED_RESOURCE_TYPES there was a real bug (found 2026-08-12) that mass-
+ * deleted resources whose region simply hadn't been re-checked yet this
+ * cycle, not resources that had actually vanished from AWS.
  */
-export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[]): Promise<FinalizeOutcome> {
+export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES): Promise<FinalizeOutcome> {
   const existing = await db.select<{ id: string; resource_type_key: string; category: string; last_seen_at: string; deleted_at: string | null }[]>('cloud_resources', {
     select: 'id,resource_type_key,category,last_seen_at,deleted_at',
     filters: { connection_id: `eq.${connection.id}` },
@@ -564,9 +574,9 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   });
 
   // Only resource types a currently-implemented scanner actually checked
-  // this run are eligible to be marked vanished — see COVERED_RESOURCE_TYPES
-  // and lib/discoveryFinalize.ts (extracted so this is unit-testable).
-  const { vanishedIds, activeCategoryCounts, activeCount } = computeFinalizeResult(existing, COVERED_RESOURCE_TYPES, runStartedAt);
+  // this run are eligible to be marked vanished — see the coveredResourceTypes
+  // param above and lib/discoveryFinalize.ts (extracted so this is unit-testable).
+  const { vanishedIds, activeCategoryCounts, activeCount } = computeFinalizeResult(existing, coveredResourceTypes, runStartedAt);
   const now = new Date().toISOString();
   if (vanishedIds.length > 0) {
     await db.update('cloud_resources', { id: `in.(${vanishedIds.join(',')})` }, { deleted_at: now, status: 'deleted' }, 'return=minimal');
