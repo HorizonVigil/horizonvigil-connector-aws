@@ -80,6 +80,14 @@ import { scanDirectConnect, DIRECTCONNECT_RESOURCE_TYPES } from '../lib/scanners
 import { scanGlobalAccelerator, GLOBALACCELERATOR_RESOURCE_TYPES } from '../lib/scanners/globalaccelerator';
 import { scanRoute53Resolver, ROUTE53RESOLVER_RESOURCE_TYPES } from '../lib/scanners/route53resolver';
 import { scanServiceDiscovery, SERVICEDISCOVERY_RESOURCE_TYPES } from '../lib/scanners/servicediscovery';
+import { scanLightsail, LIGHTSAIL_RESOURCE_TYPES } from '../lib/scanners/lightsail';
+import { scanOutposts, OUTPOSTS_RESOURCE_TYPES } from '../lib/scanners/outposts';
+import { scanAppRunner, APPRUNNER_RESOURCE_TYPES } from '../lib/scanners/apprunner';
+import { scanImageBuilder, IMAGEBUILDER_RESOURCE_TYPES } from '../lib/scanners/imagebuilder';
+import { scanWorkspaces, WORKSPACES_RESOURCE_TYPES } from '../lib/scanners/workspaces';
+import { scanCodeCommit, CODECOMMIT_RESOURCE_TYPES } from '../lib/scanners/codecommit';
+import { scanCodeDeploy, CODEDEPLOY_RESOURCE_TYPES } from '../lib/scanners/codedeploy';
+import { scanCodeArtifact, CODEARTIFACT_RESOURCE_TYPES } from '../lib/scanners/codeartifact';
 import { scanGuardDutyFindings } from '../lib/scanners/guarddutyFindings';
 import { scanSecurityHubFindings } from '../lib/scanners/securityhubFindings';
 import { scanAccessAnalyzerFindings } from '../lib/scanners/accessAnalyzerFindings';
@@ -202,6 +210,14 @@ export const REGIONAL_SCANNERS: Record<string, ScannerFn> = {
   directconnect: scanDirectConnect,
   route53resolver: scanRoute53Resolver,
   servicediscovery: scanServiceDiscovery,
+  lightsail: scanLightsail,
+  outposts: scanOutposts,
+  apprunner: scanAppRunner,
+  imagebuilder: scanImageBuilder,
+  workspaces: scanWorkspaces,
+  codecommit: scanCodeCommit,
+  codedeploy: scanCodeDeploy,
+  codeartifact: scanCodeArtifact,
 };
 export const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
   iam: scanIam,
@@ -353,6 +369,14 @@ export const SCANNER_RESOURCE_TYPES: Record<string, readonly string[]> = {
   globalaccelerator: GLOBALACCELERATOR_RESOURCE_TYPES,
   route53resolver: ROUTE53RESOLVER_RESOURCE_TYPES,
   servicediscovery: SERVICEDISCOVERY_RESOURCE_TYPES,
+  lightsail: LIGHTSAIL_RESOURCE_TYPES,
+  outposts: OUTPOSTS_RESOURCE_TYPES,
+  apprunner: APPRUNNER_RESOURCE_TYPES,
+  imagebuilder: IMAGEBUILDER_RESOURCE_TYPES,
+  workspaces: WORKSPACES_RESOURCE_TYPES,
+  codecommit: CODECOMMIT_RESOURCE_TYPES,
+  codedeploy: CODEDEPLOY_RESOURCE_TYPES,
+  codeartifact: CODEARTIFACT_RESOURCE_TYPES,
 };
 const COVERED_RESOURCE_TYPES = Object.values(SCANNER_RESOURCE_TYPES).flat();
 
