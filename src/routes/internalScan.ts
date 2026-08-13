@@ -131,7 +131,7 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
         ...Object.keys(REGIONAL_SCANNERS).filter((name) => regions.every((r) => stepSet.has(`regional:${name}:${r}`) && !failedStepIds.has(`regional:${name}:${r}`))).flatMap((name) => SCANNER_RESOURCE_TYPES[name] ?? []),
       ];
 
-      const outcome = await runFinalize(db, row.org_id, null, connection, runStartedAt, stepErrors, coveredResourceTypes);
+      const outcome = await runFinalize(db, row.org_id, null, connection, runStartedAt, stepErrors, coveredResourceTypes, steps.length);
       const nextScan = new Date(Date.now() + row.scan_interval_hours * 60 * 60 * 1000).toISOString();
       await db.update('cloud_connections', { id: `eq.${row.id}` }, { next_scheduled_scan_at: nextScan }, 'return=minimal');
 

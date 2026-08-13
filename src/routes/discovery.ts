@@ -665,7 +665,7 @@ export interface FinalizeOutcome { totalResources: number; deleted: number; find
  * deleted resources whose region simply hadn't been re-checked yet this
  * cycle, not resources that had actually vanished from AWS.
  */
-export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES): Promise<FinalizeOutcome> {
+export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES, totalSteps = 0): Promise<FinalizeOutcome> {
   const existing = await db.select<{ id: string; resource_type_key: string; category: string; last_seen_at: string; deleted_at: string | null }[]>('cloud_resources', {
     select: 'id,resource_type_key,category,last_seen_at,deleted_at',
     filters: { connection_id: `eq.${connection.id}` },
@@ -695,13 +695,15 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   const realErrors = stepErrors.filter((e) => e.severity !== 'info');
   // A handful of transient failures (a couple of "fetch failed" network
   // blips late in a long multi-region run, say) shouldn't flip a connection
-  // that mostly succeeded to a scary "error" badge -- found via a real case
-  // this session: 15 failed steps out of 1,100+, with 428 real resources
-  // landed cleanly, still showed status='error'. This threshold is a fixed
-  // count rather than a ratio of total steps run, since that number isn't
-  // threaded through to this function today; revisit if that changes.
-  const ERROR_STATUS_THRESHOLD = 10;
-  const connectionIsBroken = realErrors.length > ERROR_STATUS_THRESHOLD;
+  // that mostly succeeded to a scary "error" badge. A fixed count threshold
+  // was tried first and failed on the real case that motivated this: a
+  // persistent, reproducible cluster of 15 "fetch failed" steps out of
+  // 1,100+ (1.3%) that shows up on every single run, with 428 real
+  // resources landing cleanly regardless. 15 exceeded any fixed threshold
+  // low enough to still catch genuinely broken connections, so this uses a
+  // ratio of totalSteps instead -- >10% real failures, or the old fixed
+  // floor of 10 when totalSteps isn't known (callers that don't pass it).
+  const connectionIsBroken = totalSteps > 0 ? realErrors.length / totalSteps > 0.1 : realErrors.length > 10;
   const summary = {
     scannedAt: now, totalResources: activeCount, categoryCounts: activeCategoryCounts,
     servicesTotal: `${Object.keys(REGIONAL_SCANNERS).length + Object.keys(GLOBAL_SCANNERS).length} live / 245 catalogued`,
@@ -746,13 +748,13 @@ discoveryRoutes.post('/accounts/:id/discovery/finalize', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
-    const body = (await c.req.json().catch(() => ({}))) as { runStartedAt?: string; stepErrors?: StepErrorInput[] };
+    const body = (await c.req.json().catch(() => ({}))) as { runStartedAt?: string; stepErrors?: StepErrorInput[]; totalSteps?: number };
     if (!body.runStartedAt) return errJson(400, 'runStartedAt is required');
 
     const connection = await loadConnection(db, orgId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
 
-    const outcome = await runFinalize(db, orgId, auth.userId, connection, body.runStartedAt, body.stepErrors ?? []);
+    const outcome = await runFinalize(db, orgId, auth.userId, connection, body.runStartedAt, body.stepErrors ?? [], COVERED_RESOURCE_TYPES, body.totalSteps ?? 0);
     return okJson(outcome);
   }),
 );
