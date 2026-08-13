@@ -693,6 +693,15 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   );
 
   const realErrors = stepErrors.filter((e) => e.severity !== 'info');
+  // A handful of transient failures (a couple of "fetch failed" network
+  // blips late in a long multi-region run, say) shouldn't flip a connection
+  // that mostly succeeded to a scary "error" badge -- found via a real case
+  // this session: 15 failed steps out of 1,100+, with 428 real resources
+  // landed cleanly, still showed status='error'. This threshold is a fixed
+  // count rather than a ratio of total steps run, since that number isn't
+  // threaded through to this function today; revisit if that changes.
+  const ERROR_STATUS_THRESHOLD = 10;
+  const connectionIsBroken = realErrors.length > ERROR_STATUS_THRESHOLD;
   const summary = {
     scannedAt: now, totalResources: activeCount, categoryCounts: activeCategoryCounts,
     servicesTotal: `${Object.keys(REGIONAL_SCANNERS).length + Object.keys(GLOBAL_SCANNERS).length} live / 245 catalogued`,
@@ -704,7 +713,7 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
     { id: `eq.${connection.id}` },
     {
       last_discovery_at: now, last_full_scan_at: now, last_sync_at: now, resource_summary: summary,
-      status: realErrors.length > 0 ? 'error' : 'connected',
+      status: connectionIsBroken ? 'error' : 'connected',
       error_message: realErrors.length > 0 ? `${realErrors.length} scan step(s) failed: ${realErrors.slice(0, 3).map((e) => e.message).join('; ')}` : null,
     },
     'return=minimal',
@@ -720,7 +729,7 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   await db.insert(
     'connection_validation_runs',
     {
-      connection_id: connection.id, run_type: 'discovery', status: realErrors.length > 0 ? 'failed' : 'succeeded',
+      connection_id: connection.id, run_type: 'discovery', status: connectionIsBroken ? 'failed' : 'succeeded',
       started_at: runStartedAt, finished_at: now, triggered_by: actorId,
       error_message: realErrors.length > 0 ? `${realErrors.length} scan step(s) failed: ${realErrors.slice(0, 3).map((e) => e.message).join('; ')}` : null,
     },
