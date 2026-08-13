@@ -65,6 +65,21 @@ import { scanTrustedAdvisorResource, TRUSTEDADVISOR_RESOURCE_TYPES } from '../li
 import { scanShield, SHIELD_RESOURCE_TYPES } from '../lib/scanners/shield';
 import { scanOrganizations, ORGANIZATIONS_RESOURCE_TYPES } from '../lib/scanners/organizations';
 import { scanHealth, HEALTH_RESOURCE_TYPES } from '../lib/scanners/health';
+import { scanDataSync, DATASYNC_RESOURCE_TYPES } from '../lib/scanners/datasync';
+import { scanDrs, DRS_RESOURCE_TYPES } from '../lib/scanners/drs';
+import { scanFsx, FSX_RESOURCE_TYPES } from '../lib/scanners/fsx';
+import { scanGlacier, GLACIER_RESOURCE_TYPES } from '../lib/scanners/glacier';
+import { scanS3Control, S3CONTROL_RESOURCE_TYPES } from '../lib/scanners/s3control';
+import { scanSnowball, SNOWBALL_RESOURCE_TYPES } from '../lib/scanners/snowball';
+import { scanStorageGateway, STORAGEGATEWAY_RESOURCE_TYPES } from '../lib/scanners/storagegateway';
+import { scanMemoryDb, MEMORYDB_RESOURCE_TYPES } from '../lib/scanners/memorydb';
+import { scanRedshiftServerless, REDSHIFTSERVERLESS_RESOURCE_TYPES } from '../lib/scanners/redshiftserverless';
+import { scanTimestream, TIMESTREAM_RESOURCE_TYPES } from '../lib/scanners/timestream';
+import { scanAppMesh, APPMESH_RESOURCE_TYPES } from '../lib/scanners/appmesh';
+import { scanDirectConnect, DIRECTCONNECT_RESOURCE_TYPES } from '../lib/scanners/directconnect';
+import { scanGlobalAccelerator, GLOBALACCELERATOR_RESOURCE_TYPES } from '../lib/scanners/globalaccelerator';
+import { scanRoute53Resolver, ROUTE53RESOLVER_RESOURCE_TYPES } from '../lib/scanners/route53resolver';
+import { scanServiceDiscovery, SERVICEDISCOVERY_RESOURCE_TYPES } from '../lib/scanners/servicediscovery';
 import { scanGuardDutyFindings } from '../lib/scanners/guarddutyFindings';
 import { scanSecurityHubFindings } from '../lib/scanners/securityhubFindings';
 import { scanAccessAnalyzerFindings } from '../lib/scanners/accessAnalyzerFindings';
@@ -174,6 +189,19 @@ export const REGIONAL_SCANNERS: Record<string, ScannerFn> = {
   wellarchitected: scanWellArchitected,
   computeoptimizer: scanComputeOptimizer,
   servicecatalog: scanServiceCatalog,
+  datasync: scanDataSync,
+  drs: scanDrs,
+  fsx: scanFsx,
+  glacier: scanGlacier,
+  snowball: scanSnowball,
+  storagegateway: scanStorageGateway,
+  memorydb: scanMemoryDb,
+  redshiftserverless: scanRedshiftServerless,
+  timestream: scanTimestream,
+  appmesh: scanAppMesh,
+  directconnect: scanDirectConnect,
+  route53resolver: scanRoute53Resolver,
+  servicediscovery: scanServiceDiscovery,
 };
 export const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
   iam: scanIam,
@@ -184,6 +212,8 @@ export const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
   shield: scanShield,
   organizations: scanOrganizations,
   health: scanHealth,
+  s3control: scanS3Control,
+  globalaccelerator: scanGlobalAccelerator,
 };
 
 /**
@@ -308,6 +338,21 @@ export const SCANNER_RESOURCE_TYPES: Record<string, readonly string[]> = {
   shield: SHIELD_RESOURCE_TYPES,
   organizations: ORGANIZATIONS_RESOURCE_TYPES,
   health: HEALTH_RESOURCE_TYPES,
+  datasync: DATASYNC_RESOURCE_TYPES,
+  drs: DRS_RESOURCE_TYPES,
+  fsx: FSX_RESOURCE_TYPES,
+  glacier: GLACIER_RESOURCE_TYPES,
+  s3control: S3CONTROL_RESOURCE_TYPES,
+  snowball: SNOWBALL_RESOURCE_TYPES,
+  storagegateway: STORAGEGATEWAY_RESOURCE_TYPES,
+  memorydb: MEMORYDB_RESOURCE_TYPES,
+  redshiftserverless: REDSHIFTSERVERLESS_RESOURCE_TYPES,
+  timestream: TIMESTREAM_RESOURCE_TYPES,
+  appmesh: APPMESH_RESOURCE_TYPES,
+  directconnect: DIRECTCONNECT_RESOURCE_TYPES,
+  globalaccelerator: GLOBALACCELERATOR_RESOURCE_TYPES,
+  route53resolver: ROUTE53RESOLVER_RESOURCE_TYPES,
+  servicediscovery: SERVICEDISCOVERY_RESOURCE_TYPES,
 };
 const COVERED_RESOURCE_TYPES = Object.values(SCANNER_RESOURCE_TYPES).flat();
 
