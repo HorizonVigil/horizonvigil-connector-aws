@@ -16,7 +16,7 @@ interface ListAcceleratorsResponse { Accelerators?: Accelerator[] }
 export async function scanGlobalAccelerator(ctx: ScannerContext): Promise<ScannedResource[]> {
   const result = await callJsonApi(ctx.creds, {
     service: 'globalaccelerator', region: 'us-west-2', host: 'globalaccelerator.us-west-2.amazonaws.com',
-    target: 'GlobalAccelerator_V20180808.ListAccelerators', body: {},
+    target: 'GlobalAccelerator_V20180706.ListAccelerators', body: {},
   });
   if (!result.ok) {
     console.error(`Global Accelerator ListAccelerators failed (continuing without it): ${result.errorMessage ?? result.errorCode ?? result.status}`);
