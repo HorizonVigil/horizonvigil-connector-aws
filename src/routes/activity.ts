@@ -26,9 +26,9 @@ function mapRow(r: AuditRow) {
 
 /**
  * GET /api/aws-accounts/accounts/:id/activity — one account's own audit
- * trail: every audit_log row CloudOps360 itself wrote while acting on this
+ * trail: every audit_log row HorizonVigil itself wrote while acting on this
  * connection (connect/disconnect/test/validation/discovery/sync/recommendation
- * events). This is CloudOps360's own action log, not AWS CloudTrail — it
+ * events). This is HorizonVigil's own action log, not AWS CloudTrail — it
  * won't show e.g. a security group edited via the AWS Console or CLI. Real
  * AWS-side audit (CloudTrail LookupEvents) isn't ingested by any scanner yet.
  */

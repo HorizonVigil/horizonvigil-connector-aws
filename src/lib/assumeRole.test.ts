@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { assumeConnectionRole } from './assumeRole';
 
-const ROLE_ARN = 'arn:aws:iam::123456789012:role/cloudops360-readonly';
+const ROLE_ARN = 'arn:aws:iam::123456789012:role/horizonvigil-readonly';
 const EXTERNAL_ID = 'ext-abc123';
 
 afterEach(() => {

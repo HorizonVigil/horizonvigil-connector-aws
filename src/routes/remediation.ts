@@ -336,7 +336,7 @@ remediationRoutes.post('/remediation/:id/execute', (c) =>
 
     let snapshotId: string | undefined;
     if (existing.action_type === 'delete_volume') {
-      const snap = await createSafetySnapshot(resolved.creds, existing.region, existing.target_resource_id, `Auto-snapshot before CloudOps360 remediation ${existing.id}`);
+      const snap = await createSafetySnapshot(resolved.creds, existing.region, existing.target_resource_id, `Auto-snapshot before HorizonVigil remediation ${existing.id}`);
       if ('error' in snap) {
         const [updated] = await db.update<RemediationRequestRow[]>('remediation_requests', { id: `eq.${existing.id}` }, { status: 'failed', execution_result: { reason: `Safety snapshot failed, delete aborted: ${snap.error}` } });
         await logExecution(db, orgId, existing, 'failed', auth.userId, { reason: snap.error });

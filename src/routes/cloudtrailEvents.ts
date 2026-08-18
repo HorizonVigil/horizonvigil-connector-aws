@@ -48,22 +48,22 @@ function mapEvent(e: RawCloudTrailEvent) {
  * GET /api/aws-accounts/accounts/:id/cloudtrail-events — real AWS-side audit
  * history for this account, live from AWS CloudTrail's LookupEvents API
  * (not stored/synced anywhere — proxied live on every request). This is
- * genuinely different from the account's CloudOps360 activity log: it shows
+ * genuinely different from the account's HorizonVigil activity log: it shows
  * actual AWS Console/CLI/SDK/Terraform actions taken by real IAM identities
  * (who, from what source IP, with what request parameters), not actions
- * taken through CloudOps360 itself.
+ * taken through HorizonVigil itself.
  *
  * Works with zero setup on the customer's side: LookupEvents returns the
  * default 90-day CloudTrail Event History every AWS account has whether or
  * not they've configured a Trail — it just needs the connection's IAM
- * identity to have cloudtrail:LookupEvents, which the CloudOps360
+ * identity to have cloudtrail:LookupEvents, which the HorizonVigil
  * least-privilege policy already includes (see leastPrivilegePolicy.ts).
  * An identity without it gets a clear, actionable AccessDenied message
  * below rather than a generic 500.
  *
  * LookupAttributes is intentionally capped at one filter — that's a real
  * AWS API constraint (LookupEvents only accepts a single lookup attribute
- * per call), not something CloudOps360 is choosing to under-build.
+ * per call), not something HorizonVigil is choosing to under-build.
  */
 cloudtrailEventsRoutes.get('/accounts/:id/cloudtrail-events', (c) =>
   guarded(async () => {
@@ -108,7 +108,7 @@ cloudtrailEventsRoutes.get('/accounts/:id/cloudtrail-events', (c) =>
 
     if (!result.ok) {
       if (result.errorCode === 'AccessDeniedException' || result.status === 403) {
-        return errJson(403, 'This connection\'s IAM identity doesn\'t have cloudtrail:LookupEvents permission. Grant it (already included in CloudOps360\'s documented least-privilege policy) to see real AWS-side account activity here.');
+        return errJson(403, 'This connection\'s IAM identity doesn\'t have cloudtrail:LookupEvents permission. Grant it (already included in HorizonVigil\'s documented least-privilege policy) to see real AWS-side account activity here.');
       }
       return errJson(result.status || 500, result.errorMessage ?? result.errorCode ?? 'CloudTrail LookupEvents call failed.');
     }

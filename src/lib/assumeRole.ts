@@ -30,7 +30,7 @@ export async function assumeConnectionRole(
     Action: 'AssumeRole',
     Version: '2011-06-15',
     RoleArn: roleArn,
-    RoleSessionName: 'cloudops360-validation',
+    RoleSessionName: 'horizonvigil-validation',
     ExternalId: externalId,
     DurationSeconds: '900',
   }).toString();

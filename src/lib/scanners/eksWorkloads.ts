@@ -35,7 +35,7 @@ export const EKS_WORKLOAD_RESOURCE_TYPES = ['eks_pod', 'eks_deployment', 'eks_na
  * (CONFIG_MAP-only clusters, the legacy path — kube-system namespace):
  *
  *   - userarn: <this connection's IAM user or role ARN>
- *     username: cloudops360-reader
+ *     username: horizonvigil-reader
  *     groups: ["view"]
  *
  * (The "view" group requires a matching ClusterRoleBinding to the built-in
