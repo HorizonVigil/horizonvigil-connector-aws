@@ -2,9 +2,10 @@
 # used (GitHub Actions CI is account-wide blocked on a billing failure this
 # session). Needed specifically because the shared-lib git dependency
 # requires an authenticated clone (see Dockerfile) and the plain
-# `gcloud run deploy --source` path has no way to inject a build secret
-# without BuildKit, which this project's default Cloud Build docker builder
-# doesn't reliably have available.
+# `gcloud run deploy --source` path has no way to inject a build secret at all.
+# `docker buildx create --use` below provisions a real BuildKit backend so
+# `docker buildx build --secret` can mount GH_PAT as a file instead of a
+# --build-arg (which would otherwise land in image layer history).
 #
 # Usage: gcloud builds submit --config=cloudbuild.yaml --region=us-central1 .
 #        gcloud run deploy connector-aws --image=us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest --region=us-central1
@@ -14,7 +15,11 @@ steps:
     args:
       - '-c'
       - |
-        docker build --build-arg GH_PAT="$$GH_PAT" -t us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest .
+        set -euo pipefail
+        docker buildx create --use --name ci-builder --driver docker-container >/dev/null 2>&1 || docker buildx use ci-builder
+        printf '%s' "$$GH_PAT" > /tmp/gh_pat
+        docker buildx build --secret id=gh_pat,src=/tmp/gh_pat --load -t us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest .
+        rm -f /tmp/gh_pat
     secretEnv: ['GH_PAT']
 availableSecrets:
   secretManager:
