@@ -25,7 +25,7 @@ import { scanSecurityHub, SECURITYHUB_RESOURCE_TYPES } from '../lib/scanners/sec
 import { scanAutoScaling, AUTOSCALING_RESOURCE_TYPES } from '../lib/scanners/autoscaling';
 import { scanElastiCache, ELASTICACHE_RESOURCE_TYPES } from '../lib/scanners/elasticache';
 import { scanRedshift, REDSHIFT_RESOURCE_TYPES } from '../lib/scanners/redshift';
-import { scanCloudFormation, CLOUDFORMATION_RESOURCE_TYPES } from '../lib/scanners/cloudformation';
+import { scanCloudFormation, CLOUDFORMATION_RESOURCE_TYPES, scanCloudFormationDeploymentEvents } from '../lib/scanners/cloudformation';
 import { scanEfs, EFS_RESOURCE_TYPES } from '../lib/scanners/efs';
 import { scanBackup, BACKUP_RESOURCE_TYPES } from '../lib/scanners/backup';
 import { scanCloudWatch, CLOUDWATCH_RESOURCE_TYPES, extractMonitoringAlarmRows } from '../lib/scanners/cloudwatch';
@@ -636,6 +636,21 @@ export async function runResourceStep(db: Db, orgId: string, env: Env, connectio
     const alarmRows = extractMonitoringAlarmRows(scanned, connection.id);
     if (alarmRows.length > 0) {
       await db.insert('monitoring_alarms?on_conflict=connection_id,alarm_name', alarmRows, 'resolution=merge-duplicates,return=minimal');
+    }
+  }
+
+  // deployment_events sync -- real deployment history, Phase 3 of the
+  // admin-console investigation-infrastructure roadmap. Needs a second API
+  // call per stack (DescribeStackEvents has no account-wide list), so this
+  // runs after the main cloudformation_stack rows are known, not derived
+  // from `scanned` alone like the alarm sync above.
+  if (scannerName === 'cloudformation') {
+    const stackNames = scanned.filter((r) => r.resourceTypeKey === 'cloudformation_stack' && r.resourceName).map((r) => r.resourceName as string);
+    if (stackNames.length > 0) {
+      const events = await scanCloudFormationDeploymentEvents({ creds: resolved.creds, region }, connection.id, stackNames);
+      if (events.length > 0) {
+        await db.insert('deployment_events?on_conflict=connection_id,provider,event_id', events, 'resolution=merge-duplicates,return=minimal');
+      }
     }
   }
 

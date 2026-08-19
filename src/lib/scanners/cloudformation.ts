@@ -56,3 +56,53 @@ export async function scanCloudFormation(ctx: ScannerContext): Promise<ScannedRe
   }
   return out;
 }
+
+export interface DeploymentEventRow {
+  connection_id: string; provider: 'aws'; deployment_name: string; event_id: string;
+  status: string; reason: string | null; resource_type: string | null;
+  logical_resource_id: string | null; physical_resource_id: string | null;
+  region: string; occurred_at: string; metadata: Record<string, unknown>;
+}
+
+/**
+ * Real deployment history -- DescribeStackEvents returns a genuine,
+ * chronological, per-resource-status log of every stack create/update/
+ * delete operation, timestamped by AWS itself. This is the first real
+ * deployment-tracking signal in this codebase (see the admin-console
+ * investigation-infrastructure roadmap, Phase 3): every other "deployment"
+ * concept anywhere in this fleet is current-state-only inventory, not
+ * history.
+ *
+ * One DescribeStackEvents call per stack (the API has no account-wide
+ * "all events" endpoint), so this is capped to the most recent 20 stacks
+ * per region-scan to keep the step inside its request budget -- a
+ * pragmatic first-pass limit, not a hard architectural one. No pagination
+ * beyond the first page: CFN returns events newest-first, and the first
+ * page is what a root-cause view actually needs (recent history), not an
+ * exhaustive archive.
+ */
+export async function scanCloudFormationDeploymentEvents(ctx: ScannerContext, connectionId: string, stackNames: string[]): Promise<DeploymentEventRow[]> {
+  const endpoint = `cloudformation.${ctx.region}.amazonaws.com`;
+  const out: DeploymentEventRow[] = [];
+  for (const stackName of stackNames.slice(0, 20)) {
+    const result = await callQueryApi(ctx.creds, { service: 'cloudformation', region: ctx.region, host: endpoint, action: 'DescribeStackEvents', version: VERSION, params: { StackName: stackName } });
+    if (!result.ok) {
+      console.error(`CloudFormation DescribeStackEvents failed for ${stackName} in ${ctx.region} (continuing without it): ${result.errorMessage ?? result.errorCode ?? result.status}`);
+      continue;
+    }
+    for (const event of extractListItems(extractSection(result.body as string, 'StackEvents'), 'member')) {
+      const eventId = field(event, 'EventId');
+      const timestamp = field(event, 'Timestamp');
+      const status = field(event, 'ResourceStatus');
+      if (!eventId || !timestamp || !status) continue;
+      out.push({
+        connection_id: connectionId, provider: 'aws', deployment_name: stackName, event_id: eventId,
+        status, reason: field(event, 'ResourceStatusReason'), resource_type: field(event, 'ResourceType'),
+        logical_resource_id: field(event, 'LogicalResourceId'), physical_resource_id: field(event, 'PhysicalResourceId'),
+        region: ctx.region, occurred_at: timestamp,
+        metadata: { clientRequestToken: field(event, 'ClientRequestToken') },
+      });
+    }
+  }
+  return out;
+}
