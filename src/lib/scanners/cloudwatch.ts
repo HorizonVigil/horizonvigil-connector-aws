@@ -86,3 +86,32 @@ export async function scanCloudWatch(ctx: ScannerContext): Promise<ScannedResour
 
   return out;
 }
+
+export interface MonitoringAlarmRow {
+  connection_id: string; resource_id: null; alarm_name: string; metric_name: string;
+  namespace: string; region: string; state: string; threshold: number | null; comparison_operator: string | null;
+}
+
+/**
+ * Derives monitoring_alarms rows from scanCloudWatch's own output rather
+ * than making a second DescribeAlarms call -- the cloudwatch_alarm
+ * ScannedResource objects it already produces carry every field this table
+ * needs (name/state/metricName/namespace/comparisonOperator/threshold), so
+ * this is a pure filter+map over data already fetched, not a new API call.
+ * resource_id stays null: nothing in this codebase structurally links an
+ * alarm to the resource it monitors (see monitoring_alarms' schema itself,
+ * and cloud_resources' cloudwatch_alarm rows, which have the same gap) --
+ * namespace/metricName string-matching is a future UI-layer concern, not
+ * something this sync can resolve at write time.
+ */
+export function extractMonitoringAlarmRows(scanned: ScannedResource[], connectionId: string): MonitoringAlarmRow[] {
+  return scanned
+    .filter((r): r is ScannedResource & { resourceName: string; region: string } => r.resourceTypeKey === 'cloudwatch_alarm' && !!r.resourceName && !!r.region)
+    .map((r) => ({
+      connection_id: connectionId, resource_id: null, alarm_name: r.resourceName,
+      metric_name: (r.metadata?.metricName as string) ?? '', namespace: (r.metadata?.namespace as string) ?? '',
+      region: r.region, state: r.state ?? 'INSUFFICIENT_DATA',
+      threshold: r.metadata?.threshold != null ? Number(r.metadata.threshold) : null,
+      comparison_operator: (r.metadata?.comparisonOperator as string) ?? null,
+    }));
+}

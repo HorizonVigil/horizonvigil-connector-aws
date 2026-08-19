@@ -28,7 +28,7 @@ import { scanRedshift, REDSHIFT_RESOURCE_TYPES } from '../lib/scanners/redshift'
 import { scanCloudFormation, CLOUDFORMATION_RESOURCE_TYPES } from '../lib/scanners/cloudformation';
 import { scanEfs, EFS_RESOURCE_TYPES } from '../lib/scanners/efs';
 import { scanBackup, BACKUP_RESOURCE_TYPES } from '../lib/scanners/backup';
-import { scanCloudWatch, CLOUDWATCH_RESOURCE_TYPES } from '../lib/scanners/cloudwatch';
+import { scanCloudWatch, CLOUDWATCH_RESOURCE_TYPES, extractMonitoringAlarmRows } from '../lib/scanners/cloudwatch';
 import { scanCloudTrail, CLOUDTRAIL_RESOURCE_TYPES } from '../lib/scanners/cloudtrail';
 import { scanSsm, SSM_RESOURCE_TYPES } from '../lib/scanners/ssm';
 import { scanEvents, EVENTS_RESOURCE_TYPES } from '../lib/scanners/events';
@@ -557,15 +557,16 @@ export async function runMetricStep(db: Db, orgId: string, env: Env, connectionI
 export async function runResourceStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
   let scanner: ScannerFn | undefined;
   let region: string;
+  let scannerName: string;
   if (stepId.startsWith('regional:')) {
     const rest = stepId.slice('regional:'.length);
     const sep = rest.indexOf(':');
     if (sep === -1) return { stepId, resourceCount: 0, created: 0, error: `Malformed stepId "${stepId}"`, errorSeverity: 'error' };
-    const scannerName = rest.slice(0, sep);
+    scannerName = rest.slice(0, sep);
     region = rest.slice(sep + 1);
     scanner = REGIONAL_SCANNERS[scannerName];
   } else if (stepId.startsWith('global:')) {
-    const scannerName = stepId.slice('global:'.length);
+    scannerName = stepId.slice('global:'.length);
     region = 'global';
     scanner = GLOBAL_SCANNERS[scannerName];
   } else {
@@ -625,6 +626,17 @@ export async function runResourceStep(db: Db, orgId: string, env: Env, connectio
   await db.insert('cloud_resources?on_conflict=connection_id,resource_type_key,resource_id', rows, 'resolution=merge-duplicates,return=minimal');
   if (createdEvents.length > 0) {
     await db.insert('resource_lifecycle_events', createdEvents, 'return=minimal');
+  }
+
+  // monitoring_alarms sync -- piggybacks on the cloudwatch step's own
+  // DescribeAlarms results (no second API call) so cloudops-observability's
+  // Alerts page and dashboard, which query this table specifically, aren't
+  // permanently empty. See horizonvigil-incidents-adjacent plan notes.
+  if (scannerName === 'cloudwatch') {
+    const alarmRows = extractMonitoringAlarmRows(scanned, connection.id);
+    if (alarmRows.length > 0) {
+      await db.insert('monitoring_alarms?on_conflict=connection_id,alarm_name', alarmRows, 'resolution=merge-duplicates,return=minimal');
+    }
   }
 
   return { stepId, resourceCount: rows.length, created: createdEvents.length };
