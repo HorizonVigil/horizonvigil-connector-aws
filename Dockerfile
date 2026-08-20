@@ -38,5 +38,7 @@ RUN node -e "const p=require('./package.json'); delete p.dependencies['@cloudops
     && npm install --omit=dev
 COPY --from=build /app/node_modules/@cloudops360/shared-lib ./node_modules/@cloudops360/shared-lib
 COPY --from=build /app/dist ./dist
+RUN useradd -r -u 10001 -g node appuser && chown -R appuser:node /app
+USER appuser
 EXPOSE 8080
 CMD ["npm", "run", "start"]
