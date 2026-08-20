@@ -687,6 +687,20 @@ discoveryRoutes.post('/accounts/:id/discovery/run-step', (c) =>
 export interface StepErrorInput { message: string; severity: 'error' | 'info' }
 
 /**
+ * Both real producers of StepErrorInput (this file's own /run-step loop via
+ * internalScan.ts, and the frontend's syncContext.tsx client-orchestrated
+ * loop) construct `message` as the literal `${stepId}: ${error}` -- this
+ * recovers that stepId rather than widening StepErrorInput's shape (and
+ * both callers' request bodies) just to carry a field the message already
+ * encodes. Falls back to the full message if a caller ever doesn't follow
+ * the convention, rather than throwing away the error entirely.
+ */
+function extractStepId(message: string): string {
+  const idx = message.indexOf(': ');
+  return idx === -1 ? message : message.slice(0, idx);
+}
+
+/**
  * POST /api/aws-accounts/accounts/:id/discovery/finalize — runs after every
  * step has completed: anything belonging to this connection, of a resource
  * type a scanner actually ran this cycle, not touched by this run
@@ -785,6 +799,12 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
       connection_id: connection.id, run_type: 'discovery', status: connectionIsBroken ? 'failed' : 'succeeded',
       started_at: runStartedAt, finished_at: now, triggered_by: actorId,
       error_message: realErrors.length > 0 ? `${realErrors.length} scan step(s) failed: ${realErrors.slice(0, 3).map((e) => e.message).join('; ')}` : null,
+      // Full per-step detail (not just the first 3, and not just a
+      // concatenated string) so recurring-failure detection can look back
+      // across runs and name exactly which steps keep failing -- the
+      // >10% threshold above deliberately keeps these runs "succeeded"
+      // (see its comment), so this is the only place that history survives.
+      failed_steps: realErrors.length > 0 ? realErrors.map((e) => ({ step: extractStepId(e.message), message: e.message })) : null,
     },
     'return=minimal',
   );

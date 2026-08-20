@@ -153,7 +153,42 @@ permissionsRoutes.get('/accounts/:id/permissions', (c) =>
   }),
 );
 
-/** GET /api/aws-accounts/accounts/:id/sync-history — every validation run for one account, newest first. */
+/**
+ * A discovery run only leaves "succeeded" when real step failures stay
+ * under the 10% threshold in discovery.ts's runFinalize (deliberately, so
+ * a handful of consistently-flaky steps don't flip every run to a scary
+ * "error" badge -- see that function's comment). That's the right call for
+ * the run-level status, but it means a step that's failed on every single
+ * recent run is otherwise invisible unless someone reads error_message on
+ * each row by hand. This surfaces that pattern explicitly: any step that
+ * failed in at least half of the last 10 discovery runs.
+ */
+const RECURRING_FAILURE_LOOKBACK = 10;
+const RECURRING_FAILURE_MIN_RATIO = 0.5;
+
+interface ValidationRunRow {
+  id: string; run_type: string; status: string; started_at: string;
+  failed_steps: { step: string; message: string }[] | null;
+}
+
+function computeRecurringFailures(runs: ValidationRunRow[]): { step: string; failureCount: number; runsChecked: number; lastMessage: string }[] {
+  const discoveryRuns = runs.filter((r) => r.run_type === 'discovery').slice(0, RECURRING_FAILURE_LOOKBACK);
+  const byStep = new Map<string, { failureCount: number; lastMessage: string }>();
+  for (const run of discoveryRuns) {
+    for (const err of run.failed_steps ?? []) {
+      const existing = byStep.get(err.step);
+      // Runs are newest-first, so the first message seen for a step is its most recent.
+      byStep.set(err.step, { failureCount: (existing?.failureCount ?? 0) + 1, lastMessage: existing?.lastMessage ?? err.message });
+    }
+  }
+  const threshold = discoveryRuns.length * RECURRING_FAILURE_MIN_RATIO;
+  return [...byStep.entries()]
+    .filter(([, v]) => v.failureCount >= threshold && v.failureCount >= 2)
+    .map(([step, v]) => ({ step, failureCount: v.failureCount, runsChecked: discoveryRuns.length, lastMessage: v.lastMessage }))
+    .sort((a, b) => b.failureCount - a.failureCount);
+}
+
+/** GET /api/aws-accounts/accounts/:id/sync-history — every validation run for one account, newest first, plus which steps (if any) have been recurringly failing. */
 permissionsRoutes.get('/accounts/:id/sync-history', (c) =>
   guarded(async () => {
     const auth = getAuthContext(c.req.raw);
@@ -161,13 +196,13 @@ permissionsRoutes.get('/accounts/:id/sync-history', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
-    const runs = await db.select('connection_validation_runs', {
-      select: 'id,run_type,status,identity_arn,identity_account_id,started_at,finished_at,error_message,triggered_by',
+    const runs = await db.select<ValidationRunRow[]>('connection_validation_runs', {
+      select: 'id,run_type,status,identity_arn,identity_account_id,started_at,finished_at,error_message,triggered_by,failed_steps',
       filters: { connection_id: `eq.${c.req.param('id')}` },
       order: 'started_at.desc',
       limit: 50,
     });
-    return okJson({ runs });
+    return okJson({ runs, recurringFailures: computeRecurringFailures(runs) });
   }),
 );
 
