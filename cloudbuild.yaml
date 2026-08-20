@@ -44,3 +44,5 @@ availableSecrets:
   secretManager:
     - versionName: projects/cloudops360/secrets/gh_pat/versions/latest
       env: 'GH_PAT'
+options:
+  logging: CLOUD_LOGGING_ONLY
