@@ -1,16 +1,16 @@
-# Manual-deploy fallback for when `gcloud run deploy --source .` can't be
-# used (GitHub Actions CI is account-wide blocked on a billing failure this
-# session). Needed specifically because the shared-lib git dependency
-# requires an authenticated clone (see Dockerfile) and the plain
-# `gcloud run deploy --source` path has no way to inject a build secret at all.
-# `docker buildx create --use` below provisions a real BuildKit backend so
-# `docker buildx build --secret` can mount GH_PAT as a file instead of a
+# Real CI/CD: a Cloud Build trigger (connected directly to this repo's
+# GitHub App connection, not GitHub Actions) runs this on every push to
+# main -- build, push, deploy, no self-hosted runner or GitHub Actions
+# minutes involved at all. Sidesteps GitHub Actions' account-wide billing
+# block entirely, and the shared-lib git dependency's authenticated-clone
+# requirement (see Dockerfile) the same way the old manual fallback did:
+# `docker buildx build --secret` mounts GH_PAT as a file, never a
 # --build-arg (which would otherwise land in image layer history).
 #
-# Usage: gcloud builds submit --config=cloudbuild.yaml --region=us-central1 .
-#        gcloud run deploy connector-aws --image=us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest --region=us-central1
+# Still runnable by hand: gcloud builds submit --config=cloudbuild.yaml --region=us-central1 .
 steps:
   - name: 'gcr.io/cloud-builders/docker'
+    id: build
     entrypoint: 'bash'
     args:
       - '-c'
@@ -21,9 +21,26 @@ steps:
         docker buildx build --secret id=gh_pat,src=/tmp/gh_pat --load -t us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest .
         rm -f /tmp/gh_pat
     secretEnv: ['GH_PAT']
+  - name: 'gcr.io/cloud-builders/docker'
+    id: push
+    args: ['push', 'us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest']
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: deploy
+    entrypoint: gcloud
+    # min/max-instances=1 pinned on every deploy, not just the first --
+    # otherwise a later `gcloud run deploy` without these flags resets
+    # max-instances to its service default and the account-wide
+    # instance-limit guardrail silently stops applying.
+    args:
+      - 'run'
+      - 'deploy'
+      - 'connector-aws'
+      - '--image=us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest'
+      - '--region=us-central1'
+      - '--min-instances=0'
+      - '--max-instances=1'
+      - '--quiet'
 availableSecrets:
   secretManager:
     - versionName: projects/cloudops360/secrets/gh_pat/versions/latest
       env: 'GH_PAT'
-images:
-  - 'us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest'
