@@ -1,4 +1,4 @@
-import type { Env as BaseEnv } from '@cloudops360/shared-lib';
+import type { Env as BaseEnv } from '@horizonvigil/shared-lib';
 
 /**
  * Cloud Run reads these as plain container environment variables (set via

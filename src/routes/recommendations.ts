@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson, type Env } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson, type Env } from '@horizonvigil/shared-lib';
 import { notCurrentlyExcludedFilter } from '../lib/exclusions';
 
 export const recommendationsRoutes = new Hono<{ Bindings: Env }>();

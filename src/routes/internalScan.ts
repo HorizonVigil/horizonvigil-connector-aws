@@ -1,4 +1,4 @@
-import { Hono, createDb, guarded, okJson, errJson, type Db } from '@cloudops360/shared-lib';
+import { Hono, createDb, guarded, okJson, errJson, type Db } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import {
   REGIONAL_SCANNERS, GLOBAL_SCANNERS, FINDING_SCANNERS, METRIC_STEP_NAME, SCANNER_RESOURCE_TYPES,

@@ -1,4 +1,4 @@
-import { createApp, okJson } from '@cloudops360/shared-lib';
+import { createApp, okJson } from '@horizonvigil/shared-lib';
 import { accountsRoutes } from './routes/accounts';
 import { dashboardRoutes } from './routes/dashboard';
 import { orgHierarchyRoutes } from './routes/organizations';

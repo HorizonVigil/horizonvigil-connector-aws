@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, guarded, okJson, parsePagination, paginatedEnvelope, type Env } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, guarded, okJson, parsePagination, paginatedEnvelope, type Env } from '@horizonvigil/shared-lib';
 
 export const activityRoutes = new Hono<{ Bindings: Env }>();
 

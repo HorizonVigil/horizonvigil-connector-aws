@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, guarded, okJson, errJson } from '@cloudops360/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, guarded, okJson, errJson } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { callJsonApi } from '../lib/awsApi';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
