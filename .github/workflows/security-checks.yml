@@ -1,0 +1,82 @@
+name: Security Checks
+
+on:
+  push:
+    branches: [main, test]
+  pull_request:
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - run: npm install
+
+      - name: Type check
+        run: npm run typecheck --if-present
+
+      - name: Tests
+        run: npm test --if-present
+
+      # devDependencies (build/test tooling) never ship in a production
+      # image or bundle -- --omit=dev keeps this signal on what's actually
+      # deployed instead of failing the build over dev-only tooling CVEs.
+      - name: Dependency audit (high/critical, production deps only)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Container scan only applies to services with a Dockerfile.
+      - name: Check for a Dockerfile
+        id: has-dockerfile
+        run: echo "exists=$([ -f Dockerfile ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image for scanning
+        if: steps.has-dockerfile.outputs.exists == 'true'
+        run: docker build -t local-scan-target:${{ github.sha }} .
+
+      # scanners: vuln only -- secret detection is gitleaks' job (above).
+      # Running both here flagged UI placeholder copy (a GCP-key JSON
+      # example in an account-connect form) as a "leaked" credential
+      # purely from key-name shape, with no way to allowlist it cleanly
+      # since the bundled JS filename is content-hashed and changes every
+      # build.
+      - name: Container scan
+        if: steps.has-dockerfile.outputs.exists == 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: local-scan-target:${{ github.sha }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+      # Fleet-wide deployment-policy rules learned the hard way this
+      # session: GH_PAT must never be a build-arg (lands in image layer
+      # history), and every runtime image must drop root.
+      - name: Deployment policy checks
+        run: |
+          set -e
+          fail=0
+          if [ -f Dockerfile ]; then
+            if grep -qE '^ARG GH_PAT' Dockerfile; then
+              echo "::error file=Dockerfile::ARG GH_PAT found — secrets must be passed via --mount=type=secret, never a build-arg (it lands in image layer history)."
+              fail=1
+            fi
+            if ! grep -qE '^USER ' Dockerfile; then
+              echo "::error file=Dockerfile::No USER directive — the container would run as root."
+              fail=1
+            fi
+          fi
+          if [ -f cloudbuild.yaml ] && grep -q -- '--build-arg GH_PAT' cloudbuild.yaml; then
+            echo "::error file=cloudbuild.yaml::--build-arg GH_PAT found — use a BuildKit --secret mount instead."
+            fail=1
+          fi
+          exit $fail

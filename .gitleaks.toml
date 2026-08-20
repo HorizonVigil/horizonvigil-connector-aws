@@ -1,0 +1,15 @@
+title = "gitleaks config"
+
+# Extend rather than replace the default ruleset.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known-safe, intentionally-public values"
+regexes = [
+  # Supabase "publishable" keys (sb_publishable_...) are the direct
+  # equivalent of a Stripe pk_ key -- meant to ship in client-side bundles
+  # and committed CI config, not a credential. The service_role key is the
+  # actual secret and is never referenced in this repo.
+  '''sb_publishable_[A-Za-z0-9_-]+''',
+]
