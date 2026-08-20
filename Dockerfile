@@ -12,7 +12,7 @@ COPY package.json ./
 # "x-access-token") and installs the built package straight into
 # node_modules, the same end state npm's own git installer would reach.
 RUN --mount=type=secret,id=gh_pat \
-    git clone --depth 1 --branch v1.0.11 https://x-access-token:$(cat /run/secrets/gh_pat)@github.com/kknr8367/cloudops-shared-lib.git /tmp/shared-lib \
+    git clone --depth 1 --branch v1.0.13 https://x-access-token:$(cat /run/secrets/gh_pat)@github.com/kknr8367/cloudops-shared-lib.git /tmp/shared-lib \
     && cd /tmp/shared-lib && npm install && npm run build && rm -rf node_modules
 RUN node -e "const p=require('./package.json'); delete p.dependencies['@cloudops360/shared-lib']; require('fs').writeFileSync('./package.json', JSON.stringify(p, null, 2));" \
     && npm install \
