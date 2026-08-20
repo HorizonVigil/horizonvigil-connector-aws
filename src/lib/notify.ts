@@ -8,9 +8,13 @@ import type { Env } from '../env';
  * affect the caller's real response.
  */
 export async function notify(env: Env, accessToken: string, orgId: string, event: string, summary: string, detail?: string): Promise<void> {
-  const base = env.AUTOMATION_API_URL || 'https://cloudops360-1-automation-api.thequietmind18.workers.dev';
+  // No hardcoded fallback: forwarding the caller's real bearer token
+  // anywhere requires an explicitly configured destination. Silently
+  // skipping is consistent with this function's own contract (best-effort,
+  // must never affect the caller).
+  if (!env.AUTOMATION_API_URL) return;
   try {
-    await fetch(`${base}/api/automation/webhooks/dispatch`, {
+    await fetch(`${env.AUTOMATION_API_URL}/api/automation/webhooks/dispatch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}`, 'X-Org-Id': orgId },
       body: JSON.stringify({ event, summary, detail }),
