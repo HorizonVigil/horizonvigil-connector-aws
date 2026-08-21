@@ -29,11 +29,21 @@ export async function callQueryApi(
 ): Promise<AwsCallResult> {
   const client = new AwsClient({ accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey, sessionToken: creds.sessionToken, service: opts.service, region: opts.region });
   const body = new URLSearchParams({ Action: opts.action, Version: opts.version, ...(opts.params ?? {}) }).toString();
-  const res = await client.fetch(`https://${opts.host}/`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  });
+  let res: Response;
+  try {
+    res = await client.fetch(`https://${opts.host}/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+  } catch (err) {
+    // Same transport-level failure mode as callJsonApi above (see its
+    // comment) — a service without an endpoint in this region throws here
+    // instead of returning a response, and every caller already has a
+    // graceful !result.ok path that this reuses instead of letting the
+    // exception propagate as an uncaught step error.
+    return { ok: false, status: 0, body: '', errorCode: 'FETCH_FAILED', errorMessage: err instanceof Error ? err.message : 'Network request failed' };
+  }
   const text = await res.text();
   if (!res.ok) {
     return {

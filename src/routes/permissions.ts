@@ -2,7 +2,7 @@ import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, ge
 import type { Env } from '../env';
 import { decryptCredentials } from '../lib/crypto';
 import { assumeConnectionRole } from '../lib/assumeRole';
-import { runFullValidation, type PermissionCheckResult } from '../lib/permissionChecks';
+import { runFullValidation, type PermissionCheckResult, type IdentitySummary } from '../lib/permissionChecks';
 import type { AwsCreds } from '../lib/awsApi';
 
 export const permissionsRoutes = new Hono<{ Bindings: Env }>();
@@ -33,13 +33,108 @@ export async function resolveCredentials(env: Env, connection: ResolvableConnect
   return { creds: assumed.credentials };
 }
 
+type ValidationOutcome =
+  | { crashed: true; message: string }
+  | { crashed: false; status: 'succeeded' | 'failed'; identity: IdentitySummary | null; checks: PermissionCheckResult[]; errorMessage?: string };
+
 /**
- * POST /api/aws-accounts/accounts/:id/permissions/validate — runs real
- * sts:GetCallerIdentity + IAM/Organizations/CloudWatch/CloudTrail/Tagging/
- * Cost Explorer permission probes against the connection's own credentials
- * (or an assumed role), records the run + every check, and updates the
- * connection's status/last_permission_check_at. Editor+ (same bar as
- * triggering any scan/sync elsewhere in this app).
+ * Runs real sts:GetCallerIdentity + IAM/Organizations/CloudWatch/CloudTrail/
+ * Tagging/Cost Explorer permission probes against a connection's own
+ * credentials (or an assumed role), records the run + every check, and
+ * updates the connection's status/last_permission_check_at — shared by both
+ * the interactive route below and /internal/run-due-permission-checks, so
+ * a scheduled check writes exactly the same rows a manual click would.
+ * `actor` is null for a scheduler-triggered run (no user to attribute an
+ * audit log entry to — same "skip audit logging, there's no real actor"
+ * convention internalScan.ts's run-due-scans already uses).
+ *
+ * Everything from resolveCredentials onward can throw (decryption, the AWS
+ * calls themselves, a bad env var) — without the inner try/catch, an
+ * exception would leave the 'running' row inserted below orphaned forever,
+ * since nothing else ever marks it failed. Every exit path resolves that
+ * row one way or another before returning.
+ */
+export async function runConnectionValidation(
+  db: Db,
+  env: Env,
+  connection: ResolvableConnection & { id: string },
+  actor: { orgId: string; userId: string } | null,
+): Promise<ValidationOutcome> {
+  const [run] = await db.insert<{ id: string }[]>('connection_validation_runs', {
+    connection_id: connection.id,
+    status: 'running',
+    triggered_by: actor?.userId ?? null,
+  });
+
+  try {
+    const resolved = await resolveCredentials(env, connection);
+    if ('error' in resolved) {
+      await db.update('connection_validation_runs', { id: `eq.${run.id}` }, { status: 'failed', finished_at: new Date().toISOString(), error_message: resolved.error }, 'return=minimal');
+      await db.update('cloud_connections', { id: `eq.${connection.id}` }, { last_permission_check_at: new Date().toISOString() }, 'return=minimal');
+      if (actor) await writeAuditLog(db, { orgId: actor.orgId, actorId: actor.userId, action: 'aws_account.permission_validation_failed', targetType: 'cloud_connection', targetId: connection.id, metadata: { reason: resolved.error } });
+      return { crashed: false, status: 'failed', errorMessage: resolved.error, identity: null, checks: [] };
+    }
+
+    const { identity, checks } = await runFullValidation(resolved.creds, connection.default_region || 'us-east-1');
+    const overallStatus = checks[0]?.status === 'granted' ? 'succeeded' : 'failed';
+
+    await db.update(
+      'connection_validation_runs',
+      { id: `eq.${run.id}` },
+      {
+        status: overallStatus,
+        finished_at: new Date().toISOString(),
+        identity_arn: identity?.arn ?? null,
+        identity_account_id: identity?.accountId ?? null,
+        identity_user_id: identity?.userId ?? null,
+        error_message: overallStatus === 'failed' ? checks[0]?.detail : null,
+      },
+      'return=minimal',
+    );
+
+    if (checks.length > 0) {
+      await db.insert(
+        'connection_permission_checks',
+        checks.map((check) => ({ run_id: run.id, service: check.service, label: check.label, status: check.status, detail: check.detail, verified: check.verified })),
+        'return=minimal',
+      );
+    }
+
+    const connectionPatch: Record<string, unknown> = { last_permission_check_at: new Date().toISOString() };
+    if (overallStatus === 'succeeded') {
+      connectionPatch.status = 'connected';
+      connectionPatch.error_message = null;
+    } else {
+      connectionPatch.status = 'error';
+      connectionPatch.error_message = checks[0]?.detail ?? 'Validation failed';
+    }
+    await db.update('cloud_connections', { id: `eq.${connection.id}` }, connectionPatch, 'return=minimal');
+
+    if (actor) {
+      await writeAuditLog(db, {
+        orgId: actor.orgId,
+        actorId: actor.userId,
+        action: overallStatus === 'succeeded' ? 'aws_account.permission_validation_succeeded' : 'aws_account.permission_validation_failed',
+        targetType: 'cloud_connection',
+        targetId: connection.id,
+        metadata: { checks: checks.map((ck) => ({ service: ck.service, status: ck.status })) },
+      });
+    }
+
+    return { crashed: false, status: overallStatus, identity, checks };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Validation crashed unexpectedly';
+    await db.update('connection_validation_runs', { id: `eq.${run.id}` }, { status: 'failed', finished_at: new Date().toISOString(), error_message: message }, 'return=minimal');
+    await db.update('cloud_connections', { id: `eq.${connection.id}` }, { status: 'error', error_message: message, last_permission_check_at: new Date().toISOString() }, 'return=minimal');
+    if (actor) await writeAuditLog(db, { orgId: actor.orgId, actorId: actor.userId, action: 'aws_account.permission_validation_failed', targetType: 'cloud_connection', targetId: connection.id, metadata: { reason: message } });
+    return { crashed: true, message };
+  }
+}
+
+/**
+ * POST /api/aws-accounts/accounts/:id/permissions/validate — the
+ * interactive "Validate Permissions" button's endpoint. Editor+ (same bar
+ * as triggering any scan/sync elsewhere in this app).
  */
 permissionsRoutes.post('/accounts/:id/permissions/validate', (c) =>
   guarded(async () => {
@@ -55,77 +150,61 @@ permissionsRoutes.post('/accounts/:id/permissions/validate', (c) =>
     const connection = rows[0];
     if (!connection) return errJson(404, 'Account not found');
 
-    const [run] = await db.insert<{ id: string }[]>('connection_validation_runs', {
-      connection_id: connection.id,
-      status: 'running',
-      triggered_by: auth.userId,
+    const result = await runConnectionValidation(db, c.env, connection, { orgId, userId: auth.userId });
+    if (result.crashed) return errJson(500, result.message);
+    return okJson({ status: result.status, identity: result.identity, checks: result.checks, errorMessage: result.errorMessage });
+  }),
+);
+
+const PERMISSION_CHECK_INTERVAL_DAYS = 7;
+const MAX_PERMISSION_CHECKS_PER_RUN = 10;
+
+/**
+ * POST /api/aws-accounts/internal/run-due-permission-checks — the automatic
+ * counterpart to the interactive route above. Resource discovery already
+ * has this (see internalScan.ts's run-due-scans + the scheduled-scan-aws
+ * Cloud Scheduler job); permission validation never did, meaning it was
+ * genuinely manual-only until now — every connection needed a human to
+ * click "Validate Permissions," with no equivalent of auto_scan_enabled/
+ * next_scheduled_scan_at for permissions specifically. Same auth pattern as
+ * run-due-scans (shared secret + service-role DB, since there's no user
+ * session to check) and the same "not reached this cycle, picked up next
+ * tick" semantics — next_permission_check_at isn't advanced until a
+ * connection is actually checked, so nothing is silently skipped forever.
+ *
+ * Weekly rather than daily: permissions change far less often than
+ * resources, and every check is a handful of real AWS API calls per
+ * connection, not worth running on the same cadence as resource discovery.
+ */
+permissionsRoutes.post('/internal/run-due-permission-checks', (c) =>
+  guarded(async () => {
+    const secret = c.req.header('x-internal-scan-secret');
+    if (!c.env.INTERNAL_SCAN_SECRET) return errJson(503, 'INTERNAL_SCAN_SECRET is not configured — scheduled permission checks are not active in this environment.');
+    if (!c.env.SUPABASE_SERVICE_ROLE_KEY) return errJson(503, 'SUPABASE_SERVICE_ROLE_KEY is not configured — scheduled permission checks cannot authenticate to the database in this environment.');
+    if (secret !== c.env.INTERNAL_SCAN_SECRET) return errJson(403, 'Invalid or missing X-Internal-Scan-Secret.');
+
+    const db = createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY);
+    const now = new Date().toISOString();
+
+    const due = await db.select<(ResolvableConnection & { id: string })[]>('cloud_connections', {
+      select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
+      filters: {
+        provider: 'eq.aws',
+        or: `(next_permission_check_at.is.null,next_permission_check_at.lte.${now})`,
+        status: 'neq.pending',
+      },
+      limit: MAX_PERMISSION_CHECKS_PER_RUN,
     });
 
-    // Everything from here on can throw (decryption, the AWS calls themselves,
-    // a bad env var) — without this try/catch, an exception would leave the
-    // 'running' row above orphaned forever, since nothing else ever marks it
-    // failed. Every exit path below must resolve that row one way or another.
-    try {
-      const resolved = await resolveCredentials(c.env, connection);
-      if ('error' in resolved) {
-        await db.update('connection_validation_runs', { id: `eq.${run.id}` }, { status: 'failed', finished_at: new Date().toISOString(), error_message: resolved.error }, 'return=minimal');
-        await db.update('cloud_connections', { id: `eq.${connection.id}` }, { last_permission_check_at: new Date().toISOString() }, 'return=minimal');
-        await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.permission_validation_failed', targetType: 'cloud_connection', targetId: connection.id, metadata: { reason: resolved.error } });
-        return okJson({ status: 'failed', errorMessage: resolved.error, identity: null, checks: [] });
-      }
-
-      const { identity, checks } = await runFullValidation(resolved.creds, connection.default_region || 'us-east-1');
-      const overallStatus = checks[0]?.status === 'granted' ? 'succeeded' : 'failed';
-
-      await db.update(
-        'connection_validation_runs',
-        { id: `eq.${run.id}` },
-        {
-          status: overallStatus,
-          finished_at: new Date().toISOString(),
-          identity_arn: identity?.arn ?? null,
-          identity_account_id: identity?.accountId ?? null,
-          identity_user_id: identity?.userId ?? null,
-          error_message: overallStatus === 'failed' ? checks[0]?.detail : null,
-        },
-        'return=minimal',
-      );
-
-      if (checks.length > 0) {
-        await db.insert(
-          'connection_permission_checks',
-          checks.map((check) => ({ run_id: run.id, service: check.service, label: check.label, status: check.status, detail: check.detail, verified: check.verified })),
-          'return=minimal',
-        );
-      }
-
-      const connectionPatch: Record<string, unknown> = { last_permission_check_at: new Date().toISOString() };
-      if (overallStatus === 'succeeded') {
-        connectionPatch.status = 'connected';
-        connectionPatch.error_message = null;
-      } else {
-        connectionPatch.status = 'error';
-        connectionPatch.error_message = checks[0]?.detail ?? 'Validation failed';
-      }
-      await db.update('cloud_connections', { id: `eq.${connection.id}` }, connectionPatch, 'return=minimal');
-
-      await writeAuditLog(db, {
-        orgId,
-        actorId: auth.userId,
-        action: overallStatus === 'succeeded' ? 'aws_account.permission_validation_succeeded' : 'aws_account.permission_validation_failed',
-        targetType: 'cloud_connection',
-        targetId: connection.id,
-        metadata: { checks: checks.map((ck) => ({ service: ck.service, status: ck.status })) },
-      });
-
-      return okJson({ status: overallStatus, identity, checks });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Validation crashed unexpectedly';
-      await db.update('connection_validation_runs', { id: `eq.${run.id}` }, { status: 'failed', finished_at: new Date().toISOString(), error_message: message }, 'return=minimal');
-      await db.update('cloud_connections', { id: `eq.${connection.id}` }, { status: 'error', error_message: message, last_permission_check_at: new Date().toISOString() }, 'return=minimal');
-      await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.permission_validation_failed', targetType: 'cloud_connection', targetId: connection.id, metadata: { reason: message } });
-      return errJson(500, message);
+    const results = [];
+    for (const connection of due) {
+      const result = await runConnectionValidation(db, c.env, connection, null);
+      const nextCheck = new Date(Date.now() + PERMISSION_CHECK_INTERVAL_DAYS * 24 * 60 * 60 * 1000).toISOString();
+      await db.update('cloud_connections', { id: `eq.${connection.id}` }, { next_permission_check_at: nextCheck }, 'return=minimal');
+      results.push({ connectionId: connection.id, status: result.crashed ? 'crashed' : result.status });
     }
+
+    return okJson({ connectionsChecked: results.length, results });
   }),
 );
 

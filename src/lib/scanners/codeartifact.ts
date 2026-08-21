@@ -10,9 +10,20 @@ interface ListRepositoriesResponse { repositories?: RepositorySummary[] }
 /** AWS CodeArtifact — REST-JSON, confirmed against AWS's API reference (POST /v1/domains uses this exact shape; ListRepositories mirrors it at POST /v1/repositories, account-wide rather than scoped to one domain). */
 export async function scanCodeArtifact(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'codeartifact', ctx.region);
-  const res = await client.fetch(`https://codeartifact.${ctx.region}.amazonaws.com/v1/repositories`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
-  });
+  // CodeArtifact isn't available in every region (us-west-1 is a confirmed
+  // gap) — client.fetch() throws a raw network exception there instead of
+  // returning a response to check .ok on, same failure mode fixed in
+  // callJsonApi/callQueryApi. This scanner calls client.fetch() directly
+  // rather than through either shared helper, so it needs its own catch.
+  let res: Response;
+  try {
+    res = await client.fetch(`https://codeartifact.${ctx.region}.amazonaws.com/v1/repositories`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+    });
+  } catch (err) {
+    console.error(`CodeArtifact ListRepositories failed in ${ctx.region} (continuing without it): ${err instanceof Error ? err.message : 'Network request failed'}`);
+    return [];
+  }
   const text = await res.text();
   if (!res.ok) {
     console.error(`CodeArtifact ListRepositories failed in ${ctx.region} (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);
