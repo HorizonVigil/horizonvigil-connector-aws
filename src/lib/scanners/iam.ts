@@ -1,6 +1,7 @@
 import { callQueryApi } from '../awsApi';
 import { extractSection, extractListItems, field } from '../xmlList';
 import type { ScannedResource, ScannerContext } from './types';
+import { analyzePrincipalPolicies, parsePolicyDocument, ROLE_ANALYSIS_CAP, type PrincipalPolicyFetcher, type PrivilegeAnalysisResult } from '../iamPrivilegeAnalysis';
 
 const VERSION = '2010-05-08';
 /** IAM is a global service with a single endpoint — always signed against us-east-1 regardless of which scan region a caller passes in, same convention AWS's own CLI/SDKs use for IAM/STS. */
@@ -46,20 +47,31 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
   ]);
 
   const out: ScannedResource[] = [];
+  // Principals to run privilege analysis on after the main inventory loops
+  // below — kept as direct object references into `out` so attaching
+  // privilegeLevel/privilegeReasons later just mutates `resource.metadata`
+  // in place, no second pass over `out` needed to find them again.
+  const principalsToAnalyze: { resource: ScannedResource; kind: 'Role' | 'User'; name: string }[] = [];
 
   for (const u of extractListItems(extractSection(users, 'Users'), 'member')) {
-    out.push({
+    const userName = field(u, 'UserName') ?? undefined;
+    const resource: ScannedResource = {
       resourceTypeKey: 'iam_user', resourceId: field(u, 'UserId')!, region: null,
-      resourceName: field(u, 'UserName') ?? undefined,
+      resourceName: userName,
       metadata: { arn: field(u, 'Arn'), path: field(u, 'Path'), createDate: field(u, 'CreateDate'), passwordLastUsed: field(u, 'PasswordLastUsed') },
-    });
+    };
+    out.push(resource);
+    if (userName) principalsToAnalyze.push({ resource, kind: 'User', name: userName });
   }
   for (const r of extractListItems(extractSection(roles, 'Roles'), 'member')) {
-    out.push({
+    const roleName = field(r, 'RoleName') ?? undefined;
+    const resource: ScannedResource = {
       resourceTypeKey: 'iam_role', resourceId: field(r, 'RoleId')!, region: null,
-      resourceName: field(r, 'RoleName') ?? undefined,
+      resourceName: roleName,
       metadata: { arn: field(r, 'Arn'), path: field(r, 'Path'), createDate: field(r, 'CreateDate'), description: field(r, 'Description'), maxSessionDuration: field(r, 'MaxSessionDuration') },
-    });
+    };
+    out.push(resource);
+    if (roleName) principalsToAnalyze.push({ resource, kind: 'Role', name: roleName });
   }
   for (const p of extractListItems(extractSection(policies, 'Policies'), 'member')) {
     out.push({
@@ -98,6 +110,55 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
       resourceTypeKey: 'iam_saml_provider', resourceId: arn, region: null, resourceName: arn.split('/').pop(),
       metadata: { arn, validUntil: field(saml, 'ValidUntil'), createDate: field(saml, 'CreateDate') },
     });
+  }
+
+  // Real IAM policy-document analysis for the "is this identity
+  // over-privileged" leg of a toxic-combination correlation (see
+  // iamPrivilegeAnalysis.ts) — capped at ROLE_ANALYSIS_CAP principals and
+  // cached per policy ARN across all of them, since the same customer-
+  // managed policy is commonly attached to many roles in a real account.
+  const managedPolicyDocCache = new Map<string, ReturnType<typeof parsePolicyDocument>>();
+  const fetchManagedPolicyDocument = async (policyArn: string) => {
+    if (managedPolicyDocCache.has(policyArn)) return managedPolicyDocCache.get(policyArn) ?? null;
+    const policyXml = await call('GetPolicy', { PolicyArn: policyArn });
+    const versionId = field(policyXml, 'DefaultVersionId');
+    if (!versionId) {
+      managedPolicyDocCache.set(policyArn, null);
+      return null;
+    }
+    const versionXml = await call('GetPolicyVersion', { PolicyArn: policyArn, VersionId: versionId });
+    const doc = parsePolicyDocument(field(versionXml, 'Document'));
+    managedPolicyDocCache.set(policyArn, doc);
+    return doc;
+  };
+
+  for (const { resource, kind, name } of principalsToAnalyze.slice(0, ROLE_ANALYSIS_CAP)) {
+    const fetcher: PrincipalPolicyFetcher = {
+      listAttachedPolicies: async () => {
+        const xml = await call(`ListAttached${kind}Policies`, { [`${kind}Name`]: name });
+        return extractListItems(extractSection(xml, 'AttachedPolicies'), 'member')
+          .map((m) => field(m, 'PolicyArn'))
+          .filter((arn): arn is string => !!arn)
+          .map((policyArn) => ({ policyArn }));
+      },
+      listInlinePolicyNames: async () => {
+        const xml = await call(`List${kind}Policies`, { [`${kind}Name`]: name });
+        return extractListItems(extractSection(xml, 'PolicyNames'), 'member').map((s) => s.trim()).filter(Boolean);
+      },
+      getInlinePolicyDocument: async (policyName: string) => {
+        const xml = await call(`Get${kind}Policy`, { [`${kind}Name`]: name, PolicyName: policyName });
+        return parsePolicyDocument(field(xml, 'PolicyDocument'));
+      },
+      getManagedPolicyDocument: fetchManagedPolicyDocument,
+    };
+    let result: PrivilegeAnalysisResult;
+    try {
+      result = await analyzePrincipalPolicies(fetcher, `${kind.toLowerCase()} ${name}`);
+    } catch (err) {
+      console.error(`IAM privilege analysis failed for ${kind} ${name} (continuing without it): ${err instanceof Error ? err.message : err}`);
+      continue;
+    }
+    resource.metadata = { ...resource.metadata, privilegeLevel: result.privilegeLevel, privilegeReasons: result.privilegeReasons };
   }
 
   // Credential report: a single account-wide security summary (MFA/access-key

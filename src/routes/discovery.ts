@@ -1,6 +1,7 @@
 import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, inFilter, writeAuditLog, guarded, okJson, errJson, type Db } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
+import { resolveFindingResourceIds } from '../lib/arnResourceLookup';
 import { scanEc2, EC2_RESOURCE_TYPES } from '../lib/scanners/ec2';
 import { scanRds, RDS_RESOURCE_TYPES } from '../lib/scanners/rds';
 import { scanIam, IAM_RESOURCE_TYPES } from '../lib/scanners/iam';
@@ -480,12 +481,19 @@ export async function runFindingStep(db: Db, orgId: string, env: Env, connection
   });
   const existingKeys = new Set(existing.map((r) => `${r.finding_source}:${r.aws_finding_id}`));
 
+  // Best-effort resolve each finding's resourceArn back to a real
+  // cloud_resources row for this connection — see arnResourceLookup.ts for
+  // why this can't be a simple 1:1 parse. A finding whose resourceArn
+  // doesn't resolve just gets resource_id: null, same as before this ran.
+  const resourceIdByArn = await resolveFindingResourceIds(db, connection.id, scanned.map((f) => f.resourceArn));
+
   const now = new Date().toISOString();
   let created = 0;
   const rows = scanned.map((f) => {
     if (!existingKeys.has(`${f.findingSource}:${f.awsFindingId}`)) created++;
     return {
-      connection_id: connection.id, resource_id: null, finding_source: f.findingSource, aws_finding_id: f.awsFindingId,
+      connection_id: connection.id, resource_id: (f.resourceArn && resourceIdByArn.get(f.resourceArn)) ?? null,
+      finding_source: f.findingSource, aws_finding_id: f.awsFindingId,
       severity: f.severity, cvss_score: f.cvssScore ?? null, title: f.title, description: f.description ?? null,
       compliance_frameworks: f.complianceFrameworks ?? [], remediation_link: f.remediationLink ?? null,
       discovered_at: f.discoveredAt, region: f.region, resource_arn: f.resourceArn ?? null, last_seen_at: now,
