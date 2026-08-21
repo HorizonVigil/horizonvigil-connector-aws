@@ -53,11 +53,26 @@ export async function callJsonApi(
   opts: { service: string; region: string; host: string; target: string; body: Record<string, unknown> },
 ): Promise<AwsCallResult> {
   const client = new AwsClient({ accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey, sessionToken: creds.sessionToken, service: opts.service, region: opts.region });
-  const res = await client.fetch(`https://${opts.host}/`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-amz-json-1.1', 'X-Amz-Target': opts.target },
-    body: JSON.stringify(opts.body),
-  });
+  let res: Response;
+  try {
+    res = await client.fetch(`https://${opts.host}/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-amz-json-1.1', 'X-Amz-Target': opts.target },
+      body: JSON.stringify(opts.body),
+    });
+  } catch (err) {
+    // A handful of services (Timestream is the known case — its
+    // endpoint-discovery host is only real in the subset of regions that
+    // actually support the service) don't resolve at all in every region a
+    // connection might scan, which throws here instead of returning an HTTP
+    // response to check .ok on. Every caller already has a graceful
+    // "service not available/enabled in this region" path keyed off
+    // `!result.ok` — converting a transport-level failure into that same
+    // shape (rather than letting it propagate as an uncaught step error)
+    // lets that existing handling cover this case too, instead of every
+    // caller needing its own try/catch around the same failure mode.
+    return { ok: false, status: 0, body: {}, errorCode: 'FETCH_FAILED', errorMessage: err instanceof Error ? err.message : 'Network request failed' };
+  }
   const text = await res.text();
   const parsed = text ? safeJsonParse(text) : {};
   if (!res.ok) {
