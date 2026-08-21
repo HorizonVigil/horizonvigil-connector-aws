@@ -17,13 +17,26 @@ interface ExternalAccessDetails {
   principal?: Record<string, string>;
   action?: string[];
 }
+// UNUSED_ACCESS finding detail shapes -- one of these four is present
+// depending on what the analyzer flagged, never more than one per finding.
+interface UnusedPermissionDetails { actions?: string[]; serviceNamespace?: string; lastAccessed?: string }
+interface UnusedIamRoleDetails { lastAccessed?: string }
+interface UnusedIamUserAccessKeyDetails { accessKeyId?: string; lastAccessed?: string }
+interface UnusedIamUserPasswordDetails { lastAccessed?: string }
+interface FindingDetails {
+  externalAccessDetails?: ExternalAccessDetails;
+  unusedPermissionDetails?: UnusedPermissionDetails;
+  unusedIamRoleDetails?: UnusedIamRoleDetails;
+  unusedIamUserAccessKeyDetails?: UnusedIamUserAccessKeyDetails;
+  unusedIamUserPasswordDetails?: UnusedIamUserPasswordDetails;
+}
 interface AccessAnalyzerFinding {
   id: string;
   resource?: string;
   resourceType?: string;
   status?: 'ACTIVE' | 'ARCHIVED' | 'RESOLVED';
   createdAt?: string;
-  findingDetails?: { externalAccessDetails?: ExternalAccessDetails }[];
+  findingDetails?: FindingDetails[];
 }
 interface ListFindingsV2Response {
   findings?: AccessAnalyzerFinding[];
@@ -36,13 +49,62 @@ function describePrincipal(principal: Record<string, string> | undefined): strin
 }
 
 /**
- * Only covers `type=ACCOUNT` analyzers — the classic "is this resource
- * reachable from outside my account" analyzer, and the only one of Access
- * Analyzer's six analyzer types (ACCOUNT, ORGANIZATION, *_UNUSED_ACCESS,
- * *_INTERNAL_ACCESS — a genuinely different, newer finding shape each) this
- * batch covers. ORGANIZATION and the unused-access/internal-access
- * analyzer types are a real, tracked gap, not silently skipped — they'd
- * each need their own field mapping, not a one-line addition.
+ * UNVERIFIED against a real account with an active UNUSED_ACCESS analyzer
+ * (none was available this session -- same caveat inspectorFindings.ts
+ * already carries for the same reason). Shape matches AWS's published
+ * ListFindingsV2 reference for unused-access finding detail types, not yet
+ * exercised against a live response -- if AWS's actual field names differ,
+ * this degrades to the generic fallback title below rather than throwing,
+ * same "never crash on an unexpected shape" convention as everywhere else
+ * in this file.
+ */
+function describeUnusedAccess(details: FindingDetails, resourceLabel: string): { title: string; description: string } | null {
+  if (details.unusedIamUserAccessKeyDetails) {
+    const d = details.unusedIamUserAccessKeyDetails;
+    return {
+      title: `Unused IAM access key on ${resourceLabel}`,
+      description: `Access key ${d.accessKeyId ?? '(unknown)'} has not been used${d.lastAccessed ? ` since ${d.lastAccessed}` : ', ever'}.`,
+    };
+  }
+  if (details.unusedIamUserPasswordDetails) {
+    const d = details.unusedIamUserPasswordDetails;
+    return {
+      title: `Unused IAM console password on ${resourceLabel}`,
+      description: `Console password has not been used${d.lastAccessed ? ` since ${d.lastAccessed}` : ', ever'}.`,
+    };
+  }
+  if (details.unusedIamRoleDetails) {
+    const d = details.unusedIamRoleDetails;
+    return {
+      title: `Unused IAM role: ${resourceLabel}`,
+      description: `This role has not been assumed${d.lastAccessed ? ` since ${d.lastAccessed}` : ', ever'}.`,
+    };
+  }
+  if (details.unusedPermissionDetails) {
+    const d = details.unusedPermissionDetails;
+    return {
+      title: `Unused permissions on ${resourceLabel}`,
+      description: `${d.actions?.length ? `${d.actions.length} unused action(s)` : 'Unused permissions'} in ${d.serviceNamespace ?? 'a service'}${d.lastAccessed ? `, last accessed ${d.lastAccessed}` : ', never used'}.`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Covers `type=ACCOUNT` (external-access) and `type=UNUSED_ACCESS`
+ * analyzers — the two of Access Analyzer's four analyzer types (ACCOUNT,
+ * ORGANIZATION, ACCOUNT_UNUSED_ACCESS, ORGANIZATION_UNUSED_ACCESS) most
+ * relevant outside an AWS Organizations management account. ORGANIZATION
+ * and ORGANIZATION_UNUSED_ACCESS remain a real, tracked gap, not silently
+ * skipped — organization-wide analyzers need org-level credentials this
+ * per-account scanner doesn't have.
+ *
+ * Unused-access findings (over-permissioned/unused roles, users, access
+ * keys, passwords -- the "non-human identity" risk this analyzer type is
+ * purpose-built for) get their own finding_source, iam_access_analyzer_unused,
+ * so they're distinguishable from the external-access findings below that
+ * feed the attack-path correlation engine's exposure leg -- an unused
+ * permission alone isn't "exposed," it's a different risk category.
  *
  * REST-JSON, like the other finding scanners. ListFindingsV2 conveniently
  * embeds findingDetails.externalAccessDetails inline per finding (confirmed
@@ -80,34 +142,64 @@ export async function scanAccessAnalyzerFindings(ctx: ScannerContext): Promise<S
     return text ? (JSON.parse(text) as Record<string, unknown>) : {};
   };
 
-  const analyzerList = (await getJson('/analyzer?type=ACCOUNT')) as ListAnalyzersResponse | null;
-  const analyzers = (analyzerList?.analyzers ?? []).filter((a) => a.status === 'ACTIVE');
+  // Shared ListAnalyzers + paginated ListFindingsV2 walk for one analyzer
+  // `type` -- ACCOUNT and UNUSED_ACCESS each need their own analyzer lookup
+  // (a customer creates each type separately; having one doesn't imply the
+  // other exists) but otherwise page through findings identically.
+  const scanAnalyzerType = async (type: string, processFinding: (f: AccessAnalyzerFinding) => void): Promise<void> => {
+    const analyzerList = (await getJson(`/analyzer?type=${type}`)) as ListAnalyzersResponse | null;
+    const analyzers = (analyzerList?.analyzers ?? []).filter((a) => a.status === 'ACTIVE');
+    for (const analyzer of analyzers) {
+      let nextToken: string | undefined;
+      for (let page = 0; page < 2; page++) {
+        const result = (await postJson('/findingv2', { analyzerArn: analyzer.arn, maxResults: 50, nextToken })) as ListFindingsV2Response | null;
+        if (!result) break;
+        for (const f of result.findings ?? []) {
+          if (f.status !== 'ACTIVE') continue;
+          processFinding(f);
+        }
+        nextToken = result.nextToken;
+        if (!nextToken) break;
+      }
+    }
+  };
 
   const out: ScannedFinding[] = [];
-  for (const analyzer of analyzers) {
-    let nextToken: string | undefined;
-    for (let page = 0; page < 2; page++) {
-      const result = (await postJson('/findingv2', { analyzerArn: analyzer.arn, maxResults: 50, nextToken })) as ListFindingsV2Response | null;
-      if (!result) break;
-      for (const f of result.findings ?? []) {
-        if (f.status !== 'ACTIVE') continue;
-        const details = f.findingDetails?.[0]?.externalAccessDetails;
-        const resourceLabel = f.resourceType?.split('::').pop() ?? 'Resource';
-        out.push({
-          findingSource: 'iam_access_analyzer',
-          awsFindingId: f.id,
-          severity: details?.isPublic ? 'critical' : 'high',
-          title: `${resourceLabel} is accessible from outside this account${details?.isPublic ? ' (public)' : ''}`,
-          description: `Accessible by ${describePrincipal(details?.principal)}${details?.action?.length ? ` for actions: ${details.action.join(', ')}` : ''}`,
-          complianceFrameworks: [],
-          discoveredAt: f.createdAt ?? new Date().toISOString(),
-          region: ctx.region,
-          resourceArn: f.resource,
-        });
-      }
-      nextToken = result.nextToken;
-      if (!nextToken) break;
-    }
-  }
+
+  await scanAnalyzerType('ACCOUNT', (f) => {
+    const details = f.findingDetails?.[0]?.externalAccessDetails;
+    const resourceLabel = f.resourceType?.split('::').pop() ?? 'Resource';
+    out.push({
+      findingSource: 'iam_access_analyzer',
+      awsFindingId: f.id,
+      severity: details?.isPublic ? 'critical' : 'high',
+      title: `${resourceLabel} is accessible from outside this account${details?.isPublic ? ' (public)' : ''}`,
+      description: `Accessible by ${describePrincipal(details?.principal)}${details?.action?.length ? ` for actions: ${details.action.join(', ')}` : ''}`,
+      complianceFrameworks: [],
+      discoveredAt: f.createdAt ?? new Date().toISOString(),
+      region: ctx.region,
+      resourceArn: f.resource,
+    });
+  });
+
+  await scanAnalyzerType('UNUSED_ACCESS', (f) => {
+    const detailEntry = f.findingDetails?.[0];
+    if (!detailEntry) return;
+    const resourceLabel = f.resourceType?.split('::').pop() ?? f.resource ?? 'Resource';
+    const described = describeUnusedAccess(detailEntry, resourceLabel);
+    if (!described) return; // an unrecognized detail shape -- degrade by skipping this one finding, not the whole scan
+    out.push({
+      findingSource: 'iam_access_analyzer_unused',
+      awsFindingId: f.id,
+      severity: 'medium',
+      title: described.title,
+      description: described.description,
+      complianceFrameworks: [],
+      discoveredAt: f.createdAt ?? new Date().toISOString(),
+      region: ctx.region,
+      resourceArn: f.resource,
+    });
+  });
+
   return out;
 }
