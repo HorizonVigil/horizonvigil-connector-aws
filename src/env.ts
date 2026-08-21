@@ -14,6 +14,12 @@ export interface Env extends BaseEnv {
   // "not configured" result when absent, see routes/permissions.ts.
   PLATFORM_AWS_ACCESS_KEY_ID?: string;
   PLATFORM_AWS_SECRET_ACCESS_KEY?: string;
+  // The AWS account ID those credentials belong to -- the AWS Organizations
+  // bulk-import StackSet template (templates/horizonvigil-scan-role-
+  // stackset.yaml) needs this as its trust policy's Principal, not the
+  // credentials themselves. Same "not currently provisioned, degrade
+  // honestly" status as the two above -- see routes/bulkImport.ts.
+  PLATFORM_AWS_ACCOUNT_ID?: string;
   // Public URL for automation-api's event dispatcher (Slack/Jira fan-out on
   // remediation completion) — not sensitive, same convention as every other
   // cross-service URL in this app.

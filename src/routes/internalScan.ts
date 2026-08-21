@@ -141,3 +141,83 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
     return okJson({ connectionsScanned: results.length, results });
   }),
 );
+
+/**
+ * POST /internal/run-first-scans — drains AWS connections stuck at
+ * status='pending' with nothing left to move them forward. Two real cases
+ * land here: bulk-onboarded connections (see bulkImport.ts — every row it
+ * inserts starts 'pending' with no browser session open to call
+ * startDiscovery for it, unlike the interactive wizard, which fires that
+ * call itself right after creating the connection) and an interactively
+ * created connection whose browser tab closed before its one auto-triggered
+ * scan finished. Both are otherwise invisible to run-due-scans above
+ * forever — that query explicitly filters out status='pending', because a
+ * connection that's never been scanned isn't "due" for its *next* scan, it's
+ * waiting on its first one, which is what actually flips its status (see
+ * runFinalize, discovery.ts:791) and makes it eligible for run-due-scans'
+ * normal cadence from here on. This endpoint's only job is getting a
+ * connection through that one gate, once — everything else (regions,
+ * scanners, findings, metrics, MAX_CONNECTIONS_PER_RUN/
+ * MAX_STEPS_PER_CONNECTION safety caps) is identical to run-due-scans.
+ */
+internalScanRoutes.post('/internal/run-first-scans', (c) =>
+  guarded(async () => {
+    const secret = c.req.header('x-internal-scan-secret');
+    if (!c.env.INTERNAL_SCAN_SECRET) return errJson(503, 'INTERNAL_SCAN_SECRET is not configured — scheduled scanning is not active in this environment.');
+    if (!c.env.SUPABASE_SERVICE_ROLE_KEY) return errJson(503, 'SUPABASE_SERVICE_ROLE_KEY is not configured — scheduled scanning cannot authenticate to the database in this environment.');
+    if (secret !== c.env.INTERNAL_SCAN_SECRET) return errJson(403, 'Invalid or missing X-Internal-Scan-Secret.');
+
+    const db = createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY);
+
+    const pending = await db.select<{ id: string; org_id: string }[]>('cloud_connections', {
+      select: 'id,org_id',
+      filters: { provider: 'eq.aws', status: 'eq.pending' },
+      order: 'created_at.asc',
+      limit: MAX_CONNECTIONS_PER_RUN,
+    });
+
+    const results = [];
+    for (const row of pending) {
+      const connection = await loadConnection(db, row.org_id, row.id);
+      if (!connection) continue;
+
+      const runStartedAt = new Date().toISOString();
+      const regions = regionsFor(connection);
+      const steps = [
+        ...regions.flatMap((region) => Object.keys(REGIONAL_SCANNERS).map((name) => `regional:${name}:${region}`)),
+        ...Object.keys(GLOBAL_SCANNERS).map((name) => `global:${name}`),
+        ...regions.flatMap((region) => Object.keys(FINDING_SCANNERS).map((name) => `finding:${name}:${region}`)),
+        ...regions.map((region) => `metric:${METRIC_STEP_NAME}:${region}`),
+      ].slice(0, MAX_STEPS_PER_CONNECTION);
+
+      const stepErrors: StepErrorInput[] = [];
+      const failedStepIds = new Set<string>();
+      for (const stepId of steps) {
+        const result = await runOneStep(db, row.org_id, c.env, row.id, stepId);
+        if (result.error) {
+          stepErrors.push({ message: `${stepId}: ${result.error}`, severity: result.errorSeverity ?? 'error' });
+          if ((result.errorSeverity ?? 'error') !== 'info') failedStepIds.add(stepId);
+        }
+      }
+
+      const stepSet = new Set(steps);
+      const coveredResourceTypes = [
+        ...Object.keys(GLOBAL_SCANNERS).filter((name) => stepSet.has(`global:${name}`) && !failedStepIds.has(`global:${name}`)).flatMap((name) => SCANNER_RESOURCE_TYPES[name] ?? []),
+        ...Object.keys(REGIONAL_SCANNERS).filter((name) => regions.every((r) => stepSet.has(`regional:${name}:${r}`) && !failedStepIds.has(`regional:${name}:${r}`))).flatMap((name) => SCANNER_RESOURCE_TYPES[name] ?? []),
+      ];
+
+      const outcome = await runFinalize(db, row.org_id, null, connection, runStartedAt, stepErrors, coveredResourceTypes, steps.length);
+      // Enters the normal daily cadence from here on — run-due-scans above
+      // now sees this connection, since runFinalize just moved its status
+      // off 'pending'. scan_interval_hours isn't loaded here (loadConnection
+      // doesn't select it, and a freshly bulk-created row has never had a
+      // custom interval set) — 24h matches that column's own default.
+      const nextScan = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      await db.update('cloud_connections', { id: `eq.${row.id}` }, { next_scheduled_scan_at: nextScan }, 'return=minimal');
+
+      results.push({ connectionId: row.id, ...outcome });
+    }
+
+    return okJson({ connectionsScanned: results.length, results });
+  }),
+);

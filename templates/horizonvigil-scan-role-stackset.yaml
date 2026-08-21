@@ -1,0 +1,285 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  HorizonVigil read-only scan role. Deploy this once as a CloudFormation
+  StackSet targeting your AWS Organization (or a specific OU) so every member
+  account gets an identical trust role with no per-account setup. Requires
+  CAPABILITY_NAMED_IAM (the role name is fixed, not auto-generated, so
+  HorizonVigil can predict every member account's role ARN from its account
+  ID alone: arn:aws:iam::<account-id>:role/HorizonVigilRead).
+
+Parameters:
+  ExternalId:
+    Type: String
+    Description: >
+      The per-organization external ID shown in HorizonVigil's AWS
+      Organizations bulk-import screen. The same value goes into every
+      account this StackSet deploys to -- copy it from HorizonVigil, don't
+      invent your own (bulk-import derives each account's expected role ARN
+      and external ID together; a mismatched value here leaves that account
+      permanently unable to authenticate until this stack is updated).
+    AllowedPattern: '.+'
+    ConstraintDescription: ExternalId must not be empty.
+
+  PlatformAccountId:
+    Type: String
+    Description: >
+      HorizonVigil's own platform AWS account ID -- the account that
+      actually calls sts:AssumeRole against the role this template creates.
+      NOT yet a real, provisioned value: contact HorizonVigil to get the
+      real account ID before deploying this StackSet outside of testing.
+      The placeholder default below will create a role nothing can ever
+      assume (fails closed, not open).
+    Default: '000000000000'
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID.
+
+Resources:
+  HorizonVigilScanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: HorizonVigilRead
+      Description: >-
+        Read-only role for HorizonVigil's cloud security scanning. Grants no
+        write, delete, or object/secret-content-read permissions anywhere --
+        see the inline policy below for the exact action list.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${PlatformAccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref ExternalId
+      # Kept in exact sync with cloudops-frontend/src/lib/leastPrivilegePolicy.ts
+      # (LEAST_PRIVILEGE_POLICY) -- the same permission set the interactive
+      # single-account onboarding wizard already shows customers to attach by
+      # hand. A bulk-imported account must not end up more or less privileged
+      # than one connected manually.
+      Policies:
+        - PolicyName: HorizonVigilReadOnlyScan
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ComputeNetworkStorage
+                Effect: Allow
+                Action:
+                  - 'ec2:Describe*'
+                  - 'ec2:GetEbsEncryptionByDefault'
+                  - 'ec2:GetConsoleOutput'
+                  - 'elasticloadbalancing:Describe*'
+                  - 'autoscaling:Describe*'
+                  - 's3:List*'
+                  - 's3:GetBucket*'
+                  - 's3:GetObjectTagging'
+                  - 's3:GetLifecycleConfiguration'
+                  - 's3:GetEncryptionConfiguration'
+                  - 's3:GetBucketPolicyStatus'
+                  - 's3:GetBucketPublicAccessBlock'
+                  - 'efs:Describe*'
+                  - 'fsx:Describe*'
+                  - 'backup:List*'
+                  - 'backup:Describe*'
+                  - 'backup:Get*'
+                  - 'datasync:List*'
+                  - 'glacier:ListVaults'
+                  - 'storagegateway:List*'
+                  - 'storagegateway:Describe*'
+                  - 'snowball:ListJobs'
+                  - 'drs:DescribeSourceServers'
+                  - 'lightsail:Get*'
+                  - 'outposts:ListOutposts'
+                  - 'apprunner:List*'
+                  - 'imagebuilder:List*'
+                  - 'workspaces:Describe*'
+                Resource: '*'
+              - Sid: DatabasesAndCaching
+                Effect: Allow
+                Action:
+                  - 'rds:Describe*'
+                  - 'rds:List*'
+                  - 'dynamodb:Describe*'
+                  - 'dynamodb:List*'
+                  - 'elasticache:Describe*'
+                  - 'redshift:Describe*'
+                  - 'redshift:GetClusterCredentials'
+                  - 'memorydb:Describe*'
+                  - 'redshift-serverless:ListWorkgroups'
+                  - 'timestream:List*'
+                  - 'timestream:Describe*'
+                Resource: '*'
+              - Sid: AnalyticsAndDataPipelines
+                Effect: Allow
+                Action:
+                  - 'athena:List*'
+                  - 'athena:Get*'
+                  - 'glue:Get*'
+                  - 'glue:List*'
+                  - 'kinesis:List*'
+                  - 'kinesis:Describe*'
+                  - 'kafka:List*'
+                  - 'elasticmapreduce:List*'
+                Resource: '*'
+              - Sid: DevOpsCiCdAndMl
+                Effect: Allow
+                Action:
+                  - 'codebuild:List*'
+                  - 'codebuild:BatchGet*'
+                  - 'codepipeline:List*'
+                  - 'cognito-idp:List*'
+                  - 'cognito-identity:List*'
+                  - 'sagemaker:List*'
+                  - 'codecommit:List*'
+                  - 'codecommit:BatchGetRepositories'
+                  - 'codedeploy:List*'
+                  - 'codedeploy:BatchGetApplications'
+                  - 'codeartifact:List*'
+                Resource: '*'
+              - Sid: ContainersAndServerless
+                Effect: Allow
+                Action:
+                  - 'eks:Describe*'
+                  - 'eks:List*'
+                  - 'ecs:Describe*'
+                  - 'ecs:List*'
+                  - 'lambda:List*'
+                  - 'lambda:Get*'
+                  - 'cloudformation:Describe*'
+                  - 'cloudformation:List*'
+                  - 'cloudformation:Get*'
+                  - 'events:List*'
+                  - 'events:Describe*'
+                  - 'states:List*'
+                  - 'states:Describe*'
+                  - 'batch:Describe*'
+                  - 'elasticbeanstalk:Describe*'
+                  - 'apigateway:GET'
+                Resource: '*'
+              - Sid: NetworkingEdgeDns
+                Effect: Allow
+                Action:
+                  - 'route53:List*'
+                  - 'route53:Get*'
+                  - 'cloudfront:List*'
+                  - 'cloudfront:Get*'
+                  - 'acm:List*'
+                  - 'acm:Describe*'
+                  - 'wafv2:List*'
+                  - 'wafv2:Get*'
+                  - 'sqs:List*'
+                  - 'sqs:Get*'
+                  - 'sns:List*'
+                  - 'sns:Get*'
+                  - 'directconnect:Describe*'
+                  - 'globalaccelerator:ListAccelerators'
+                  - 'route53resolver:List*'
+                  - 'servicediscovery:List*'
+                  - 'appmesh:List*'
+                  - 'appmesh:Describe*'
+                Resource: '*'
+              - Sid: IdentityAndKms
+                Effect: Allow
+                Action:
+                  - 'iam:List*'
+                  - 'iam:Get*'
+                  - 'iam:GenerateCredentialReport'
+                  - 'iam:GenerateServiceLastAccessedDetails'
+                  - 'kms:List*'
+                  - 'kms:Describe*'
+                  - 'kms:GetKeyPolicy'
+                  - 'kms:GetKeyRotationStatus'
+                  - 'secretsmanager:List*'
+                  - 'secretsmanager:DescribeSecret'
+                  - 'organizations:List*'
+                  - 'organizations:Describe*'
+                  - 'sts:GetCallerIdentity'
+                Resource: '*'
+              - Sid: SecurityAndCompliance
+                Effect: Allow
+                Action:
+                  - 'securityhub:Get*'
+                  - 'securityhub:List*'
+                  - 'securityhub:Describe*'
+                  - 'guardduty:Get*'
+                  - 'guardduty:List*'
+                  - 'guardduty:Describe*'
+                  - 'inspector2:List*'
+                  - 'inspector2:Get*'
+                  - 'inspector2:BatchGetAccountStatus'
+                  - 'access-analyzer:List*'
+                  - 'access-analyzer:Get*'
+                  - 'config:Describe*'
+                  - 'config:Get*'
+                  - 'config:List*'
+                  - 'fms:ListPolicies'
+                  - 'shield:ListProtections'
+                  - 'network-firewall:List*'
+                  - 'cloudhsm:DescribeClusters'
+                  - 'detective:ListGraphs'
+                Resource: '*'
+              - Sid: MonitoringAndOps
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:Describe*'
+                  - 'cloudwatch:Get*'
+                  - 'cloudwatch:List*'
+                  - 'logs:Describe*'
+                  - 'logs:Get*'
+                  - 'logs:FilterLogEvents'
+                  - 'cloudtrail:Describe*'
+                  - 'cloudtrail:Get*'
+                  - 'cloudtrail:List*'
+                  - 'cloudtrail:LookupEvents'
+                  - 'ssm:Describe*'
+                  - 'ssm:List*'
+                  - 'ssm:Get*'
+                  - 'health:Describe*'
+                Resource: '*'
+              - Sid: CostAndBilling
+                Effect: Allow
+                Action:
+                  - 'ce:Get*'
+                  - 'ce:Describe*'
+                  - 'budgets:View*'
+                  - 'budgets:Describe*'
+                  - 'pricing:GetProducts'
+                  - 'pricing:DescribeServices'
+                  - 'pricing:GetAttributeValues'
+                  - 'cur:Describe*'
+                  - 'account:GetAccountInformation'
+                  - 'account:ListRegions'
+                Resource: '*'
+              - Sid: TrustedAdvisorSupport
+                Effect: Allow
+                Action:
+                  - 'support:Describe*'
+                  - 'trustedadvisor:Describe*'
+                Resource: '*'
+              - Sid: TaggingAndResourceGroups
+                Effect: Allow
+                Action:
+                  - 'tag:GetResources'
+                  - 'tag:GetTagKeys'
+                  - 'tag:GetTagValues'
+                  - 'resource-groups:List*'
+                  - 'resource-groups:Get*'
+                Resource: '*'
+              - Sid: GovernanceAndOptimization
+                Effect: Allow
+                Action:
+                  - 'controltower:ListLandingZones'
+                  - 'resiliencehub:ListApps'
+                  - 'wellarchitected:ListWorkloads'
+                  - 'compute-optimizer:GetEnrollmentStatus'
+                  - 'compute-optimizer:GetEC2InstanceRecommendations'
+                  - 'servicecatalog:ListPortfolios'
+                  - 'servicecatalog:SearchProductsAsAdmin'
+                  - 'ram:GetResourceShares'
+                  - 'ds:DescribeDirectories'
+                Resource: '*'
+
+Outputs:
+  RoleArn:
+    Description: The role ARN created in this member account (for reference only -- HorizonVigil derives this same ARN itself from the account ID, it doesn't read this output).
+    Value: !GetAtt HorizonVigilScanRole.Arn

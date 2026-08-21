@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '../lib/crypto';
 
@@ -92,6 +92,13 @@ accountsRoutes.post('/accounts', (c) =>
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'admin');
+    // Previously unlimited -- a single admin session could hammer this
+    // endpoint with no backstop at all. 30/hour comfortably covers a real
+    // onboarding session (even a large one, added one account at a time)
+    // without capping normal use; genuinely bulk onboarding belongs on
+    // POST /accounts/bulk-import-from-organization (bulkImport.ts), which
+    // has its own, much stricter limit.
+    await enforceRateLimit(db, `aws-account:connect:${orgId}`, 30, 3600);
 
     const body = (await c.req.json().catch(() => ({}))) as ConnectBody;
     if (!body.connectionName) return errJson(400, 'connectionName is required');

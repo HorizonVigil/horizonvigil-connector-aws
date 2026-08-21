@@ -15,6 +15,7 @@ import { internalRegistryTokenRoutes } from './routes/internalRegistryToken';
 import { remediationRoutes } from './routes/remediation';
 import { curRoutes } from './routes/cur';
 import { logsRoutes } from './routes/logs';
+import { bulkImportRoutes } from './routes/bulkImport';
 
 const app = createApp();
 
@@ -36,5 +37,6 @@ app.route('/api/aws-accounts', internalRegistryTokenRoutes);
 app.route('/api/aws-accounts', remediationRoutes);
 app.route('/api/aws-accounts', curRoutes);
 app.route('/api/aws-accounts', logsRoutes);
+app.route('/api/aws-accounts', bulkImportRoutes);
 
 export default app;
