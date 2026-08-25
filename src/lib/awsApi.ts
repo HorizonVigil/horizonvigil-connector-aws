@@ -116,15 +116,30 @@ export function createAwsClient(creds: AwsCreds, service: string, region: string
  * and patched once already, per-scanner, in codeartifact.ts alone, instead
  * of fixed centrally here; every other scanner making a raw `client.fetch()`
  * call was still one unavailable region away from an uncaught step failure
- * with no fix. Wraps in a synthetic failed Response (status 599, the
- * conventional "no complete response" sentinel — a real HTTP status is
- * required by the Response constructor, so 0 isn't usable here) so every
- * caller's existing `!res.ok` branch already handles this without any
- * further change to that caller's own logic.
+ * with no fix.
+ *
+ * Also buffers the body (by default) inside this same try/catch — confirmed
+ * live (2026-08-25, a real S3 scan on a real account) that guarding only the
+ * initial `client.fetch()` call wasn't enough: `fetch()`'s promise resolves
+ * once headers arrive, the body streams in separately, and every caller
+ * immediately calls `.text()` on the result — a connection dropped mid-body
+ * throws there too (same underlying "fetch failed" error, just from a
+ * different line), completely unguarded by only wrapping the initial call.
+ * Buffering here means the caller's later `.text()`/`.json()` call can
+ * never throw a second time — it's just reading an in-memory buffer.
+ * `bufferBody: false` opts out for the one real exception: curIngest.ts's
+ * CUR file download, which deliberately streams a potentially large gzip
+ * file via `res.body` rather than holding it entirely in memory — buffering
+ * would defeat that, and CUR files are the one caller not reading `.text()`
+ * immediately anyway.
  */
-export async function safeFetch(client: AwsClient, url: string, init?: RequestInit): Promise<Response> {
+export async function safeFetch(client: AwsClient, url: string, init?: RequestInit, opts: { bufferBody?: boolean } = {}): Promise<Response> {
+  const bufferBody = opts.bufferBody ?? true;
   try {
-    return await client.fetch(url, init);
+    const res = await client.fetch(url, init);
+    if (!bufferBody) return res;
+    const buf = await res.arrayBuffer();
+    return new Response(buf, { status: res.status, statusText: res.statusText, headers: res.headers });
   } catch (err) {
     return new Response(JSON.stringify({ message: err instanceof Error ? err.message : 'Network request failed' }), { status: 599, statusText: 'Fetch Failed' });
   }

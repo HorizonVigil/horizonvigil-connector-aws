@@ -67,7 +67,11 @@ function currentBillingPeriod(): string {
 async function s3Get(creds: AwsCreds, bucket: string, region: string, key: string): Promise<Response> {
   const client = createAwsClient(creds, 's3', region);
   const encodedKey = key.split('/').map(encodeURIComponent).join('/');
-  return safeFetch(client, `https://${bucket}.s3.${region}.amazonaws.com/${encodedKey}`);
+  // bufferBody: false -- this streams a potentially large gzip CUR file via
+  // res.body (see parseCurBatch below); buffering it entirely into memory
+  // first would defeat the point. A mid-stream failure is instead caught at
+  // the point parseCurBatch actually reads the stream.
+  return safeFetch(client, `https://${bucket}.s3.${region}.amazonaws.com/${encodedKey}`, undefined, { bufferBody: false });
 }
 
 export interface CurManifest {
