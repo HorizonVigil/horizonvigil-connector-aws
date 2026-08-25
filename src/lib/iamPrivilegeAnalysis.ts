@@ -21,6 +21,9 @@ export type PrivilegeLevel = 'scoped' | 'broad' | 'admin_equivalent';
 export interface PrivilegeAnalysisResult {
   privilegeLevel: PrivilegeLevel;
   privilegeReasons: string[];
+  /** The full inventory of policies actually examined (capped the same way as the analysis itself) -- distinct from privilegeReasons, which only explains *why* a level was assigned. A scoped principal still has a real, non-empty policy list worth showing; privilegeReasons alone would render as one generic "no wildcard grants" line. */
+  attachedPolicyNames: string[];
+  inlinePolicyNames: string[];
 }
 
 export const ROLE_ANALYSIS_CAP = 100;
@@ -106,9 +109,11 @@ export async function analyzePrincipalPolicies(fetcher: PrincipalPolicyFetcher, 
   let isAdminEquivalent = false;
   let isBroad = false;
   const reasons: string[] = [];
+  const attachedPolicyNames: string[] = [];
 
   const attached = (await fetcher.listAttachedPolicies()).slice(0, MAX_ATTACHED_POLICIES_PER_PRINCIPAL);
   for (const { policyArn } of attached) {
+    attachedPolicyNames.push(managedPolicyName(policyArn));
     const managedResult = classifyAttachedManagedPolicy(policyArn);
     if (managedResult) {
       isAdminEquivalent = isAdminEquivalent || managedResult.isAdminEquivalent;
@@ -125,8 +130,8 @@ export async function analyzePrincipalPolicies(fetcher: PrincipalPolicyFetcher, 
     reasons.push(...result.reasons);
   }
 
-  const inlineNames = (await fetcher.listInlinePolicyNames()).slice(0, MAX_INLINE_POLICIES_PER_PRINCIPAL);
-  for (const name of inlineNames) {
+  const inlinePolicyNames = (await fetcher.listInlinePolicyNames()).slice(0, MAX_INLINE_POLICIES_PER_PRINCIPAL);
+  for (const name of inlinePolicyNames) {
     const doc = await fetcher.getInlinePolicyDocument(name);
     if (!doc) continue;
     const result = evaluatePolicyDocument(doc, `inline policy ${name}`);
@@ -137,7 +142,7 @@ export async function analyzePrincipalPolicies(fetcher: PrincipalPolicyFetcher, 
 
   const privilegeLevel: PrivilegeLevel = isAdminEquivalent ? 'admin_equivalent' : isBroad ? 'broad' : 'scoped';
   if (privilegeLevel === 'scoped') reasons.push(`${principalLabel}: no wildcard grants found in the policies analyzed`);
-  return { privilegeLevel, privilegeReasons: reasons };
+  return { privilegeLevel, privilegeReasons: reasons, attachedPolicyNames, inlinePolicyNames };
 }
 
 /** Decodes IAM's URL-encoded PolicyDocument JSON, tolerating anything malformed by returning null rather than throwing — same degrade-honestly convention as every other AWS response parser in this codebase. */

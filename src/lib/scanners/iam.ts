@@ -50,8 +50,15 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
   // Principals to run privilege analysis on after the main inventory loops
   // below — kept as direct object references into `out` so attaching
   // privilegeLevel/privilegeReasons later just mutates `resource.metadata`
-  // in place, no second pass over `out` needed to find them again.
-  const principalsToAnalyze: { resource: ScannedResource; kind: 'Role' | 'User'; name: string }[] = [];
+  // in place, no second pass over `out` needed to find them again. Groups
+  // are included alongside users/roles: AWS's ListAttachedGroupPolicies/
+  // ListGroupPolicies/GetGroupPolicy follow the exact same ${kind}-templated
+  // action-name shape as User/Role, and a group's attached/inline policies
+  // are real permissions its members inherit -- worth surfacing the same
+  // way, even though a group can't itself authenticate or be assumed (see
+  // extractCloudIdentityRows below for how that distinction is represented:
+  // is_human is always false for a group, same as a role).
+  const principalsToAnalyze: { resource: ScannedResource; kind: 'Role' | 'User' | 'Group'; name: string }[] = [];
 
   for (const u of extractListItems(extractSection(users, 'Users'), 'member')) {
     const userName = field(u, 'UserName') ?? undefined;
@@ -81,11 +88,14 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
     });
   }
   for (const g of extractListItems(extractSection(groups, 'Groups'), 'member')) {
-    out.push({
+    const groupName = field(g, 'GroupName') ?? undefined;
+    const resource: ScannedResource = {
       resourceTypeKey: 'iam_group', resourceId: field(g, 'GroupId')!, region: null,
-      resourceName: field(g, 'GroupName') ?? undefined,
+      resourceName: groupName,
       metadata: { arn: field(g, 'Arn'), path: field(g, 'Path'), createDate: field(g, 'CreateDate') },
-    });
+    };
+    out.push(resource);
+    if (groupName) principalsToAnalyze.push({ resource, kind: 'Group', name: groupName });
   }
   for (const ip of extractListItems(extractSection(instanceProfiles, 'InstanceProfiles'), 'member')) {
     out.push({
@@ -158,7 +168,10 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
       console.error(`IAM privilege analysis failed for ${kind} ${name} (continuing without it): ${err instanceof Error ? err.message : err}`);
       continue;
     }
-    resource.metadata = { ...resource.metadata, privilegeLevel: result.privilegeLevel, privilegeReasons: result.privilegeReasons };
+    resource.metadata = {
+      ...resource.metadata, privilegeLevel: result.privilegeLevel, privilegeReasons: result.privilegeReasons,
+      attachedPolicies: result.attachedPolicyNames, inlinePolicies: result.inlinePolicyNames,
+    };
   }
 
   // Credential report: a single account-wide security summary (MFA/access-key
@@ -240,7 +253,7 @@ function nullIfNA(value: string | undefined): string | null {
 }
 
 export interface CloudIdentityRow {
-  connection_id: string; provider: 'aws'; identity_type: 'user' | 'role';
+  connection_id: string; provider: 'aws'; identity_type: 'user' | 'role' | 'group';
   native_id: string; native_label: string | null; display_name: string | null;
   is_human: boolean; privilege_level: string | null; privilege_reasons: unknown[];
   mfa_enabled: boolean | null; last_used_at: string | null; last_used_source: 'credential_report' | 'provider_api' | null;
@@ -269,23 +282,29 @@ function latestUsedAt(metadata: Record<string, unknown> | undefined): { at: stri
   return { at: null, source: null };
 }
 
+const IDENTITY_TYPE_BY_RESOURCE_TYPE: Record<string, CloudIdentityRow['identity_type']> = {
+  iam_user: 'user', iam_role: 'role', iam_group: 'group',
+};
+
 /**
- * Derives cloud_identities rows from this scanner's own iam_user/iam_role
- * output -- same "no second API call, just reshape what was already
- * fetched" convention as cloudwatch.ts's extractMonitoringAlarmRows. Groups
- * and instance profiles are deliberately excluded: a group is a permission
- * container, not a principal that can itself authenticate or be assumed,
- * and an instance profile is a wrapper around a role (already captured)
- * rather than a distinct identity.
+ * Derives cloud_identities rows from this scanner's own iam_user/iam_role/
+ * iam_group output -- same "no second API call, just reshape what was
+ * already fetched" convention as cloudwatch.ts's extractMonitoringAlarmRows.
+ * Instance profiles are still excluded: a wrapper around a role (already
+ * captured), not a distinct identity. A group IS included even though it
+ * can't itself authenticate or be assumed -- is_human is always false for
+ * it, same as a role, but its attached/inline policies are real permissions
+ * its members inherit and worth surfacing here alongside the principals
+ * that hold them directly.
  */
 export function extractCloudIdentityRows(scanned: ScannedResource[], connectionId: string): CloudIdentityRow[] {
   const now = new Date().toISOString();
   return scanned
-    .filter((r): r is ScannedResource & { resourceId: string } => r.resourceTypeKey === 'iam_user' || r.resourceTypeKey === 'iam_role')
+    .filter((r): r is ScannedResource & { resourceId: string } => r.resourceTypeKey in IDENTITY_TYPE_BY_RESOURCE_TYPE)
     .map((r) => {
       const { at, source } = latestUsedAt(r.metadata);
       return {
-        connection_id: connectionId, provider: 'aws', identity_type: r.resourceTypeKey === 'iam_user' ? 'user' : 'role',
+        connection_id: connectionId, provider: 'aws', identity_type: IDENTITY_TYPE_BY_RESOURCE_TYPE[r.resourceTypeKey],
         native_id: r.resourceId, native_label: (r.metadata?.arn as string) ?? null, display_name: r.resourceName ?? null,
         is_human: r.resourceTypeKey === 'iam_user',
         privilege_level: (r.metadata?.privilegeLevel as string) ?? null, privilege_reasons: (r.metadata?.privilegeReasons as unknown[]) ?? [],
