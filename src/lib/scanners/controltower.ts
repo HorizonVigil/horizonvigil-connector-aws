@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -10,7 +10,7 @@ interface ListLandingZonesResponse { landingZones?: LandingZoneSummary[] }
 /** AWS Control Tower — REST-JSON, path confirmed against AWS's API reference (`/list-landingzones`, no hyphen before "landingzones"). Returns at most one landing zone, only in accounts where Control Tower is actually set up. */
 export async function scanControlTower(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'controltower', ctx.region);
-  const res = await client.fetch(`https://controltower.${ctx.region}.amazonaws.com/list-landingzones`, {
+  const res = await safeFetch(client, `https://controltower.${ctx.region}.amazonaws.com/list-landingzones`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
   });
   const text = await res.text();

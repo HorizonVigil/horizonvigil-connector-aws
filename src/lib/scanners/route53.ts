@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import { extractSection, extractListItems, field, boolField, numField } from '../xmlList';
 import type { ScannedResource, ScannerContext } from './types';
 
@@ -15,7 +15,7 @@ export const ROUTE53_RESOURCE_TYPES = ['route53_hosted_zone', 'route53_health_ch
 export async function scanRoute53(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'route53', 'us-east-1');
   const get = async (path: string): Promise<string> => {
-    const res = await client.fetch(`https://route53.amazonaws.com${path}`, { method: 'GET' });
+    const res = await safeFetch(client, `https://route53.amazonaws.com${path}`, { method: 'GET' });
     const text = await res.text();
     if (!res.ok) {
       console.error(`Route53 GET ${path} failed (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);

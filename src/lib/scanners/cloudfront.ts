@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import { extractSection, extractListItems, field, boolField } from '../xmlList';
 import type { ScannedResource, ScannerContext } from './types';
 
@@ -13,7 +13,7 @@ export const CLOUDFRONT_RESOURCE_TYPES = ['cloudfront_distribution', 'cloudfront
  */
 export async function scanCloudFront(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'cloudfront', 'us-east-1');
-  const res = await client.fetch('https://cloudfront.amazonaws.com/2020-05-31/distribution', { method: 'GET' });
+  const res = await safeFetch(client, 'https://cloudfront.amazonaws.com/2020-05-31/distribution', { method: 'GET' });
   const text = await res.text();
   if (!res.ok) {
     console.error(`CloudFront ListDistributions failed (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);
@@ -38,7 +38,7 @@ export async function scanCloudFront(ctx: ScannerContext): Promise<ScannedResour
   // CloudFront read a private S3 origin bucket, superseded by Origin Access
   // Control but still supported and still shown here since existing
   // customers' distributions commonly still use it.
-  const oaiRes = await client.fetch('https://cloudfront.amazonaws.com/2020-05-31/origin-access-identity/cloudfront', { method: 'GET' });
+  const oaiRes = await safeFetch(client, 'https://cloudfront.amazonaws.com/2020-05-31/origin-access-identity/cloudfront', { method: 'GET' });
   const oaiText = await oaiRes.text();
   if (!oaiRes.ok) {
     console.error(`CloudFront ListCloudFrontOriginAccessIdentities failed (continuing without it): HTTP ${oaiRes.status} ${oaiText.slice(0, 200)}`);

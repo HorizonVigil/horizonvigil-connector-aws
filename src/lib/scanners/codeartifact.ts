@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -7,23 +7,20 @@ export const CODEARTIFACT_RESOURCE_TYPES = ['codeartifact_repository'] as const;
 interface RepositorySummary { name: string; administratorAccount?: string; domainName?: string; arn?: string; description?: string }
 interface ListRepositoriesResponse { repositories?: RepositorySummary[] }
 
-/** AWS CodeArtifact — REST-JSON, confirmed against AWS's API reference (POST /v1/domains uses this exact shape; ListRepositories mirrors it at POST /v1/repositories, account-wide rather than scoped to one domain). */
+/**
+ * AWS CodeArtifact — REST-JSON, confirmed against AWS's API reference (POST
+ * /v1/domains uses this exact shape; ListRepositories mirrors it at POST
+ * /v1/repositories, account-wide rather than scoped to one domain).
+ * CodeArtifact isn't available in every region (us-west-1 is a confirmed
+ * gap) — safeFetch (awsApi.ts) covers the resulting raw network exception
+ * the same way it covers every other scanner making a direct client.fetch()
+ * call now, so this no longer needs its own local try/catch for it.
+ */
 export async function scanCodeArtifact(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'codeartifact', ctx.region);
-  // CodeArtifact isn't available in every region (us-west-1 is a confirmed
-  // gap) — client.fetch() throws a raw network exception there instead of
-  // returning a response to check .ok on, same failure mode fixed in
-  // callJsonApi/callQueryApi. This scanner calls client.fetch() directly
-  // rather than through either shared helper, so it needs its own catch.
-  let res: Response;
-  try {
-    res = await client.fetch(`https://codeartifact.${ctx.region}.amazonaws.com/v1/repositories`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
-    });
-  } catch (err) {
-    console.error(`CodeArtifact ListRepositories failed in ${ctx.region} (continuing without it): ${err instanceof Error ? err.message : 'Network request failed'}`);
-    return [];
-  }
+  const res = await safeFetch(client, `https://codeartifact.${ctx.region}.amazonaws.com/v1/repositories`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+  });
   const text = await res.text();
   if (!res.ok) {
     console.error(`CodeArtifact ListRepositories failed in ${ctx.region} (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);

@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannerContext } from './types';
 import type { ScannedFinding } from './findingTypes';
 
@@ -41,7 +41,7 @@ export async function scanSecurityHubFindings(ctx: ScannerContext): Promise<Scan
   const base = `https://securityhub.${ctx.region}.amazonaws.com`;
 
   const postJson = async (body: Record<string, unknown>): Promise<GetFindingsResponse | null> => {
-    const res = await client.fetch(`${base}/findings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const res = await safeFetch(client, `${base}/findings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const text = await res.text();
     if (!res.ok) {
       console.error(`Security Hub GetFindings failed in ${ctx.region} (continuing without it — likely just not enabled there): HTTP ${res.status} ${text.slice(0, 200)}`);

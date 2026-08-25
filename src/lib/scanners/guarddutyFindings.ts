@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannerContext } from './types';
 import type { ScannedFinding } from './findingTypes';
 
@@ -64,7 +64,7 @@ export async function scanGuardDutyFindings(ctx: ScannerContext): Promise<Scanne
   const base = `https://guardduty.${ctx.region}.amazonaws.com`;
 
   const getJson = async (path: string): Promise<Record<string, unknown> | null> => {
-    const res = await client.fetch(`${base}${path}`, { method: 'GET' });
+    const res = await safeFetch(client, `${base}${path}`, { method: 'GET' });
     const text = await res.text();
     if (!res.ok) {
       console.error(`GuardDuty GET ${path} failed in ${ctx.region} (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);
@@ -73,7 +73,7 @@ export async function scanGuardDutyFindings(ctx: ScannerContext): Promise<Scanne
     return text ? (JSON.parse(text) as Record<string, unknown>) : {};
   };
   const postJson = async (path: string, body: unknown): Promise<Record<string, unknown> | null> => {
-    const res = await client.fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const res = await safeFetch(client, `${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const text = await res.text();
     if (!res.ok) {
       console.error(`GuardDuty POST ${path} failed in ${ctx.region} (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);

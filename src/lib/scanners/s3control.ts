@@ -1,4 +1,4 @@
-import { callQueryApi, createAwsClient } from '../awsApi';
+import { callQueryApi, createAwsClient, safeFetch } from '../awsApi';
 import { extractListItems, extractSection, field } from '../xmlList';
 import type { ScannedResource, ScannerContext } from './types';
 
@@ -20,7 +20,7 @@ export async function scanS3Control(ctx: ScannerContext): Promise<ScannedResourc
   }
 
   const client = createAwsClient(ctx.creds, 's3', 'us-east-1');
-  const res = await client.fetch('https://s3-control.us-east-1.amazonaws.com/v20180820/jobs', {
+  const res = await safeFetch(client, 'https://s3-control.us-east-1.amazonaws.com/v20180820/jobs', {
     method: 'GET', headers: { 'x-amz-account-id': accountId },
   });
   const text = await res.text();

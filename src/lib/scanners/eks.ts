@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -55,7 +55,7 @@ export async function scanEks(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'eks', ctx.region);
   const base = `https://eks.${ctx.region}.amazonaws.com`;
   const getJson = async (path: string): Promise<Record<string, unknown> | null> => {
-    const res = await client.fetch(`${base}${path}`, { method: 'GET' });
+    const res = await safeFetch(client, `${base}${path}`, { method: 'GET' });
     const text = await res.text();
     if (!res.ok) {
       console.error(`EKS GET ${path} failed in ${ctx.region} (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);
@@ -78,7 +78,7 @@ export async function scanEks(ctx: ScannerContext): Promise<ScannedResource[]> {
   // scanner reported zero clusters -- a scan-time permission or transient
   // API issue on this specific call would explain that gap; silently
   // returning [] here made it undiagnosable.
-  const listRes = await client.fetch(`${base}/clusters`, { method: 'GET' });
+  const listRes = await safeFetch(client, `${base}/clusters`, { method: 'GET' });
   const listText = await listRes.text();
   if (!listRes.ok) throw new Error(`EKS ListClusters failed in ${ctx.region}: HTTP ${listRes.status} ${listText.slice(0, 300)}`);
   const list = listText ? (JSON.parse(listText) as Record<string, unknown>) : {};

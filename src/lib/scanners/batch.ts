@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -25,7 +25,7 @@ export async function scanBatch(ctx: ScannerContext): Promise<ScannedResource[]>
   const client = createAwsClient(ctx.creds, 'batch', ctx.region);
   const base = `https://batch.${ctx.region}.amazonaws.com`;
   const post = async (path: string, body: Record<string, unknown>): Promise<Record<string, unknown> | null> => {
-    const res = await client.fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const res = await safeFetch(client, `${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const text = await res.text();
     if (!res.ok) {
       console.error(`Batch POST ${path} failed in ${ctx.region} (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);

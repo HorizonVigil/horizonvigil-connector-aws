@@ -1,4 +1,4 @@
-import { callQueryApi, createAwsClient } from '../awsApi';
+import { callQueryApi, createAwsClient, safeFetch } from '../awsApi';
 import { extractSection, extractListItems, field } from '../xmlList';
 import type { ScannedResource, ScannerContext } from './types';
 
@@ -26,7 +26,7 @@ export async function scanS3(ctx: ScannerContext): Promise<ScannedResource[]> {
   // ListBuckets is signed against us-east-1 regardless of ctx.region — same
   // "global service, fixed signing region" convention as IAM.
   const client = createAwsClient(ctx.creds, 's3', 'us-east-1');
-  const listRes = await client.fetch('https://s3.amazonaws.com/', { method: 'GET' });
+  const listRes = await safeFetch(client, 'https://s3.amazonaws.com/', { method: 'GET' });
   const listText = await listRes.text();
   if (!listRes.ok) {
     console.error(`S3 ListBuckets failed (continuing without it): HTTP ${listRes.status} ${listText.slice(0, 200)}`);
@@ -39,7 +39,7 @@ export async function scanS3(ctx: ScannerContext): Promise<ScannedResource[]> {
     const name = field(b, 'Name');
     if (!name) return null;
     try {
-      const locRes = await client.fetch(`https://${name}.s3.amazonaws.com/?location`, { method: 'GET' });
+      const locRes = await safeFetch(client, `https://${name}.s3.amazonaws.com/?location`, { method: 'GET' });
       if (!locRes.ok) return 'unknown';
       const locText = await locRes.text();
       const match = /<LocationConstraint[^>]*>([^<]*)<\/LocationConstraint>/.exec(locText);

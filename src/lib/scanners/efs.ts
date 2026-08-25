@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -17,7 +17,7 @@ export async function scanEfs(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'elasticfilesystem', ctx.region);
   const base = `https://elasticfilesystem.${ctx.region}.amazonaws.com`;
   const getJson = async (path: string): Promise<Record<string, unknown> | null> => {
-    const res = await client.fetch(`${base}${path}`, { method: 'GET' });
+    const res = await safeFetch(client, `${base}${path}`, { method: 'GET' });
     const text = await res.text();
     if (!res.ok) {
       console.error(`EFS GET ${path} failed in ${ctx.region} (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);

@@ -103,6 +103,33 @@ export function createAwsClient(creds: AwsCreds, service: string, region: string
   return new AwsClient({ accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey, sessionToken: creds.sessionToken, service, region });
 }
 
+/**
+ * Wraps a raw `client.fetch()` call for scanners that talk to
+ * `createAwsClient` directly instead of through `callJsonApi`/`callQueryApi`
+ * above — a service with no endpoint in the region being scanned (confirmed
+ * gaps: Detective/Resilience Hub/Well-Architected/Control Tower/RAM in
+ * ap-northeast-3, CodeArtifact/Timestream in us-west-1, and more likely
+ * exist in other small regions) makes `client.fetch()` throw a raw network
+ * exception instead of returning a `Response` to check `.ok` on. Every one
+ * of these scanners already has a graceful `if (!res.ok) { ...; return []
+ * }` path for a real HTTP error — this had been independently rediscovered
+ * and patched once already, per-scanner, in codeartifact.ts alone, instead
+ * of fixed centrally here; every other scanner making a raw `client.fetch()`
+ * call was still one unavailable region away from an uncaught step failure
+ * with no fix. Wraps in a synthetic failed Response (status 599, the
+ * conventional "no complete response" sentinel — a real HTTP status is
+ * required by the Response constructor, so 0 isn't usable here) so every
+ * caller's existing `!res.ok` branch already handles this without any
+ * further change to that caller's own logic.
+ */
+export async function safeFetch(client: AwsClient, url: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await client.fetch(url, init);
+  } catch (err) {
+    return new Response(JSON.stringify({ message: err instanceof Error ? err.message : 'Network request failed' }), { status: 599, statusText: 'Fetch Failed' });
+  }
+}
+
 /** AWS Query-protocol list parameter encoding: listParams('Owner', ['self']) -> { 'Owner.1': 'self' }. */
 export function listParams(prefix: string, values: string[]): Record<string, string> {
   const out: Record<string, string> = {};

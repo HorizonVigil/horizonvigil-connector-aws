@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -10,7 +10,7 @@ interface ListGroupsResponse { GroupIdentifiers?: GroupIdentifier[] }
 /** AWS Resource Groups — REST-JSON, POST /groups-list (confirmed against AWS's API reference). Uses GroupIdentifiers, not the deprecated Groups field. */
 export async function scanResourceGroups(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'resource-groups', ctx.region);
-  const res = await client.fetch(`https://resource-groups.${ctx.region}.amazonaws.com/groups-list`, {
+  const res = await safeFetch(client, `https://resource-groups.${ctx.region}.amazonaws.com/groups-list`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
   });
   const text = await res.text();

@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -13,7 +13,7 @@ interface ListWorkloadsResponse { WorkloadSummaries?: WorkloadSummary[] }
 /** AWS Well-Architected Tool — REST-JSON, POST /workloadsSummaries (confirmed against AWS's API reference). */
 export async function scanWellArchitected(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'wellarchitected', ctx.region);
-  const res = await client.fetch(`https://wellarchitected.${ctx.region}.amazonaws.com/workloadsSummaries`, {
+  const res = await safeFetch(client, `https://wellarchitected.${ctx.region}.amazonaws.com/workloadsSummaries`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
   });
   const text = await res.text();

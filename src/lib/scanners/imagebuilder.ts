@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -10,7 +10,7 @@ interface ListImagePipelinesResponse { imagePipelineList?: ImagePipeline[] }
 /** EC2 Image Builder — REST-JSON, POST /listImagePipelines. UNVERIFIED against a real account. */
 export async function scanImageBuilder(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'imagebuilder', ctx.region);
-  const res = await client.fetch(`https://imagebuilder.${ctx.region}.amazonaws.com/listImagePipelines`, {
+  const res = await safeFetch(client, `https://imagebuilder.${ctx.region}.amazonaws.com/listImagePipelines`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
   });
   const text = await res.text();

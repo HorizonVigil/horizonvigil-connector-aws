@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -23,7 +23,7 @@ export async function scanApiGateway(ctx: ScannerContext): Promise<ScannedResour
   const client = createAwsClient(ctx.creds, 'apigateway', ctx.region);
   const base = `https://apigateway.${ctx.region}.amazonaws.com`;
   const getJson = async (path: string): Promise<Record<string, unknown> | null> => {
-    const res = await client.fetch(`${base}${path}`, { method: 'GET' });
+    const res = await safeFetch(client, `${base}${path}`, { method: 'GET' });
     const text = await res.text();
     if (!res.ok) {
       console.error(`API Gateway GET ${path} failed in ${ctx.region} (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);

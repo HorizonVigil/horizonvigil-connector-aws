@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -20,7 +20,7 @@ interface ListAnalyzersResponse { analyzers?: AnalyzerSummary[] }
  */
 export async function scanAccessAnalyzer(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'access-analyzer', ctx.region);
-  const res = await client.fetch(`https://access-analyzer.${ctx.region}.amazonaws.com/analyzer`, { method: 'GET' });
+  const res = await safeFetch(client, `https://access-analyzer.${ctx.region}.amazonaws.com/analyzer`, { method: 'GET' });
   const text = await res.text();
   if (!res.ok) {
     console.error(`Access Analyzer ListAnalyzers failed in ${ctx.region} (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);

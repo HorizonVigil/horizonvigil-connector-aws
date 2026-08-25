@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannerContext } from './types';
 import type { ScannedFinding } from './findingTypes';
 
@@ -44,7 +44,7 @@ export async function scanInspectorFindings(ctx: ScannerContext): Promise<Scanne
   const base = `https://inspector2.${ctx.region}.amazonaws.com`;
 
   const postJson = async (body: Record<string, unknown>): Promise<ListFindingsResponse | null> => {
-    const res = await client.fetch(`${base}/findings/list`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const res = await safeFetch(client, `${base}/findings/list`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const text = await res.text();
     if (!res.ok) {
       // Inspector not activated for this account/region is the common,

@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -10,7 +10,7 @@ interface ListGraphsResponse { GraphList?: Graph[] }
 /** Amazon Detective — REST-JSON, note the `api.detective.` host prefix (confirmed against AWS's API reference), not just `detective.`. Only returns a result if this account is the administrator of a behavior graph. */
 export async function scanDetective(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'detective', ctx.region);
-  const res = await client.fetch(`https://api.detective.${ctx.region}.amazonaws.com/graphs/list`, {
+  const res = await safeFetch(client, `https://api.detective.${ctx.region}.amazonaws.com/graphs/list`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
   });
   const text = await res.text();

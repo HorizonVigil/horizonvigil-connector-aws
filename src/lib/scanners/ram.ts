@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -10,7 +10,7 @@ interface GetResourceSharesResponse { resourceShares?: ResourceShare[] }
 /** AWS Resource Access Manager — REST-JSON, POST-with-body (not GET) since resourceOwner is a required parameter. */
 export async function scanRam(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'ram', ctx.region);
-  const res = await client.fetch(`https://ram.${ctx.region}.amazonaws.com/getresourceshares`, {
+  const res = await safeFetch(client, `https://ram.${ctx.region}.amazonaws.com/getresourceshares`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resourceOwner: 'SELF' }),
   });
   const text = await res.text();

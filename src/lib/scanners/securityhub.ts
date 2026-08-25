@@ -1,4 +1,4 @@
-import { createAwsClient } from '../awsApi';
+import { createAwsClient, safeFetch } from '../awsApi';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -21,7 +21,7 @@ interface StandardsSubscription {
  */
 export async function scanSecurityHub(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'securityhub', ctx.region);
-  const res = await client.fetch(`https://securityhub.${ctx.region}.amazonaws.com/hub`, { method: 'GET' });
+  const res = await safeFetch(client, `https://securityhub.${ctx.region}.amazonaws.com/hub`, { method: 'GET' });
   const text = await res.text();
   if (!res.ok) {
     console.error(`Security Hub DescribeHub failed in ${ctx.region} (continuing without it — likely just not enabled there): HTTP ${res.status} ${text.slice(0, 200)}`);
@@ -38,7 +38,7 @@ export async function scanSecurityHub(ctx: ScannerContext): Promise<ScannedResou
 
   // GetEnabledStandards — only meaningful once a hub exists (same "not
   // subscribed" shape as DescribeHub above), so skipped entirely when it doesn't.
-  const stdRes = await client.fetch(`https://securityhub.${ctx.region}.amazonaws.com/standards/get`, {
+  const stdRes = await safeFetch(client, `https://securityhub.${ctx.region}.amazonaws.com/standards/get`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
   });
   const stdText = await stdRes.text();
