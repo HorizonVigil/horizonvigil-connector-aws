@@ -59,29 +59,23 @@ identitiesRoutes.get('/identities', (c) =>
   }),
 );
 
-/** GET /api/aws-accounts/identities/:id */
-identitiesRoutes.get('/identities/:id', (c) =>
-  guarded(async () => {
-    const auth = getAuthContext(c.req.raw);
-    const orgId = requireOrgId(c.req.raw);
-    const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
-
-    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
-    const rows = await db.select<Record<string, unknown>[]>('cloud_identities', {
-      select: `${LIST_SELECT},metadata`,
-      filters: { id: `eq.${c.req.param('id')}`, connection_id: inFilter(connectionIds) },
-    });
-    const identity = rows[0];
-    if (!identity) return errJson(404, 'Identity not found');
-    return okJson(identity);
-  }),
-);
-
 /**
  * GET /api/aws-accounts/identities/summary — counts by privilege level and
  * MFA status, for a dashboard-style KPI strip without the frontend having
  * to page through every identity to compute them client-side.
+ *
+ * Registered BEFORE /identities/:id below — Hono matches routes in
+ * registration order, and /identities/:id is a wildcard that matches any
+ * single path segment, "summary" included. With /identities/:id registered
+ * first (as this route originally was), every real request to this route
+ * was silently swallowed by that one instead: it queried cloud_identities
+ * with id=eq.summary, Postgres rejected "summary" as an invalid uuid
+ * (22P02), and PostgREST returned 400 — confirmed live via Cloud Run logs,
+ * 100% reproducible on every single call. The frontend's loadIdentities
+ * fetches this and the list endpoint via Promise.all with no per-call catch,
+ * so that one 400 rejected the whole batch and left `identities` at its
+ * initial empty array — real data (34 identities on a real connected
+ * account) rendering as a misleading "No identities match these filters."
  */
 identitiesRoutes.get('/identities/summary', (c) =>
   guarded(async () => {
@@ -106,6 +100,25 @@ identitiesRoutes.get('/identities/summary', (c) =>
       humanWithoutMfa: rows.filter((r) => r.is_human && r.mfa_enabled === false).length,
     };
     return okJson(summary);
+  }),
+);
+
+/** GET /api/aws-accounts/identities/:id */
+identitiesRoutes.get('/identities/:id', (c) =>
+  guarded(async () => {
+    const auth = getAuthContext(c.req.raw);
+    const orgId = requireOrgId(c.req.raw);
+    const db = createDb(c.env, auth.accessToken);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
+
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
+    const rows = await db.select<Record<string, unknown>[]>('cloud_identities', {
+      select: `${LIST_SELECT},metadata`,
+      filters: { id: `eq.${c.req.param('id')}`, connection_id: inFilter(connectionIds) },
+    });
+    const identity = rows[0];
+    if (!identity) return errJson(404, 'Identity not found');
+    return okJson(identity);
   }),
 );
 
