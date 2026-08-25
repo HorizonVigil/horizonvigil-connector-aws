@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '../lib/crypto';
 
@@ -161,13 +161,30 @@ interface UpdateBody {
   supportPlan?: string | null;
 }
 
-/** PUT /api/aws-accounts/accounts/:id — update name/environment/project/regions. Editor and above. */
+/**
+ * PUT /api/aws-accounts/accounts/:id — update name/environment/project/regions.
+ * Editor and above by default -- but this is also the first real ABAC
+ * integration point in the codebase: requireMenuPermissionWithAbac checks
+ * the org's abac_policies (if any) against this specific connection's own
+ * environment before falling back to the plain role/menu-permission check,
+ * so an org can define e.g. "deny cloud write access to users whose
+ * department != Platform when resource.environment == production" without
+ * that policy needing any code change here -- see cloudops-shared-lib's
+ * abac.ts for the evaluator and cloudops-admin's abac-policies routes for
+ * how policies get authored.
+ */
 accountsRoutes.put('/accounts/:id', (c) =>
   guarded(async () => {
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
+
+    const [existing] = await db.select<{ environment: string }[]>('cloud_connections', {
+      select: 'environment',
+      filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
+    });
+    if (!existing) return errJson(404, 'Account not found');
+    await requireMenuPermissionWithAbac(db, auth.userId, orgId, 'cloud', 'write', { environment: existing.environment, provider: 'aws' });
 
     const body = (await c.req.json().catch(() => ({}))) as UpdateBody;
     const patch: Record<string, unknown> = {};
