@@ -41,9 +41,9 @@ async function callInternal(url: string | undefined, secret: string | undefined,
 }
 
 export async function triggerRecommendationGeneration(env: Env, connectionId: string, orgId: string): Promise<void> {
-  await callInternal(env.COST_OPTIMIZATION_API_URL, env.INTERNAL_SCAN_SECRET, '/internal/generate-recommendations', { connectionId, orgId });
+  await callInternal(env.COST_OPTIMIZATION_API_URL, env.POST_SCAN_HOOK_SECRET, '/internal/generate-recommendations', { connectionId, orgId });
 }
 
 export async function triggerAlertEvaluation(env: Env, connectionId: string, orgId: string): Promise<void> {
-  await callInternal(env.ALERTS_API_URL, env.INTERNAL_SCAN_SECRET, '/internal/evaluate-alert-rules', { connectionId, orgId });
+  await callInternal(env.ALERTS_API_URL, env.POST_SCAN_HOOK_SECRET, '/internal/evaluate-alert-rules', { connectionId, orgId });
 }

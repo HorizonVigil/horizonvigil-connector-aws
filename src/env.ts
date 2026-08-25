@@ -28,10 +28,6 @@ export interface Env extends BaseEnv {
   // header) to call POST /internal/run-due-scans — see routes/internalScan.ts.
   // Not currently provisioned in any environment; that route returns an
   // honest 503 rather than running with no auth check when this is unset.
-  // Also reused OUTBOUND: runFinalize (discovery.ts) presents this same
-  // value as X-Internal-Scan-Secret when calling cost-optimization-api's
-  // and observability-api's own /internal/* routes below — one fleet-wide
-  // secret, not a separate one per direction.
   INTERNAL_SCAN_SECRET?: string;
   // Public Cloud Run URL for cost-optimization-api's POST
   // /internal/generate-recommendations, called (best-effort) from
@@ -42,4 +38,14 @@ export interface Env extends BaseEnv {
   // /internal/evaluate-alert-rules, called (best-effort) from runFinalize
   // the same way — see lib/postScanHooks.ts.
   ALERTS_API_URL?: string;
+  // A separate shared secret from INTERNAL_SCAN_SECRET above, presented as
+  // X-Internal-Scan-Secret when runFinalize calls out to cost-optimization-
+  // api/observability-api's own /internal/* routes. Deliberately its own
+  // value rather than reusing INTERNAL_SCAN_SECRET: that one already
+  // authenticates real, live Cloud Scheduler jobs calling INTO this
+  // service, and rotating it to also serve this new outbound direction
+  // would risk breaking those without also updating the scheduler jobs in
+  // lockstep. Same value must be set as POST_SCAN_HOOK_SECRET on
+  // cost-optimization-api and observability-api.
+  POST_SCAN_HOOK_SECRET?: string;
 }
