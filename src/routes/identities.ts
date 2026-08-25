@@ -108,3 +108,29 @@ identitiesRoutes.get('/identities/summary', (c) =>
     return okJson(summary);
   }),
 );
+
+/**
+ * GET /api/aws-accounts/identities/:id/edges — every cloud_resource_edges
+ * row where this identity is either endpoint (a role's ASSUMES edges from
+ * the resources that can assume it, an instance profile's CONTAINS edge to
+ * it, etc). Two queries rather than one OR'd query: source_identity_id and
+ * target_identity_id are separate columns (see the edges migration for
+ * why), so a single PostgREST filter can't match "either side" in one call.
+ */
+identitiesRoutes.get('/identities/:id/edges', (c) =>
+  guarded(async () => {
+    const auth = getAuthContext(c.req.raw);
+    const orgId = requireOrgId(c.req.raw);
+    const db = createDb(c.env, auth.accessToken);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
+
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
+    const identityId = c.req.param('id');
+    const select = 'id,relationship_type,confidence,source_engine,source_resource_id,source_identity_id,target_resource_id,target_identity_id,metadata,first_seen_at,last_seen_at';
+    const [asSource, asTarget] = await Promise.all([
+      db.select<Record<string, unknown>[]>('cloud_resource_edges', { select, filters: { connection_id: inFilter(connectionIds), source_identity_id: `eq.${identityId}`, deleted_at: 'is.null' } }),
+      db.select<Record<string, unknown>[]>('cloud_resource_edges', { select, filters: { connection_id: inFilter(connectionIds), target_identity_id: `eq.${identityId}`, deleted_at: 'is.null' } }),
+    ]);
+    return okJson({ outbound: asSource, inbound: asTarget });
+  }),
+);
