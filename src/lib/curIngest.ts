@@ -1,4 +1,4 @@
-import { callJsonApi, createAwsClient, type AwsCreds } from './awsApi';
+import { callJsonApi, createAwsClient, safeFetch, type AwsCreds } from './awsApi';
 
 /**
  * AWS Cost & Usage Report (CUR) ingestion — the only real AWS mechanism
@@ -67,7 +67,7 @@ function currentBillingPeriod(): string {
 async function s3Get(creds: AwsCreds, bucket: string, region: string, key: string): Promise<Response> {
   const client = createAwsClient(creds, 's3', region);
   const encodedKey = key.split('/').map(encodeURIComponent).join('/');
-  return client.fetch(`https://${bucket}.s3.${region}.amazonaws.com/${encodedKey}`);
+  return safeFetch(client, `https://${bucket}.s3.${region}.amazonaws.com/${encodedKey}`);
 }
 
 export interface CurManifest {

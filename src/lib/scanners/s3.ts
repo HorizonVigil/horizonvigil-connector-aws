@@ -74,7 +74,7 @@ export async function scanS3(ctx: ScannerContext): Promise<ScannedResource[]> {
   }
 
   const s3ControlClient = createAwsClient(ctx.creds, 's3', 'us-east-1');
-  const apRes = await s3ControlClient.fetch('https://s3-control.us-east-1.amazonaws.com/v20180820/accesspoint', {
+  const apRes = await safeFetch(s3ControlClient, 'https://s3-control.us-east-1.amazonaws.com/v20180820/accesspoint', {
     method: 'GET', headers: { 'x-amz-account-id': accountId },
   });
   const apText = await apRes.text();
@@ -95,7 +95,7 @@ export async function scanS3(ctx: ScannerContext): Promise<ScannedResource[]> {
   // control-plane API is only reachable via the us-west-2 endpoint
   // regardless of where the account's buckets actually live.
   const mrapClient = createAwsClient(ctx.creds, 's3', 'us-west-2');
-  const mrapRes = await mrapClient.fetch('https://s3-control.us-west-2.amazonaws.com/v20180820/mrap/instances', {
+  const mrapRes = await safeFetch(mrapClient, 'https://s3-control.us-west-2.amazonaws.com/v20180820/mrap/instances', {
     method: 'GET', headers: { 'x-amz-account-id': accountId },
   });
   const mrapText = await mrapRes.text();
