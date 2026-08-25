@@ -16,6 +16,7 @@ import { remediationRoutes } from './routes/remediation';
 import { curRoutes } from './routes/cur';
 import { logsRoutes } from './routes/logs';
 import { bulkImportRoutes } from './routes/bulkImport';
+import { identitiesRoutes } from './routes/identities';
 
 const app = createApp();
 
@@ -38,5 +39,6 @@ app.route('/api/aws-accounts', remediationRoutes);
 app.route('/api/aws-accounts', curRoutes);
 app.route('/api/aws-accounts', logsRoutes);
 app.route('/api/aws-accounts', bulkImportRoutes);
+app.route('/api/aws-accounts', identitiesRoutes);
 
 export default app;

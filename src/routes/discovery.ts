@@ -4,7 +4,7 @@ import { resolveCredentials, type ResolvableConnection } from './permissions';
 import { resolveFindingResourceIds } from '../lib/arnResourceLookup';
 import { scanEc2, EC2_RESOURCE_TYPES } from '../lib/scanners/ec2';
 import { scanRds, RDS_RESOURCE_TYPES } from '../lib/scanners/rds';
-import { scanIam, IAM_RESOURCE_TYPES } from '../lib/scanners/iam';
+import { scanIam, IAM_RESOURCE_TYPES, extractCloudIdentityRows } from '../lib/scanners/iam';
 import { scanSns, SNS_RESOURCE_TYPES } from '../lib/scanners/sns';
 import { scanSqs, SQS_RESOURCE_TYPES } from '../lib/scanners/sqs';
 import { scanDynamoDb, DYNAMODB_RESOURCE_TYPES } from '../lib/scanners/dynamodb';
@@ -659,6 +659,17 @@ export async function runResourceStep(db: Db, orgId: string, env: Env, connectio
       if (events.length > 0) {
         await db.insert('deployment_events?on_conflict=connection_id,provider,event_id', events, 'resolution=merge-duplicates,return=minimal');
       }
+    }
+  }
+
+  // cloud_identities sync -- piggybacks on the iam step's own iam_user/
+  // iam_role results (no second API call), same pattern as the alarm sync
+  // above. IAM is a global scanner (see iam.ts's REGION comment) so this
+  // runs once per account, not once per scan region.
+  if (scannerName === 'iam') {
+    const identityRows = extractCloudIdentityRows(scanned, connection.id);
+    if (identityRows.length > 0) {
+      await db.insert('cloud_identities?on_conflict=connection_id,provider,native_id', identityRows, 'resolution=merge-duplicates,return=minimal');
     }
   }
 

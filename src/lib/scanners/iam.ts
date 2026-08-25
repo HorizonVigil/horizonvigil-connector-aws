@@ -177,21 +177,52 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
     const header = rows[0];
     const col = (name: string) => header.indexOf(name);
     const dataRows = rows.slice(1);
+    const userCol = col('user');
     const mfaCol = col('mfa_active');
     const pwEnabledCol = col('password_enabled');
+    const pwLastUsedCol = col('password_last_used');
     const key1ActiveCol = col('access_key_1_active');
     const key1RotatedCol = col('access_key_1_last_rotated');
+    const key1LastUsedCol = col('access_key_1_last_used_date');
     const key2ActiveCol = col('access_key_2_active');
     const key2RotatedCol = col('access_key_2_last_rotated');
+    const key2LastUsedCol = col('access_key_2_last_used_date');
     const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
     const isStaleKey = (active: string | undefined, rotated: string | undefined) =>
       active === 'true' && !!rotated && rotated !== 'N/A' && new Date(rotated).getTime() < ninetyDaysAgo;
     let usersWithoutMfa = 0;
     let usersWithStaleKeys = 0;
+
+    // The per-user MFA/key-hygiene fields below used to be parsed only to
+    // feed the two account-wide counters after this loop, then discarded --
+    // real per-identity data (which user lacks MFA, which key is stale)
+    // computed and thrown away on every single scan. Now attached directly
+    // onto the matching iam_user's own metadata (matched by username, the
+    // credential report's `user` column) so it survives into cloud_resources
+    // and, from there, into the new cloud_identities table's ingestion step
+    // in discovery.ts -- a canonical identity record with no MFA/key
+    // hygiene data on it would be far less useful than one with it.
+    const userResourceByName = new Map(out.filter((r) => r.resourceTypeKey === 'iam_user' && r.resourceName).map((r) => [r.resourceName as string, r]));
     for (const row of dataRows) {
       if (mfaCol >= 0 && pwEnabledCol >= 0 && row[pwEnabledCol] === 'true' && row[mfaCol] === 'false') usersWithoutMfa++;
       if (isStaleKey(row[key1ActiveCol], row[key1RotatedCol]) || isStaleKey(row[key2ActiveCol], row[key2RotatedCol])) usersWithStaleKeys++;
+
+      const userName = userCol >= 0 ? row[userCol] : undefined;
+      const userResource = userName ? userResourceByName.get(userName) : undefined;
+      if (!userResource) continue;
+      const accessKeys = [
+        { index: 1, active: row[key1ActiveCol] === 'true', lastRotated: nullIfNA(row[key1RotatedCol]), lastUsedDate: nullIfNA(row[key1LastUsedCol]) },
+        { index: 2, active: row[key2ActiveCol] === 'true', lastRotated: nullIfNA(row[key2RotatedCol]), lastUsedDate: nullIfNA(row[key2LastUsedCol]) },
+      ].filter((k) => k.active || k.lastRotated);
+      userResource.metadata = {
+        ...userResource.metadata,
+        mfaActive: mfaCol >= 0 ? row[mfaCol] === 'true' : undefined,
+        passwordEnabled: pwEnabledCol >= 0 ? row[pwEnabledCol] === 'true' : undefined,
+        credentialReportPasswordLastUsed: nullIfNA(row[pwLastUsedCol]),
+        accessKeys,
+      };
     }
+
     out.push({
       resourceTypeKey: 'iam_credential_report', resourceId: 'credential-report', region: null,
       resourceName: 'IAM Credential Report',
@@ -200,4 +231,68 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
   }
 
   return out;
+}
+
+/** The credential report CSV uses the literal string "N/A" (and "not_supported" for password fields on roles/service-linked contexts) for fields that don't apply — normalized to null so downstream consumers don't have to special-case string sentinels. */
+function nullIfNA(value: string | undefined): string | null {
+  if (!value || value === 'N/A' || value === 'not_supported') return null;
+  return value;
+}
+
+export interface CloudIdentityRow {
+  connection_id: string; provider: 'aws'; identity_type: 'user' | 'role';
+  native_id: string; native_label: string | null; display_name: string | null;
+  is_human: boolean; privilege_level: string | null; privilege_reasons: unknown[];
+  mfa_enabled: boolean | null; last_used_at: string | null; last_used_source: 'credential_report' | 'provider_api' | null;
+  identity_created_at: string | null; metadata: Record<string, unknown>;
+  last_seen_at: string; deleted_at: null;
+}
+
+/**
+ * Prefers the credential report's own per-user data (password-last-used +
+ * both access keys' last-used-date, whichever is most recent) over the
+ * ListUsers API's bare PasswordLastUsed field, since the credential report
+ * is the only source with access-key activity at all -- falls back to
+ * PasswordLastUsed only when no credential report data exists yet (a
+ * brand-new account, or the very first scan before AWS has finished
+ * generating one -- see the GenerateCredentialReport call above).
+ */
+function latestUsedAt(metadata: Record<string, unknown> | undefined): { at: string | null; source: 'credential_report' | 'provider_api' | null } {
+  const accessKeys = (metadata?.accessKeys as { lastUsedDate: string | null }[] | undefined) ?? [];
+  const candidates = [metadata?.credentialReportPasswordLastUsed, ...accessKeys.map((k) => k.lastUsedDate)]
+    .filter((v): v is string => typeof v === 'string');
+  if (candidates.length > 0) {
+    return { at: candidates.reduce((a, b) => (new Date(a) > new Date(b) ? a : b)), source: 'credential_report' };
+  }
+  const passwordLastUsed = metadata?.passwordLastUsed;
+  if (typeof passwordLastUsed === 'string') return { at: passwordLastUsed, source: 'provider_api' };
+  return { at: null, source: null };
+}
+
+/**
+ * Derives cloud_identities rows from this scanner's own iam_user/iam_role
+ * output -- same "no second API call, just reshape what was already
+ * fetched" convention as cloudwatch.ts's extractMonitoringAlarmRows. Groups
+ * and instance profiles are deliberately excluded: a group is a permission
+ * container, not a principal that can itself authenticate or be assumed,
+ * and an instance profile is a wrapper around a role (already captured)
+ * rather than a distinct identity.
+ */
+export function extractCloudIdentityRows(scanned: ScannedResource[], connectionId: string): CloudIdentityRow[] {
+  const now = new Date().toISOString();
+  return scanned
+    .filter((r): r is ScannedResource & { resourceId: string } => r.resourceTypeKey === 'iam_user' || r.resourceTypeKey === 'iam_role')
+    .map((r) => {
+      const { at, source } = latestUsedAt(r.metadata);
+      return {
+        connection_id: connectionId, provider: 'aws', identity_type: r.resourceTypeKey === 'iam_user' ? 'user' : 'role',
+        native_id: r.resourceId, native_label: (r.metadata?.arn as string) ?? null, display_name: r.resourceName ?? null,
+        is_human: r.resourceTypeKey === 'iam_user',
+        privilege_level: (r.metadata?.privilegeLevel as string) ?? null, privilege_reasons: (r.metadata?.privilegeReasons as unknown[]) ?? [],
+        mfa_enabled: typeof r.metadata?.mfaActive === 'boolean' ? (r.metadata.mfaActive as boolean) : null,
+        last_used_at: at, last_used_source: source,
+        identity_created_at: (r.metadata?.createDate as string) ?? null,
+        metadata: r.metadata ?? {}, last_seen_at: now, deleted_at: null,
+      };
+    });
 }
