@@ -101,6 +101,7 @@ import type { ScannedResource, ScannerFn } from '../lib/scanners/types';
 import type { ScannedFinding, FindingScannerFn } from '../lib/scanners/findingTypes';
 import type { ScannedMetric } from '../lib/scanners/metricTypes';
 import { computeFinalizeResult } from '../lib/discoveryFinalize';
+import { triggerRecommendationGeneration, triggerAlertEvaluation } from '../lib/postScanHooks';
 
 export const discoveryRoutes = new Hono<{ Bindings: Env }>();
 
@@ -761,7 +762,7 @@ export interface FinalizeOutcome { totalResources: number; deleted: number; find
  * deleted resources whose region simply hadn't been re-checked yet this
  * cycle, not resources that had actually vanished from AWS.
  */
-export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES, totalSteps = 0): Promise<FinalizeOutcome> {
+export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], env: Env, coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES, totalSteps = 0): Promise<FinalizeOutcome> {
   const existing = await db.select<{ id: string; resource_type_key: string; category: string; last_seen_at: string; deleted_at: string | null }[]>('cloud_resources', {
     select: 'id,resource_type_key,category,last_seen_at,deleted_at',
     filters: { connection_id: `eq.${connection.id}` },
@@ -856,6 +857,14 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
     console.error(`Edge materialization failed for connection ${connection.id} (continuing without it): ${err instanceof Error ? err.message : err}`);
   }
 
+  // Both best-effort, server-to-server — see postScanHooks.ts's doc comment
+  // for why these live here rather than as a client-side post-scan step:
+  // this is the one function every scan path (interactive, daily sweep,
+  // abandoned-scan recovery) already funnels through, so triggering here
+  // covers all of them instead of just the browser-driven one.
+  await triggerRecommendationGeneration(env, connection.id, orgId);
+  await triggerAlertEvaluation(env, connection.id, orgId);
+
   return { totalResources: activeCount, deleted: vanishedIds.length, findingsResolved: resolvedFindings.length, categoryCounts: activeCategoryCounts, errors: stepErrors };
 }
 
@@ -872,7 +881,7 @@ discoveryRoutes.post('/accounts/:id/discovery/finalize', (c) =>
     const connection = await loadConnection(db, orgId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
 
-    const outcome = await runFinalize(db, orgId, auth.userId, connection, body.runStartedAt, body.stepErrors ?? [], COVERED_RESOURCE_TYPES, body.totalSteps ?? 0);
+    const outcome = await runFinalize(db, orgId, auth.userId, connection, body.runStartedAt, body.stepErrors ?? [], c.env, COVERED_RESOURCE_TYPES, body.totalSteps ?? 0);
     return okJson(outcome);
   }),
 );

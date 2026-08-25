@@ -28,5 +28,18 @@ export interface Env extends BaseEnv {
   // header) to call POST /internal/run-due-scans — see routes/internalScan.ts.
   // Not currently provisioned in any environment; that route returns an
   // honest 503 rather than running with no auth check when this is unset.
+  // Also reused OUTBOUND: runFinalize (discovery.ts) presents this same
+  // value as X-Internal-Scan-Secret when calling cost-optimization-api's
+  // and observability-api's own /internal/* routes below — one fleet-wide
+  // secret, not a separate one per direction.
   INTERNAL_SCAN_SECRET?: string;
+  // Public Cloud Run URL for cost-optimization-api's POST
+  // /internal/generate-recommendations, called (best-effort) from
+  // runFinalize after every discovery run — see lib/postScanHooks.ts. Not
+  // sensitive, same convention as AUTOMATION_API_URL above.
+  COST_OPTIMIZATION_API_URL?: string;
+  // Public Cloud Run URL for observability-api's POST
+  // /internal/evaluate-alert-rules, called (best-effort) from runFinalize
+  // the same way — see lib/postScanHooks.ts.
+  ALERTS_API_URL?: string;
 }
