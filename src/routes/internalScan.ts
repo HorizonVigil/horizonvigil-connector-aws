@@ -55,6 +55,19 @@ export const internalScanRoutes = new Hono<{ Bindings: Env }>();
 // 5 x 1500 that could exceed it.
 const MAX_CONNECTIONS_PER_RUN = 3;
 const MAX_STEPS_PER_CONNECTION = 1500;
+// An interactive scan is entirely driven by the browser tab's own loop
+// (syncContext.tsx) -- if that tab closes, crashes, sleeps, or loses its
+// connection mid-scan, nothing client-side can ever resume it; the server
+// has no idea the scan stopped short of finishing. cloud_connections.
+// scan_started_at (set at the first call of that loop, cleared by
+// runFinalize on real completion) is this job's only signal that a scan
+// began and never reached a conclusion. 30 minutes is deliberately
+// generous -- a real interactive full sweep can legitimately take longer
+// than the server-side sweep above (~22.5 min worst case per its own
+// comment) since each step is its own browser-to-Cloud-Run round trip, not
+// a tight in-process loop -- so this only ever reclaims scans that are
+// genuinely abandoned, not ones still honestly in progress in an open tab.
+const ABANDONED_SCAN_THRESHOLD_MINUTES = 30;
 
 interface ConnectionDue { id: string; org_id: string; scan_interval_hours: number }
 
@@ -143,22 +156,32 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
 );
 
 /**
- * POST /internal/run-first-scans — drains AWS connections stuck at
- * status='pending' with nothing left to move them forward. Two real cases
- * land here: bulk-onboarded connections (see bulkImport.ts — every row it
- * inserts starts 'pending' with no browser session open to call
- * startDiscovery for it, unlike the interactive wizard, which fires that
- * call itself right after creating the connection) and an interactively
- * created connection whose browser tab closed before its one auto-triggered
- * scan finished. Both are otherwise invisible to run-due-scans above
- * forever — that query explicitly filters out status='pending', because a
- * connection that's never been scanned isn't "due" for its *next* scan, it's
- * waiting on its first one, which is what actually flips its status (see
- * runFinalize, discovery.ts:791) and makes it eligible for run-due-scans'
- * normal cadence from here on. This endpoint's only job is getting a
- * connection through that one gate, once — everything else (regions,
- * scanners, findings, metrics, MAX_CONNECTIONS_PER_RUN/
- * MAX_STEPS_PER_CONNECTION safety caps) is identical to run-due-scans.
+ * POST /internal/run-first-scans — drains AWS connections that need a full
+ * scan completed server-side because nothing client-side is going to
+ * finish it for them. Three real cases land here:
+ *
+ * 1. Bulk-onboarded connections (see bulkImport.ts — every row it inserts
+ *    starts 'pending' with no browser session open to call startDiscovery
+ *    for it, unlike the interactive wizard, which fires that call itself
+ *    right after creating the connection).
+ * 2. A newly-created connection whose browser tab closed before its one
+ *    auto-triggered scan finished (also left at status='pending').
+ * 3. An already-connected account where a user clicked "Discover
+ *    Resources" and then closed the tab, lost network, or put the laptop
+ *    to sleep before the scan finished — status stays whatever it was
+ *    (usually 'connected', from the *previous* successful scan), so this
+ *    case is invisible to a status='pending' check alone. Caught instead
+ *    via scan_started_at, set by GET /discovery/steps (the loop's first
+ *    call) and cleared by runFinalize on real completion — see
+ *    ABANDONED_SCAN_THRESHOLD_MINUTES above.
+ *
+ * All three are otherwise invisible to run-due-scans above forever — that
+ * query only looks at next_scheduled_scan_at, which nothing here has
+ * reached yet (case 1/2 have never completed a first scan at all; case 3's
+ * *previous* successful scan already set it comfortably in the future).
+ * Everything else (regions, scanners, findings, metrics,
+ * MAX_CONNECTIONS_PER_RUN/MAX_STEPS_PER_CONNECTION safety caps) is
+ * identical to run-due-scans.
  */
 internalScanRoutes.post('/internal/run-first-scans', (c) =>
   guarded(async () => {
@@ -168,10 +191,14 @@ internalScanRoutes.post('/internal/run-first-scans', (c) =>
     if (secret !== c.env.INTERNAL_SCAN_SECRET) return errJson(403, 'Invalid or missing X-Internal-Scan-Secret.');
 
     const db = createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY);
+    const abandonedBefore = new Date(Date.now() - ABANDONED_SCAN_THRESHOLD_MINUTES * 60 * 1000).toISOString();
 
     const pending = await db.select<{ id: string; org_id: string }[]>('cloud_connections', {
       select: 'id,org_id',
-      filters: { provider: 'eq.aws', status: 'eq.pending' },
+      filters: {
+        provider: 'eq.aws', status: 'neq.disconnected',
+        or: `(status.eq.pending,scan_started_at.lt.${abandonedBefore})`,
+      },
       order: 'created_at.asc',
       limit: MAX_CONNECTIONS_PER_RUN,
     });

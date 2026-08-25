@@ -399,13 +399,22 @@ export function regionsFor(connection: ConnectionForDiscovery): string[] {
   return connection.scan_regions?.length ? connection.scan_regions : [connection.default_region];
 }
 
-/** GET /api/aws-accounts/accounts/:id/discovery/steps — the ordered step list this account's scan regions require, for the frontend's step-loop. */
+/**
+ * GET /api/aws-accounts/accounts/:id/discovery/steps — the ordered step
+ * list this account's scan regions require, for the frontend's step-loop.
+ * Also stamps scan_started_at, even though this is nominally a GET — this
+ * is genuinely the first call of every interactive scan (see
+ * syncContext.tsx's startDiscovery), so it's the one reliable place to
+ * record "a scan began here" for the abandoned-scan sweep in
+ * internalScan.ts to detect a tab that closed before finishing. Bumped to
+ * requiring 'write' rather than 'read' to match that real side effect.
+ */
 discoveryRoutes.get('/accounts/:id/discovery/steps', (c) =>
   guarded(async () => {
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
     const connection = await loadConnection(db, orgId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
@@ -420,6 +429,8 @@ discoveryRoutes.get('/accounts/:id/discovery/steps', (c) =>
       ...regions.flatMap((region) => findingNames.map((name) => `finding:${name}:${region}`)),
       ...regions.map((region) => `metric:${METRIC_STEP_NAME}:${region}`),
     ];
+
+    await db.update('cloud_connections', { id: `eq.${connection.id}` }, { scan_started_at: new Date().toISOString() }, 'return=minimal');
 
     return okJson({ steps, regions, scannerCount: regionalNames.length + globalNames.length + findingNames.length + 1 });
   }),
@@ -802,6 +813,10 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
       last_discovery_at: now, last_full_scan_at: now, last_sync_at: now, resource_summary: summary,
       status: connectionIsBroken ? 'error' : 'connected',
       error_message: realErrors.length > 0 ? `${realErrors.length} scan step(s) failed: ${realErrors.slice(0, 3).map((e) => e.message).join('; ')}` : null,
+      // Scan reached a real, committed conclusion (however it finished) --
+      // clears the "started but not yet finished" marker so the
+      // abandoned-scan sweep in internalScan.ts doesn't try to re-run it.
+      scan_started_at: null,
     },
     'return=minimal',
   );
