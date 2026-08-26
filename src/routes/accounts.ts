@@ -227,6 +227,7 @@ accountsRoutes.put('/accounts/:id/credentials', (c) =>
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
+    await enforceRateLimit(db, `aws-account:rotate-credentials:${orgId}`, 30, 3600);
 
     const rows = await db.select<{ id: string; connection_method: string }[]>('cloud_connections', {
       select: 'id,connection_method',
