@@ -91,7 +91,11 @@ export async function scanEc2(ctx: ScannerContext): Promise<ScannedResource[]> {
         resourceTypeKey: 'ec2_instance', resourceId: field(i, 'instanceId')!, region: ctx.region,
         resourceName: tags['Name'], state: state ? (field(state, 'name') ?? undefined) : undefined, tags,
         metadata: { instanceType: field(i, 'instanceType'), launchTime: field(i, 'launchTime'), privateIp: field(i, 'privateIpAddress'), publicIp: field(i, 'publicIpAddress'), platform: field(i, 'platformDetails') },
-        relationships: { vpcId: field(i, 'vpcId'), subnetId: field(i, 'subnetId'), securityGroupIds: extractListItems(extractSection(i, 'groupSet')).map(g => field(g, 'groupId')) },
+        relationships: {
+          vpcId: field(i, 'vpcId'), subnetId: field(i, 'subnetId'),
+          securityGroupIds: extractListItems(extractSection(i, 'groupSet')).map(g => field(g, 'groupId')),
+          instanceProfileArn: field(extractSection(i, 'iamInstanceProfile') ?? '', 'arn'),
+        },
       });
     }
   }
