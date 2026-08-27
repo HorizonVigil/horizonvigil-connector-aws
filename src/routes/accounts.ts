@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit, checkCloudAccountLimit } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '../lib/crypto';
 
@@ -99,6 +99,10 @@ accountsRoutes.post('/accounts', (c) =>
     // POST /accounts/bulk-import-from-organization (bulkImport.ts), which
     // has its own, much stricter limit.
     await enforceRateLimit(db, `aws-account:connect:${orgId}`, 30, 3600);
+    // Soft, non-blocking -- checked before the insert so `used` reflects the
+    // count this new account is about to join, not after. Never rejects the
+    // connect itself; only surfaces a real upgrade prompt in the response.
+    const limitCheck = await checkCloudAccountLimit(db, orgId);
 
     const body = (await c.req.json().catch(() => ({}))) as ConnectBody;
     if (!body.connectionName) return errJson(400, 'connectionName is required');
@@ -148,7 +152,7 @@ accountsRoutes.post('/accounts', (c) =>
     });
 
     const { credentials_encrypted: _omit, ...safe } = created;
-    return okJson(safe, 201);
+    return okJson({ ...safe, planLimitWarning: limitCheck.atLimit ? limitCheck.message : null }, 201);
   }),
 );
 
