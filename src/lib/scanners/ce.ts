@@ -5,7 +5,7 @@ const TARGET_PREFIX = 'AWSInsightsIndexService';
 const HOST = 'ce.us-east-1.amazonaws.com';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
-export const CE_RESOURCE_TYPES = ['cost_category_definition', 'cost_anomaly_monitor'] as const;
+export const CE_RESOURCE_TYPES = ['cost_category', 'cost_anomaly_monitor'] as const;
 
 interface CostCategoryReference {
   CostCategoryArn: string; Name: string; EffectiveStart?: string; EffectiveEnd?: string; NumberOfRules?: number;
@@ -36,7 +36,7 @@ export async function scanCostExplorer(ctx: ScannerContext): Promise<ScannedReso
   } else {
     for (const cc of (categories.body as { CostCategoryReferences?: CostCategoryReference[] }).CostCategoryReferences ?? []) {
       out.push({
-        resourceTypeKey: 'cost_category_definition', resourceId: cc.CostCategoryArn, region: null, resourceName: cc.Name,
+        resourceTypeKey: 'cost_category', resourceId: cc.CostCategoryArn, region: null, resourceName: cc.Name,
         metadata: { effectiveStart: cc.EffectiveStart, effectiveEnd: cc.EffectiveEnd, numberOfRules: cc.NumberOfRules },
       });
     }

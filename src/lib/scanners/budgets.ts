@@ -6,7 +6,7 @@ const TARGET_PREFIX = 'AWSBudgetServiceGateway';
 const HOST = 'budgets.amazonaws.com';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
-export const BUDGETS_RESOURCE_TYPES = ['aws_budget'] as const;
+export const BUDGETS_RESOURCE_TYPES = ['budgets_budget'] as const;
 
 interface BudgetAmount { Amount?: string; Unit?: string }
 interface Budget {
@@ -52,7 +52,7 @@ export async function scanBudgets(ctx: ScannerContext): Promise<ScannedResource[
     const body = res.body as { Budgets?: Budget[]; NextToken?: string };
     for (const b of body.Budgets ?? []) {
       out.push({
-        resourceTypeKey: 'aws_budget', resourceId: `${accountId}:${b.BudgetName}`, region: null, resourceName: b.BudgetName,
+        resourceTypeKey: 'budgets_budget', resourceId: `${accountId}:${b.BudgetName}`, region: null, resourceName: b.BudgetName,
         metadata: {
           budgetType: b.BudgetType, timeUnit: b.TimeUnit,
           limit: b.BudgetLimit ? `${b.BudgetLimit.Amount} ${b.BudgetLimit.Unit}` : null,
