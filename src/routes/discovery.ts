@@ -93,6 +93,17 @@ import { scanCodeArtifact, CODEARTIFACT_RESOURCE_TYPES } from '../lib/scanners/c
 import { scanCostExplorer, CE_RESOURCE_TYPES } from '../lib/scanners/ce';
 import { scanBudgets, BUDGETS_RESOURCE_TYPES } from '../lib/scanners/budgets';
 import { scanInspector2, INSPECTOR2_RESOURCE_TYPES } from '../lib/scanners/inspector2';
+import { scanOpenSearch, ES_RESOURCE_TYPES } from '../lib/scanners/es';
+import { scanFirehose, FIREHOSE_RESOURCE_TYPES } from '../lib/scanners/firehose';
+import { scanDms, DMS_RESOURCE_TYPES } from '../lib/scanners/dms';
+import { scanSes, SES_RESOURCE_TYPES } from '../lib/scanners/ses';
+import { scanLakeFormation, LAKEFORMATION_RESOURCE_TYPES } from '../lib/scanners/lakeformation';
+import { scanLicenseManager, LICENSEMANAGER_RESOURCE_TYPES } from '../lib/scanners/licensemanager';
+import { scanMq, MQ_RESOURCE_TYPES } from '../lib/scanners/mq';
+import { scanSavingsPlans, SAVINGSPLANS_RESOURCE_TYPES } from '../lib/scanners/savingsplans';
+import { scanAcmPca, ACMPCA_RESOURCE_TYPES } from '../lib/scanners/acmpca';
+import { scanAppSync, APPSYNC_RESOURCE_TYPES } from '../lib/scanners/appsync';
+import { scanMacie, MACIE_RESOURCE_TYPES } from '../lib/scanners/macie';
 import { scanGuardDutyFindings } from '../lib/scanners/guarddutyFindings';
 import { scanSecurityHubFindings } from '../lib/scanners/securityhubFindings';
 import { scanAccessAnalyzerFindings } from '../lib/scanners/accessAnalyzerFindings';
@@ -228,6 +239,18 @@ export const REGIONAL_SCANNERS: Record<string, ScannerFn> = {
   // inspector2.ts's own doc comment for the account-status resource this
   // adds (distinct from inspectorFindings.ts's existing findings scan).
   inspector2: scanInspector2,
+  // All regional -- see each scanner file's own doc comment for its
+  // researched API shape and confidence level.
+  es: scanOpenSearch,
+  firehose: scanFirehose,
+  dms: scanDms,
+  ses: scanSes,
+  lakeformation: scanLakeFormation,
+  licensemanager: scanLicenseManager,
+  mq: scanMq,
+  acmpca: scanAcmPca,
+  appsync: scanAppSync,
+  macie: scanMacie,
 };
 export const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
   iam: scanIam,
@@ -244,6 +267,10 @@ export const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
   // concept) -- see ce.ts/budgets.ts's own doc comments.
   ce: scanCostExplorer,
   budgets: scanBudgets,
+  // Bare hostname, no region suffix, ctx.region ignored -- same billing-
+  // wide nature as ce/budgets above, confirmed against AWS's own endpoint
+  // reference (see savingsplans.ts's doc comment).
+  savingsplans: scanSavingsPlans,
 };
 
 /**
@@ -394,6 +421,17 @@ export const SCANNER_RESOURCE_TYPES: Record<string, readonly string[]> = {
   ce: CE_RESOURCE_TYPES,
   budgets: BUDGETS_RESOURCE_TYPES,
   inspector2: INSPECTOR2_RESOURCE_TYPES,
+  es: ES_RESOURCE_TYPES,
+  firehose: FIREHOSE_RESOURCE_TYPES,
+  dms: DMS_RESOURCE_TYPES,
+  ses: SES_RESOURCE_TYPES,
+  lakeformation: LAKEFORMATION_RESOURCE_TYPES,
+  licensemanager: LICENSEMANAGER_RESOURCE_TYPES,
+  mq: MQ_RESOURCE_TYPES,
+  savingsplans: SAVINGSPLANS_RESOURCE_TYPES,
+  acmpca: ACMPCA_RESOURCE_TYPES,
+  appsync: APPSYNC_RESOURCE_TYPES,
+  macie: MACIE_RESOURCE_TYPES,
 };
 const COVERED_RESOURCE_TYPES = Object.values(SCANNER_RESOURCE_TYPES).flat();
 

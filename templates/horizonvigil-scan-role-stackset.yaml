@@ -120,6 +120,12 @@ Resources:
                   - 'kinesis:Describe*'
                   - 'kafka:List*'
                   - 'elasticmapreduce:List*'
+                  - 'es:List*'
+                  - 'es:Describe*'
+                  - 'firehose:List*'
+                  - 'firehose:Describe*'
+                  - 'dms:Describe*'
+                  - 'lakeformation:List*'
                 Resource: '*'
               - Sid: DevOpsCiCdAndMl
                 Effect: Allow
@@ -155,6 +161,7 @@ Resources:
                   - 'batch:Describe*'
                   - 'elasticbeanstalk:Describe*'
                   - 'apigateway:GET'
+                  - 'appsync:List*'
                 Resource: '*'
               - Sid: NetworkingEdgeDns
                 Effect: Allow
@@ -177,6 +184,8 @@ Resources:
                   - 'servicediscovery:List*'
                   - 'appmesh:List*'
                   - 'appmesh:Describe*'
+                  - 'ses:List*'
+                  - 'mq:List*'
                 Resource: '*'
               - Sid: IdentityAndKms
                 Effect: Allow
@@ -217,6 +226,8 @@ Resources:
                   - 'network-firewall:List*'
                   - 'cloudhsm:DescribeClusters'
                   - 'detective:ListGraphs'
+                  - 'acm-pca:List*'
+                  - 'macie2:List*'
                 Resource: '*'
               - Sid: MonitoringAndOps
                 Effect: Allow
@@ -249,6 +260,7 @@ Resources:
                   - 'cur:Describe*'
                   - 'account:GetAccountInformation'
                   - 'account:ListRegions'
+                  - 'savingsplans:Describe*'
                 Resource: '*'
               - Sid: TrustedAdvisorSupport
                 Effect: Allow
@@ -277,6 +289,7 @@ Resources:
                   - 'servicecatalog:SearchProductsAsAdmin'
                   - 'ram:GetResourceShares'
                   - 'ds:DescribeDirectories'
+                  - 'license-manager:List*'
                 Resource: '*'
 
 Outputs:
