@@ -90,6 +90,9 @@ import { scanWorkspaces, WORKSPACES_RESOURCE_TYPES } from '../lib/scanners/works
 import { scanCodeCommit, CODECOMMIT_RESOURCE_TYPES } from '../lib/scanners/codecommit';
 import { scanCodeDeploy, CODEDEPLOY_RESOURCE_TYPES } from '../lib/scanners/codedeploy';
 import { scanCodeArtifact, CODEARTIFACT_RESOURCE_TYPES } from '../lib/scanners/codeartifact';
+import { scanCostExplorer, CE_RESOURCE_TYPES } from '../lib/scanners/ce';
+import { scanBudgets, BUDGETS_RESOURCE_TYPES } from '../lib/scanners/budgets';
+import { scanInspector2, INSPECTOR2_RESOURCE_TYPES } from '../lib/scanners/inspector2';
 import { scanGuardDutyFindings } from '../lib/scanners/guarddutyFindings';
 import { scanSecurityHubFindings } from '../lib/scanners/securityhubFindings';
 import { scanAccessAnalyzerFindings } from '../lib/scanners/accessAnalyzerFindings';
@@ -221,6 +224,10 @@ export const REGIONAL_SCANNERS: Record<string, ScannerFn> = {
   codecommit: scanCodeCommit,
   codedeploy: scanCodeDeploy,
   codeartifact: scanCodeArtifact,
+  // Enabled per region like guardduty/securityhub above -- see
+  // inspector2.ts's own doc comment for the account-status resource this
+  // adds (distinct from inspectorFindings.ts's existing findings scan).
+  inspector2: scanInspector2,
 };
 export const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
   iam: scanIam,
@@ -233,6 +240,10 @@ export const GLOBAL_SCANNERS: Record<string, ScannerFn> = {
   health: scanHealth,
   s3control: scanS3Control,
   globalaccelerator: scanGlobalAccelerator,
+  // Both account-wide, us-east-1-only services (billing has no regional
+  // concept) -- see ce.ts/budgets.ts's own doc comments.
+  ce: scanCostExplorer,
+  budgets: scanBudgets,
 };
 
 /**
@@ -380,6 +391,9 @@ export const SCANNER_RESOURCE_TYPES: Record<string, readonly string[]> = {
   codecommit: CODECOMMIT_RESOURCE_TYPES,
   codedeploy: CODEDEPLOY_RESOURCE_TYPES,
   codeartifact: CODEARTIFACT_RESOURCE_TYPES,
+  ce: CE_RESOURCE_TYPES,
+  budgets: BUDGETS_RESOURCE_TYPES,
+  inspector2: INSPECTOR2_RESOURCE_TYPES,
 };
 const COVERED_RESOURCE_TYPES = Object.values(SCANNER_RESOURCE_TYPES).flat();
 
