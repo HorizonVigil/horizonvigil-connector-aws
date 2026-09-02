@@ -1,0 +1,40 @@
+# CI only -- build/typecheck/test on every push and PR. Deployment is
+# handled by Cloud Build (cloudbuild.yaml + the horizonvigil-connector-aws-main-deploy
+# trigger in cloudops360), not here: this repo used to also deploy from
+# this workflow, but running both on the same push to main raced two
+# concurrent deploys of the same Cloud Run service. Cloud Build was kept
+# (see the comment at the top of cloudbuild.yaml -- it predates this
+# change and was already the one with a consistent success record); this
+# file now only gives PR/push authors a fast build-and-test signal.
+
+name: CI
+
+on:
+  push:
+    branches: [main, test]
+  pull_request:
+
+env:
+  PROJECT_ID: cloudops360
+  REGION: us-central1
+  SERVICE: connector-aws
+  REPO: cloudops360
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Configure git for private shared-lib dependency
+        run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          printf "machine github.com\nlogin x-access-token\npassword %s\n" "${{ secrets.GH_PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc
+      - run: npm install
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+
