@@ -1,5 +1,7 @@
 import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, guarded, okJson, errJson } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
+import { resolveCredentials, type ResolvableConnection } from './permissions';
+import { listOrganizationTree, type OrgTreeNode } from '../lib/scanners/organizations';
 
 export const orgHierarchyRoutes = new Hono<{ Bindings: Env }>();
 
@@ -31,6 +33,74 @@ orgHierarchyRoutes.get('/organizations', (c) =>
     return okJson({
       awsAccounts: Array.from(groups.entries()).map(([awsAccountId, connections]) => ({ awsAccountId, connections })),
     });
+  }),
+);
+
+/**
+ * GET /api/aws-accounts/organizations/hierarchy?managementConnectionId=
+ * — the real AWS Organizations OU tree (spec §25), walked live via the
+ * management connection's own credentials, with every account annotated as
+ * `connected` / `not_connected` against this org's `cloud_connections`. When
+ * no `managementConnectionId` is given, or the given connection can't read
+ * Organizations, the response falls back to `{ mode: 'flat', ... }` — the
+ * same account-id grouping `/organizations` returns — so the Hierarchy view
+ * always has something real to render. Live-cloud call: NOT runnable in this
+ * environment (needs PLATFORM_AWS_* for cross-account role assumption).
+ */
+orgHierarchyRoutes.get('/organizations/hierarchy', (c) =>
+  guarded(async () => {
+    const auth = getAuthContext(c.req.raw);
+    const orgId = requireOrgId(c.req.raw);
+    const db = createDb(c.env, auth.accessToken);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
+
+    const connectedRows = await db.select<{ aws_account_id: string; id: string; connection_name: string; status: string; environment: string }[]>('cloud_connections', {
+      select: 'aws_account_id,id,connection_name,status,environment',
+      filters: { org_id: `eq.${orgId}`, provider: 'eq.aws' },
+    });
+    const connectedById = new Map(connectedRows.map((r) => [r.aws_account_id, r]));
+
+    const flat = () => {
+      const groups = new Map<string, typeof connectedRows>();
+      for (const row of connectedRows) {
+        const list = groups.get(row.aws_account_id) ?? [];
+        list.push(row);
+        groups.set(row.aws_account_id, list);
+      }
+      return okJson({
+        mode: 'flat' as const,
+        awsAccounts: [...groups.entries()].map(([awsAccountId, connections]) => ({ awsAccountId, connections })),
+      });
+    };
+
+    const managementConnectionId = c.req.query('managementConnectionId');
+    if (!managementConnectionId) return flat();
+
+    const rows = await db.select<(ResolvableConnection & { id: string })[]>('cloud_connections', {
+      select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
+      filters: { id: `eq.${managementConnectionId}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
+    });
+    const mgmt = rows[0];
+    if (!mgmt) return errJson(404, 'Management account connection not found.');
+
+    const resolved = await resolveCredentials(c.env, mgmt);
+    if ('error' in resolved) return flat();
+
+    const tree = await listOrganizationTree(resolved.creds);
+    if (!tree.ok) return flat();
+
+    const annotate = (node: OrgTreeNode): unknown => ({
+      type: node.type,
+      id: node.id,
+      name: node.name,
+      accounts: node.accounts.map((a) => {
+        const connected = connectedById.get(a.id);
+        return { ...a, connected: !!connected, connectionId: connected?.id ?? null, environment: connected?.environment ?? null };
+      }),
+      children: node.children.map(annotate),
+    });
+
+    return okJson({ mode: 'tree' as const, roots: tree.roots.map(annotate) });
   }),
 );
 

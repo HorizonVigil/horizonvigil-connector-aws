@@ -81,6 +81,57 @@ interface BulkImportBody {
 }
 
 /**
+ * GET /api/aws-accounts/accounts/bulk-import/preview?managementConnectionId=
+ * — a read-only dry run of the bulk import below: lists the Organization's
+ * accounts via the management connection's own credentials, diffs against
+ * what this org already has connected, and returns the counts + a small
+ * sample so the UI can show "820 accounts found, 12 already connected, 808
+ * importable" before the customer commits. No `cloud_connections` rows are
+ * created. Same read-level bar as viewing the account list — the blast-radius
+ * concern is on the POST, not on counting.
+ */
+bulkImportRoutes.get('/accounts/bulk-import/preview', (c) =>
+  guarded(async () => {
+    const auth = getAuthContext(c.req.raw);
+    const orgId = requireOrgId(c.req.raw);
+    const db = createDb(c.env, auth.accessToken);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
+
+    const managementConnectionId = c.req.query('managementConnectionId');
+    if (!managementConnectionId) {
+      return errJson(400, 'managementConnectionId is required — pass the connection id of your AWS Organizations management account.');
+    }
+
+    const rows = await db.select<(ResolvableConnection & { id: string })[]>('cloud_connections', {
+      select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
+      filters: { id: `eq.${managementConnectionId}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
+    });
+    const managementConnection = rows[0];
+    if (!managementConnection) return errJson(404, 'Management account connection not found.');
+
+    const resolved = await resolveCredentials(c.env, managementConnection);
+    if ('error' in resolved) return errJson(400, `Could not resolve credentials for the management account connection: ${resolved.error}`);
+
+    const listed = await listOrganizationAccounts(resolved.creds);
+    if (!listed.ok) return errJson(400, listed.error);
+
+    const active = listed.accounts.filter((a): a is OrgAccount & { Id: string } => a.Status === 'ACTIVE' && !!a.Id);
+    const alreadyConnected = await existingAwsAccountIds(db, orgId);
+    const importable = active.filter((a) => !alreadyConnected.has(a.Id));
+
+    return okJson({
+      total: listed.accounts.length,
+      active: active.length,
+      inactive: listed.accounts.length - active.length,
+      alreadyConnected: active.length - importable.length,
+      importable: importable.length,
+      overLimit: importable.length > MAX_ACCOUNTS_PER_BULK_IMPORT ? importable.length - MAX_ACCOUNTS_PER_BULK_IMPORT : 0,
+      sample: importable.slice(0, 8).map((a) => ({ id: a.Id, name: a.Name ?? a.Id })),
+    });
+  }),
+);
+
+/**
  * POST /api/aws-accounts/accounts/bulk-import-from-organization — the bulk
  * onboarding path the interactive per-account wizard genuinely can't reach
  * at a 2,000+-account scale (it creates one connection per submit). Requires
