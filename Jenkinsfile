@@ -64,7 +64,6 @@ pipeline {
     }
 
     stage('Build, push & deploy') {
-      when { branch 'main' }
       steps {
         withCredentials([string(credentialsId: 'gh-pat', variable: 'GH_PAT')]) {
           sh """
