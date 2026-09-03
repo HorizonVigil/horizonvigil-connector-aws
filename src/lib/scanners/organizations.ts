@@ -92,3 +92,63 @@ export async function listOrganizationAccounts(creds: AwsCreds): Promise<{ ok: t
   }
   return { ok: true, accounts: (result.body as ListAccountsResponse).Accounts ?? [] };
 }
+
+// ── Full OU tree (spec §25) ────────────────────────────────────────────────
+
+export interface OrgTreeNode {
+  type: 'root' | 'ou';
+  id: string;
+  name: string;
+  accounts: { id: string; name: string; email?: string; status?: string }[];
+  children: OrgTreeNode[];
+}
+
+/**
+ * A recursive walk of the real AWS Organizations OU tree for the bulk-import
+ * / Hierarchy view (routes/organizations.ts's `/organizations/hierarchy`).
+ * Separate from `scanOrganizations` (the discovery-pipeline scanner, which is
+ * deliberately shallow — see its doc comment): this one walks arbitrarily
+ * deep via `ListOrganizationalUnitsForParent` + `ListAccountsForParent` on
+ * each node. `maxNodes` bounds a pathological deployment; every call only
+ * succeeds for the management account (or a delegated administrator) — a
+ * member account gets AWSOrganizationsNotInUseException on `ListRoots`,
+ * returned here as `{ ok: false }` so the route can fall back to the flat
+ * "group by account id" view. NOT runnable in this environment (needs
+ * PLATFORM_AWS_* to assume a cross-account role); shipped as pattern code.
+ */
+export async function listOrganizationTree(
+  creds: AwsCreds,
+  maxNodes = 500,
+): Promise<{ ok: true; roots: OrgTreeNode[] } | { ok: false; error: string }> {
+  const call = (target: string, body: Record<string, unknown> = {}) =>
+    callJsonApi(creds, { service: 'organizations', region: 'us-east-1', host: 'organizations.us-east-1.amazonaws.com', target: `AWSOrganizationsV20161128.${target}`, body });
+
+  const rootsResult = await call('ListRoots');
+  if (!rootsResult.ok) {
+    return { ok: false, error: rootsResult.errorMessage ?? rootsResult.errorCode ?? `AWS Organizations ListRoots failed (status ${rootsResult.status}) — is this the management account?` };
+  }
+
+  let visited = 0;
+  const walk = async (id: string, name: string, type: 'root' | 'ou'): Promise<OrgTreeNode> => {
+    visited++;
+    const node: OrgTreeNode = { type, id, name, accounts: [], children: [] };
+    if (visited > maxNodes) return node;
+
+    const accountsResult = await call('ListAccountsForParent', { ParentId: id });
+    for (const a of (accountsResult.ok ? (accountsResult.body as ListAccountsResponse).Accounts : []) ?? []) {
+      node.accounts.push({ id: a.Id, name: a.Name ?? a.Id, email: a.Email, status: a.Status });
+    }
+
+    const ousResult = await call('ListOrganizationalUnitsForParent', { ParentId: id });
+    for (const ou of (ousResult.ok ? (ousResult.body as ListOUsResponse).OrganizationalUnits : []) ?? []) {
+      node.children.push(await walk(ou.Id, ou.Name ?? ou.Id, 'ou'));
+    }
+    return node;
+  };
+
+  const roots: OrgTreeNode[] = [];
+  for (const root of (rootsResult.body as ListRootsResponse).Roots ?? []) {
+    roots.push(await walk(root.Id, root.Name ?? 'Root', 'root'));
+  }
+  return { ok: true, roots };
+}
