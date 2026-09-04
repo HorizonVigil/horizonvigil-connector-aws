@@ -63,30 +63,21 @@ pipeline {
       }
     }
 
+    // The build + push + deploy is offloaded to Google Cloud Build (free
+    // 120 build-min/day) via the repo's own cloudbuild.yaml. Doing the
+    // multi-stage `docker build` locally starves the 1 GB e2-micro and the
+    // durable `sh` task drops out ("agent seems to be offline"). Cloud Build
+    // also uses the `gh_pat` Secret Manager secret for the private shared-lib
+    // clone — that secret must have read access to
+    // github.com/kknr8367/cloudops-shared-lib (see JENKINS-SETUP.md).
     stage('Build, push & deploy') {
+      agent { docker { image 'google/cloud-sdk:slim'; reuseNode true; args '-u root:root' } }
       steps {
-        withCredentials([string(credentialsId: 'gh-pat', variable: 'GH_PAT')]) {
-          sh """
-            set -e
-            export DOCKER_BUILDKIT=1
-            TAG=\$(git rev-parse --short HEAD)
-
-            printf '%s' "\$GH_PAT" > /tmp/gh_pat.\$\$
-            docker build --secret id=gh_pat,src=/tmp/gh_pat.\$\$ -t "${IMAGE}:\$TAG" -t "${IMAGE}:latest" .
-            rm -f /tmp/gh_pat.\$\$
-
-            TOKEN=\$(curl -s -H 'Metadata-Flavor: Google' \
-              'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
-              | sed -n 's/.*"access_token":"\\([^"]*\\)".*/\\1/p')
-            echo "\$TOKEN" | docker login -u oauth2accesstoken --password-stdin https://${AR_HOST}
-            docker push "${IMAGE}:\$TAG"
-            docker push "${IMAGE}:latest"
-
-            docker run --rm google/cloud-sdk:slim gcloud run deploy ${SERVICE} \
-              --image="${IMAGE}:\$TAG" --project=${PROJECT} --region=${REGION} \
-              --platform=managed --min-instances=0 --max-instances=1 --quiet
-          """
-        }
+        sh """
+          set -e
+          gcloud builds submit --project=${PROJECT} --region=${REGION} \
+            --config=cloudbuild.yaml --gcs-log-dir=gs://${PROJECT}_cloudbuild/logs .
+        """
       }
     }
   }
