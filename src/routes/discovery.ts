@@ -559,7 +559,7 @@ export async function runFindingStep(db: Db, orgId: string, env: Env, connection
     return {
       connection_id: connection.id, resource_id: (f.resourceArn && resourceIdByArn.get(f.resourceArn)) ?? null,
       finding_source: f.findingSource, aws_finding_id: f.awsFindingId,
-      severity: f.severity, cvss_score: f.cvssScore ?? null, title: f.title, description: f.description ?? null,
+      severity: f.severity, cvss_score: f.cvssScore ?? null, cve: f.cve ?? null, title: f.title, description: f.description ?? null,
       compliance_frameworks: f.complianceFrameworks ?? [], remediation_link: f.remediationLink ?? null,
       discovered_at: f.discoveredAt, region: f.region, resource_arn: f.resourceArn ?? null, last_seen_at: now,
     };

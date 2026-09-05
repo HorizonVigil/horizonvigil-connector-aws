@@ -16,6 +16,8 @@ export interface ScannedFinding {
   awsFindingId: string;
   severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';
   cvssScore?: number;
+  /** Real CVE identifier, when the scanner actually has one (currently only Inspector). Never fabricated. */
+  cve?: string;
   title: string;
   description?: string;
   complianceFrameworks?: string[];

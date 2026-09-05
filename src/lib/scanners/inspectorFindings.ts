@@ -67,12 +67,19 @@ export async function scanInspectorFindings(ctx: ScannerContext): Promise<Scanne
     });
     if (!result) break;
     for (const f of result.findings ?? []) {
+      // vulnerabilityId is usually a real CVE for package-vuln findings, but
+      // Inspector also uses this same field for non-CVE identifiers on other
+      // finding types (e.g. network-reachability findings) -- only persist it
+      // as `cve` when it actually looks like one, never fabricated/guessed.
+      const vulnId = f.packageVulnerabilityDetails?.vulnerabilityId;
+      const cve = vulnId && /^CVE-\d{4}-\d+$/i.test(vulnId) ? vulnId : undefined;
       out.push({
         findingSource: 'inspector',
         awsFindingId: f.findingArn,
         severity: mapSeverity(f.severity),
         cvssScore: f.packageVulnerabilityDetails?.cvss?.[0]?.baseScore,
-        title: f.title ?? f.packageVulnerabilityDetails?.vulnerabilityId ?? 'Inspector finding',
+        cve,
+        title: f.title ?? vulnId ?? 'Inspector finding',
         description: f.description,
         complianceFrameworks: [],
         remediationLink: f.remediation?.recommendation?.url,
