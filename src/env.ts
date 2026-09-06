@@ -48,4 +48,13 @@ export interface Env extends BaseEnv {
   // lockstep. Same value must be set as POST_SCAN_HOOK_SECRET on
   // cost-optimization-api and observability-api.
   POST_SCAN_HOOK_SECRET?: string;
+  // Shared secret a Cloud Scheduler job presents (X-Internal-Scan-Secret
+  // header, same header name as INTERNAL_SCAN_SECRET for consistency, but a
+  // deliberately separate value) to call POST /internal/run-due-cost-syncs
+  // — see routes/cost.ts. Its own secret rather than reusing
+  // INTERNAL_SCAN_SECRET for the same reason POST_SCAN_HOOK_SECRET above is
+  // its own value: rotating one must never risk silently breaking the
+  // other's already-running Cloud Scheduler job. Same "honest 503, not a
+  // silent no-op" degradation as INTERNAL_SCAN_SECRET when unset.
+  INTERNAL_COST_SYNC_SECRET?: string;
 }

@@ -47,3 +47,16 @@ export async function triggerRecommendationGeneration(env: Env, connectionId: st
 export async function triggerAlertEvaluation(env: Env, connectionId: string, orgId: string): Promise<void> {
   await callInternal(env.ALERTS_API_URL, env.POST_SCAN_HOOK_SECRET, '/internal/evaluate-alert-rules', { connectionId, orgId });
 }
+
+/**
+ * Same best-effort, server-to-server pattern as the two hooks above, fired
+ * from the new POST /internal/run-due-cost-syncs route (routes/cost.ts)
+ * right after a scheduled sync writes fresh cost_snapshots rows — the
+ * server-side equivalent of the user-triggered path's own "detect
+ * immediately after a manual Sync Cost click" behavior (see
+ * frontend/src/pages/AwsAccountDetail.tsx's syncCost), now reachable from a
+ * context with no browser/user session to have driven that click.
+ */
+export async function triggerAnomalyDetection(env: Env, connectionId: string): Promise<void> {
+  await callInternal(env.COST_OPTIMIZATION_API_URL, env.POST_SCAN_HOOK_SECRET, '/internal/detect-anomalies', { connectionId });
+}
