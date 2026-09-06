@@ -1,7 +1,10 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson, type Db } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
-import { callJsonApi } from '../lib/awsApi';
+import { callJsonApi, type AwsCreds } from '../lib/awsApi';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
+import { triggerAnomalyDetection } from '../lib/postScanHooks';
+
+const MAX_CONNECTIONS_PER_COST_SYNC_RUN = 5;
 
 export const costRoutes = new Hono<{ Bindings: Env }>();
 
@@ -23,17 +26,87 @@ interface CostExplorerResult {
   Groups: CostExplorerGroup[];
 }
 
+export interface SyncTarget { id: string; aws_account_id: string }
+
+/**
+ * Pure transform: a raw GetCostAndUsage response body -> the exact
+ * cost_snapshots rows to write. Extracted out of syncConnectionCost so this
+ * (the part with actual branching logic — zero-cost filtering, the
+ * Keys[0]/'Unknown' and Unit/'USD' fallbacks) is unit-testable against a
+ * hand-built fixture without needing a live AWS call or a real Db.
+ */
+export function buildCostSnapshotRows(body: { ResultsByTime?: CostExplorerResult[] }, connection: SyncTarget): Record<string, unknown>[] {
+  const snapshotRows: Record<string, unknown>[] = [];
+  for (const period of body.ResultsByTime ?? []) {
+    for (const group of period.Groups ?? []) {
+      const amount = Number(group.Metrics?.UnblendedCost?.Amount ?? 0);
+      if (amount === 0) continue;
+      snapshotRows.push({
+        connection_id: connection.id,
+        account_id: connection.aws_account_id,
+        usage_date: period.TimePeriod.Start,
+        service: group.Keys[0] || 'Unknown',
+        unblended_cost: amount,
+        currency: group.Metrics.UnblendedCost.Unit || 'USD',
+      });
+    }
+  }
+  return snapshotRows;
+}
+
+/**
+ * The real ce:GetCostAndUsage call (month-to-date, daily granularity,
+ * grouped by service) plus the cost_snapshots write — extracted so both the
+ * user-triggered route below and the new service-role-authenticated
+ * /internal/run-due-cost-syncs route call the exact same real billing logic,
+ * not two copies that could drift. Re-syncing replaces this month's rows for
+ * the connection rather than appending, so re-running it is safe and
+ * idempotent.
+ */
+async function syncConnectionCost(db: Db, creds: AwsCreds, connection: SyncTarget): Promise<{ ok: true; synced: number; start: string; end: string } | { ok: false; status: number; message: string }> {
+  const start = monthStartIso();
+  const end = todayIso();
+
+  const result = await callJsonApi(creds, {
+    service: 'ce',
+    region: 'us-east-1',
+    host: 'ce.us-east-1.amazonaws.com',
+    target: 'AWSInsightsIndexService.GetCostAndUsage',
+    body: {
+      TimePeriod: { Start: start, End: end },
+      Granularity: 'DAILY',
+      Metrics: ['UnblendedCost'],
+      GroupBy: [{ Type: 'DIMENSION', Key: 'SERVICE' }],
+    },
+  });
+
+  if (!result.ok) {
+    const message = result.errorMessage ?? result.errorCode ?? `Cost Explorer request failed (HTTP ${result.status})`;
+    return { ok: false, status: result.status === 403 ? 403 : 502, message };
+  }
+
+  const snapshotRows = buildCostSnapshotRows(result.body as { ResultsByTime?: CostExplorerResult[] }, connection);
+
+  // Replace this month's snapshots for this connection rather than
+  // appending — makes a re-sync idempotent instead of duplicating rows
+  // (cost_snapshots has no unique constraint PostgREST can upsert against
+  // via this client without a matching on_conflict column list).
+  await db.remove('cost_snapshots', { connection_id: `eq.${connection.id}`, usage_date: `gte.${start}` }, 'return=minimal');
+  if (snapshotRows.length > 0) {
+    await db.insert('cost_snapshots', snapshotRows, 'return=minimal');
+  }
+
+  return { ok: true, synced: snapshotRows.length, start, end };
+}
+
 /**
  * POST /api/aws-accounts/accounts/:id/cost/sync — the cost ingestion this
- * domain has never had: a real ce:GetCostAndUsage call (month-to-date,
- * daily granularity, grouped by service) using the connection's own stored
- * credentials, written into cost_snapshots. Every other cost surface in
- * this codebase (Cost Management, Overview, this domain's own /cost) reads
- * from that table; until this endpoint existed, nothing ever wrote to it.
- * Re-syncing replaces this month's rows for the connection rather than
- * appending, so re-running it is safe and idempotent. Zero-cost rows are
- * dropped at the source — AWS returns one row per service per day even at
- * $0, which is exactly what made the CSV report noisy before this existed.
+ * domain has never had: a real ce:GetCostAndUsage call using the
+ * connection's own stored credentials, written into cost_snapshots. Every
+ * other cost surface in this codebase (Cost Management, Overview, this
+ * domain's own /cost) reads from that table; until this endpoint existed,
+ * nothing ever wrote to it. See syncConnectionCost() above for the shared
+ * logic also used by the scheduled /internal/run-due-cost-syncs route below.
  */
 costRoutes.post('/accounts/:id/cost/sync', (c) =>
   guarded(async () => {
@@ -52,57 +125,15 @@ costRoutes.post('/accounts/:id/cost/sync', (c) =>
     const resolved = await resolveCredentials(c.env, connection);
     if ('error' in resolved) return errJson(400, resolved.error);
 
-    const start = monthStartIso();
-    const end = todayIso();
-
-    const result = await callJsonApi(resolved.creds, {
-      service: 'ce',
-      region: 'us-east-1',
-      host: 'ce.us-east-1.amazonaws.com',
-      target: 'AWSInsightsIndexService.GetCostAndUsage',
-      body: {
-        TimePeriod: { Start: start, End: end },
-        Granularity: 'DAILY',
-        Metrics: ['UnblendedCost'],
-        GroupBy: [{ Type: 'DIMENSION', Key: 'SERVICE' }],
-      },
-    });
-
-    if (!result.ok) {
-      const message = result.errorMessage ?? result.errorCode ?? `Cost Explorer request failed (HTTP ${result.status})`;
-      await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.cost_sync_failed', targetType: 'cloud_connection', targetId: connection.id, metadata: { reason: message } });
-      return errJson(result.status === 403 ? 403 : 502, message);
+    const outcome = await syncConnectionCost(db, resolved.creds, connection);
+    if (!outcome.ok) {
+      await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.cost_sync_failed', targetType: 'cloud_connection', targetId: connection.id, metadata: { reason: outcome.message } });
+      return errJson(outcome.status, outcome.message);
     }
 
-    const body = result.body as { ResultsByTime?: CostExplorerResult[] };
-    const snapshotRows: Record<string, unknown>[] = [];
-    for (const period of body.ResultsByTime ?? []) {
-      for (const group of period.Groups ?? []) {
-        const amount = Number(group.Metrics?.UnblendedCost?.Amount ?? 0);
-        if (amount === 0) continue;
-        snapshotRows.push({
-          connection_id: connection.id,
-          account_id: connection.aws_account_id,
-          usage_date: period.TimePeriod.Start,
-          service: group.Keys[0] || 'Unknown',
-          unblended_cost: amount,
-          currency: group.Metrics.UnblendedCost.Unit || 'USD',
-        });
-      }
-    }
+    await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.cost_synced', targetType: 'cloud_connection', targetId: connection.id, metadata: { rowCount: outcome.synced, start: outcome.start, end: outcome.end } });
 
-    // Replace this month's snapshots for this connection rather than
-    // appending — makes a re-sync idempotent instead of duplicating rows
-    // (cost_snapshots has no unique constraint PostgREST can upsert against
-    // via this client without a matching on_conflict column list).
-    await db.remove('cost_snapshots', { connection_id: `eq.${connection.id}`, usage_date: `gte.${start}` }, 'return=minimal');
-    if (snapshotRows.length > 0) {
-      await db.insert('cost_snapshots', snapshotRows, 'return=minimal');
-    }
-
-    await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.cost_synced', targetType: 'cloud_connection', targetId: connection.id, metadata: { rowCount: snapshotRows.length, start, end } });
-
-    return okJson({ synced: snapshotRows.length, start, end });
+    return okJson({ synced: outcome.synced, start: outcome.start, end: outcome.end });
   }),
 );
 
@@ -160,5 +191,87 @@ costRoutes.get('/cost-summary', (c) =>
       .slice(0, 5);
 
     return okJson({ topCostAccounts, totalMonthToDate: Math.round(Array.from(costById.values()).reduce((s, v) => s + v, 0) * 100) / 100 });
+  }),
+);
+
+interface CostSyncDue { id: string; org_id: string; aws_account_id: string; cost_sync_interval_hours: number }
+
+/**
+ * POST /internal/run-due-cost-syncs — cost ingestion has been 100%
+ * click-triggered since it existed (every route above requires a real
+ * logged-in user's session). This is the server-side scheduled equivalent,
+ * mirroring internalScan.ts's own /internal/run-due-scans in every way that
+ * matters: a shared secret (INTERNAL_COST_SYNC_SECRET, its own value —
+ * see env.ts for why) authenticates a Cloud Scheduler job instead of a
+ * user, SUPABASE_SERVICE_ROLE_KEY bypasses RLS since there's no per-user
+ * token to forward, and the due-connection query/advance-next-run shape is
+ * identical, just against cost_sync_enabled/cost_sync_interval_hours/
+ * next_scheduled_cost_sync_at instead of the scan-scheduling columns.
+ *
+ * Capped at MAX_CONNECTIONS_PER_COST_SYNC_RUN per invocation — one
+ * Cost Explorer call per connection is far cheaper than a full resource
+ * scan, so this cap exists for the same "never let one invocation run
+ * unbounded" reason as run-due-scans, not because of a comparable timeout
+ * risk; a connection not reached this cycle is simply picked up next tick
+ * (its next_scheduled_cost_sync_at isn't advanced until it actually runs).
+ *
+ * Triggers anomaly detection after each successful sync via
+ * triggerAnomalyDetection() (lib/postScanHooks.ts) — the scheduled path's
+ * equivalent of the manual path's "detect right after a Sync Cost click"
+ * behavior — best-effort, same as every other postScanHooks call in this
+ * codebase.
+ */
+costRoutes.post('/internal/run-due-cost-syncs', (c) =>
+  guarded(async () => {
+    const secret = c.req.header('x-internal-scan-secret');
+    if (!c.env.INTERNAL_COST_SYNC_SECRET) return errJson(503, 'INTERNAL_COST_SYNC_SECRET is not configured — scheduled cost sync is not active in this environment.');
+    if (!c.env.SUPABASE_SERVICE_ROLE_KEY) return errJson(503, 'SUPABASE_SERVICE_ROLE_KEY is not configured — scheduled cost sync cannot authenticate to the database in this environment.');
+    if (secret !== c.env.INTERNAL_COST_SYNC_SECRET) return errJson(403, 'Invalid or missing X-Internal-Scan-Secret.');
+
+    const db = createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY);
+    const now = new Date().toISOString();
+
+    const due = await db.select<CostSyncDue[]>('cloud_connections', {
+      select: 'id,org_id,aws_account_id,cost_sync_interval_hours',
+      filters: {
+        provider: 'eq.aws', cost_sync_enabled: 'eq.true',
+        or: `(next_scheduled_cost_sync_at.is.null,next_scheduled_cost_sync_at.lte.${now})`,
+        status: 'neq.pending',
+      },
+      limit: MAX_CONNECTIONS_PER_COST_SYNC_RUN,
+    });
+
+    const results: { connectionId: string; synced?: number; error?: string }[] = [];
+    for (const row of due) {
+      const connectionRows = await db.select<(ResolvableConnection & { aws_account_id: string })[]>('cloud_connections', {
+        select: 'id,aws_account_id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
+        filters: { id: `eq.${row.id}` },
+      });
+      const connection = connectionRows[0];
+      if (!connection) continue;
+
+      const resolved = await resolveCredentials(c.env, connection);
+      if ('error' in resolved) {
+        await writeAuditLog(db, { orgId: row.org_id, actorId: null, action: 'aws_account.cost_sync_failed', targetType: 'cloud_connection', targetId: row.id, metadata: { reason: resolved.error, trigger: 'scheduled' } });
+        results.push({ connectionId: row.id, error: resolved.error });
+        continue;
+      }
+
+      const outcome = await syncConnectionCost(db, resolved.creds, connection);
+      const nextSync = new Date(Date.now() + row.cost_sync_interval_hours * 60 * 60 * 1000).toISOString();
+      await db.update('cloud_connections', { id: `eq.${row.id}` }, { next_scheduled_cost_sync_at: nextSync }, 'return=minimal');
+
+      if (!outcome.ok) {
+        await writeAuditLog(db, { orgId: row.org_id, actorId: null, action: 'aws_account.cost_sync_failed', targetType: 'cloud_connection', targetId: row.id, metadata: { reason: outcome.message, trigger: 'scheduled' } });
+        results.push({ connectionId: row.id, error: outcome.message });
+        continue;
+      }
+
+      await writeAuditLog(db, { orgId: row.org_id, actorId: null, action: 'aws_account.cost_synced', targetType: 'cloud_connection', targetId: row.id, metadata: { rowCount: outcome.synced, start: outcome.start, end: outcome.end, trigger: 'scheduled' } });
+      await triggerAnomalyDetection(c.env, row.id);
+      results.push({ connectionId: row.id, synced: outcome.synced });
+    }
+
+    return okJson({ connectionsSynced: results.length, results });
   }),
 );
