@@ -12,7 +12,9 @@ recommendationsRoutes.get('/accounts/:id/recommendations', (c) =>
     await requireMenuPermission(db, auth.userId, orgId, 'optimization', 'read');
 
     const rows = await db.select('cost_recommendations', {
-      select: 'id,category,issue,recommended_action,potential_monthly_savings,priority,status',
+      select: 'id,connection_id,resource_id,category,issue,recommended_action,potential_monthly_savings,priority,status,created_at,external_key,' +
+        'excluded_reason,excluded_justification,excluded_by,excluded_at,excluded_until,assigned_to,last_notified_at,last_notified_by,' +
+        'source,commitment_term,payment_option',
       filters: { connection_id: `eq.${c.req.param('id')}`, status: 'eq.open', or: notCurrentlyExcludedFilter() },
       order: 'potential_monthly_savings.desc',
       limit: 50,
