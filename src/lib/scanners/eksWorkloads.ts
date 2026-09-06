@@ -1,6 +1,7 @@
 import { fetch as undiciFetch, Agent } from 'undici';
 import { AwsV4Signer } from 'aws4fetch';
 import type { ScannedResource, ScannerContext } from './types';
+import { parseCpuMillicores, parseMemoryBytes } from '../k8sQuantity';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
 export const EKS_WORKLOAD_RESOURCE_TYPES = ['eks_pod', 'eks_deployment', 'eks_namespace', 'eks_node', 'eks_auth_mapping'] as const;
@@ -122,6 +123,12 @@ async function buildEksToken(ctx: ScannerContext, clusterName: string): Promise<
 interface K8sObjectMeta {
   name: string; namespace?: string; uid?: string; creationTimestamp?: string;
   labels?: Record<string, string>;
+  // Real K8s field -- lets a pod/deployment be rolled up to its owning
+  // ReplicaSet/Deployment/DaemonSet/StatefulSet exactly, instead of guessing
+  // from name-prefix conventions (fragile: a pod named "worker-abc123" could
+  // belong to a Deployment, a bare ReplicaSet, or a Job -- ownerReferences
+  // says which, unambiguously). Used by k8sCostAllocation.ts's per-workload rollup.
+  ownerReferences?: { kind: string; name: string }[];
 }
 
 // Container-level state as reported by kubelet — this is the actual source
@@ -139,7 +146,15 @@ interface K8sContainerStatus {
 }
 interface K8sPod {
   metadata: K8sObjectMeta;
-  spec?: { nodeName?: string; containers?: { name: string; image: string }[]; nodeSelector?: Record<string, string>; tolerations?: { key?: string; operator?: string; value?: string; effect?: string }[] };
+  spec?: {
+    nodeName?: string;
+    // `resources` added for k8sCostAllocation.ts -- same shape K8sContainerSpec
+    // already captures for deployments (that pod-template-level snapshot
+    // isn't a substitute: it's what a NEW pod would request, not what THIS
+    // running pod is actually holding right now).
+    containers?: { name: string; image: string; resources?: { requests?: { cpu?: string; memory?: string }; limits?: { cpu?: string; memory?: string } } }[];
+    nodeSelector?: Record<string, string>; tolerations?: { key?: string; operator?: string; value?: string; effect?: string }[];
+  };
   status?: {
     phase?: string; reason?: string; message?: string; podIP?: string; hostIP?: string; qosClass?: string;
     containerStatuses?: K8sContainerStatus[];
@@ -178,6 +193,15 @@ interface K8sDeployment {
   status?: { readyReplicas?: number; availableReplicas?: number; updatedReplicas?: number; unavailableReplicas?: number; conditions?: { type: string; status: string; reason?: string; message?: string }[] };
 }
 interface K8sDeploymentList { items?: K8sDeployment[] }
+// A Pod's real ownerReferences points to its ReplicaSet, NOT its Deployment
+// -- the ReplicaSet's own ownerReferences is what points to the Deployment.
+// Fetched transiently (not persisted as its own cloud_resources row/resource
+// type -- this scanner's scope is what discovery.ts already exposes as
+// inventory) purely to resolve that real 2-hop chain to a stable workload
+// name, so k8sCostAllocation.ts's per-workload cost rollup doesn't reset
+// every time a Deployment rolls out a new ReplicaSet.
+interface K8sReplicaSet { metadata: K8sObjectMeta }
+interface K8sReplicaSetList { items?: K8sReplicaSet[] }
 interface K8sNamespace {
   metadata: K8sObjectMeta;
   status?: { phase?: string };
@@ -197,7 +221,12 @@ interface K8sNodeObjectMeta {
 }
 interface K8sNode {
   metadata: K8sNodeObjectMeta;
-  spec?: { taints?: { key: string; value?: string; effect: string }[]; unschedulable?: boolean };
+  // `providerID` (format "aws:///<az>/<instance-id>" for the AWS cloud
+  // provider -- standard K8s field, not AWS-specific invention) is the
+  // EXACT join key to this node's real ec2_instance row -- k8sCostAllocation.ts
+  // parses the instance id out of it rather than heuristically matching on
+  // IP address, which would be fragile (multiple ENIs, NAT, etc.).
+  spec?: { taints?: { key: string; value?: string; effect: string }[]; unschedulable?: boolean; providerID?: string };
   status?: {
     addresses?: { type: string; address: string }[];
     nodeInfo?: {
@@ -225,8 +254,65 @@ interface K8sNodeList { items?: K8sNode[] }
 function findNodeAddress(node: K8sNode, type: string): string | undefined {
   return node.status?.addresses?.find((a) => a.type === type)?.address;
 }
+
+// Standard Kubernetes field, format "aws:///<availability-zone>/<instance-id>"
+// for the AWS cloud provider (confirmed against k8s.io/cloud-provider-aws) --
+// the exact join key to this node's real ec2_instance row. Returns undefined
+// for anything that doesn't match (e.g. Fargate profile nodes, which have no
+// backing EC2 instance and a different providerID shape entirely) --
+// k8sCostAllocation.ts treats that as "no resolvable node cost," not a guess.
+const AWS_PROVIDER_ID_PATTERN = /^aws:\/\/\/[^/]+\/(i-[0-9a-f]+)$/;
+function extractEc2InstanceId(providerID: string | undefined): string | undefined {
+  return providerID ? AWS_PROVIDER_ID_PATTERN.exec(providerID)?.[1] : undefined;
+}
 function isNodeReady(node: K8sNode): boolean {
   return node.status?.conditions?.find((c) => c.type === 'Ready')?.status === 'True';
+}
+
+/**
+ * Sums each container's declared CPU/memory *request* across a pod's real
+ * running containers, for k8sCostAllocation.ts. A container with no
+ * `resources.requests` declared contributes 0 -- that's real K8s semantics
+ * (an undeclared request really is "no request"), not missing data, so it's
+ * summed in rather than propagated as null. `hasAnyRequest` distinguishes a
+ * pod that genuinely declared 0 total (every container is request-less) --
+ * k8sCostAllocation.ts excludes those from proportional allocation (no
+ * request to allocate proportionally to) rather than assigning a $0 share
+ * as if that were a real answer.
+ */
+function sumPodResourceRequests(containers: { resources?: { requests?: { cpu?: string; memory?: string } } }[]): { cpuMillicores: number; memoryBytes: number; hasAnyRequest: boolean } {
+  let cpuMillicores = 0;
+  let memoryBytes = 0;
+  let hasAnyRequest = false;
+  for (const c of containers) {
+    const cpu = parseCpuMillicores(c.resources?.requests?.cpu);
+    const mem = parseMemoryBytes(c.resources?.requests?.memory);
+    if (cpu != null) { cpuMillicores += cpu; hasAnyRequest = true; }
+    if (mem != null) { memoryBytes += mem; hasAnyRequest = true; }
+  }
+  return { cpuMillicores, memoryBytes, hasAnyRequest };
+}
+
+/**
+ * Resolves a pod's real controlling workload for cost rollup: if the pod's
+ * immediate owner is a ReplicaSet (the common Deployment-managed case),
+ * follows that ReplicaSet's own ownerReferences to the real Deployment --
+ * so the rollup key is stable across rollouts (each rollout creates a new
+ * ReplicaSet with a hashed name, but the same Deployment). Pods owned
+ * directly by a DaemonSet/StatefulSet/Job (no ReplicaSet indirection) use
+ * that owner as-is. Returns undefined for a genuinely bare pod (no owner) --
+ * k8sCostAllocation.ts groups those under their own namespace-level bucket,
+ * not a fabricated workload name.
+ */
+function resolveWorkloadOwner(
+  pod: K8sPod,
+  replicaSetOwnerByKey: Map<string, { kind: string; name: string } | undefined>,
+): { kind: string; name: string } | undefined {
+  const owner = pod.metadata.ownerReferences?.[0];
+  if (!owner) return undefined;
+  if (owner.kind !== 'ReplicaSet') return owner;
+  const rsOwner = replicaSetOwnerByKey.get(`${pod.metadata.namespace}/${owner.name}`);
+  return rsOwner ?? owner; // orphaned/bare ReplicaSet (no Deployment) -- kept as-is, not guessed at.
 }
 
 interface AuthMapEntry { arn: string; username?: string; groups: string[] }
@@ -329,6 +415,20 @@ export async function scanEksWorkloads(ctx: ScannerContext): Promise<ScannedReso
     const token = await buildEksToken(ctx, name);
     const clusterId = `${ctx.region}/${name}`;
 
+    // Fetched only to resolve each pod's real Deployment via the
+    // ReplicaSet-ownership hop (see resolveWorkloadOwner) -- never persisted
+    // as its own resource type. A forbidden/failed fetch here degrades to an
+    // empty map (pods just fall back to their raw ReplicaSet owner) rather
+    // than failing the whole scan over a capability this feature doesn't
+    // strictly require.
+    const replicaSetsResult = await callK8sApi(detail.endpoint, caCertPem, token, '/apis/apps/v1/replicasets');
+    const replicaSetOwnerByKey = new Map<string, { kind: string; name: string } | undefined>();
+    if (replicaSetsResult.ok) {
+      for (const rs of (replicaSetsResult.body as K8sReplicaSetList).items ?? []) {
+        replicaSetOwnerByKey.set(`${rs.metadata.namespace}/${rs.metadata.name}`, rs.metadata.ownerReferences?.[0]);
+      }
+    }
+
     const podsResult = await callK8sApi(detail.endpoint, caCertPem, token, '/api/v1/pods');
     if (!podsResult.ok) {
       if (podsResult.forbidden) forbiddenClusters.push(name);
@@ -336,6 +436,8 @@ export async function scanEksWorkloads(ctx: ScannerContext): Promise<ScannedReso
     } else {
       for (const pod of (podsResult.body as K8sPodList).items ?? []) {
         const statuses = pod.status?.containerStatuses ?? [];
+        const requests = sumPodResourceRequests(pod.spec?.containers ?? []);
+        const workloadOwner = resolveWorkloadOwner(pod, replicaSetOwnerByKey);
         out.push({
           resourceTypeKey: 'eks_pod', resourceId: `${clusterId}/${pod.metadata.namespace}/${pod.metadata.name}`, region: ctx.region,
           resourceName: pod.metadata.name, state: pod.status?.phase, tags: pod.metadata.labels ?? {},
@@ -347,6 +449,12 @@ export async function scanEksWorkloads(ctx: ScannerContext): Promise<ScannedReso
             restartCount: statuses.reduce((sum, s) => sum + (s.restartCount ?? 0), 0),
             containerStatuses: statuses, conditions: pod.status?.conditions,
             tolerations: pod.spec?.tolerations, nodeSelector: pod.spec?.nodeSelector,
+            // Real, running-pod resource requests -- for k8sCostAllocation.ts's
+            // proportional cost share. Distinct from the deployment scanner's
+            // pod-template snapshot below (that's what a NEW pod would
+            // request; this is what THIS pod actually holds).
+            cpuRequestMillicores: requests.cpuMillicores, memoryRequestBytes: requests.memoryBytes, hasResourceRequest: requests.hasAnyRequest,
+            ownerReferences: pod.metadata.ownerReferences, workloadOwner,
           },
           relationships: { clusterName: name },
         });
@@ -449,6 +557,10 @@ export async function scanEksWorkloads(ctx: ScannerContext): Promise<ScannedReso
             allocatableCpu: node.status?.allocatable?.cpu, allocatableMemory: node.status?.allocatable?.memory, allocatablePods: node.status?.allocatable?.pods,
             annotations: node.metadata.annotations, createdAt: node.metadata.creationTimestamp,
             taints: node.spec?.taints, unschedulable: node.spec?.unschedulable, conditions: node.status?.conditions,
+            // For k8sCostAllocation.ts's exact node -> ec2_instance join (see
+            // extractEc2InstanceId's doc comment). ec2InstanceId is undefined
+            // for Fargate-backed nodes -- disclosed as excluded, not guessed.
+            providerID: node.spec?.providerID, ec2InstanceId: extractEc2InstanceId(node.spec?.providerID),
           },
           relationships: { clusterName: name },
         });
