@@ -1,6 +1,7 @@
 import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit, checkCloudAccountLimit } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '../lib/crypto';
+import { isConnectionPurgeEnabled, purgeDisabledResponse } from '../lib/capabilities';
 
 export const accountsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -356,6 +357,12 @@ accountsRoutes.delete('/accounts/:id', (c) =>
  */
 accountsRoutes.delete('/accounts/:id/permanently', (c) =>
   guarded(async () => {
+    // Phase 0.6 (2026-09-08 audits): permanent purge is disabled by default.
+    // Checked before any auth/DB work so a crafted request cannot probe for a
+    // connection's existence. Disconnect remains available and preserves
+    // history. See lib/capabilities.ts for the full list of missing controls.
+    if (!isConnectionPurgeEnabled(c.env)) return purgeDisabledResponse();
+
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
