@@ -1,4 +1,13 @@
 import { AwsClient } from 'aws4fetch';
+import {
+  classifyAwsError,
+  isRetryable,
+  backoffDelayMs,
+  retryAfterMs,
+  DEFAULT_RETRY_POLICY,
+  type NormalizedErrorCode,
+  type RetryPolicy,
+} from './awsErrors';
 
 export interface AwsCreds {
   accessKeyId: string;
@@ -13,6 +22,66 @@ export interface AwsCallResult {
   body: unknown;
   errorCode?: string;
   errorMessage?: string;
+  /** Normalized vocabulary (see awsErrors.ts) — set on every failure. */
+  normalizedCode?: NormalizedErrorCode;
+  /** How many attempts were made, including the first. >1 means a retry happened. */
+  attempts?: number;
+}
+
+/** Hard ceiling on a single AWS request. Without it a hung connection blocks a scan step until the platform's own timeout kills the whole run. */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+
+export interface AwsCallOptions {
+  retry?: RetryPolicy;
+  timeoutMs?: number;
+  /** Injectable for tests, so retry behaviour is asserted without real sleeping. */
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+}
+
+const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Runs `attempt` under the retry policy, backing off with full jitter between
+ * tries and honouring AWS's own `Retry-After` when it sends one.
+ *
+ * Only failures `isRetryable()` accepts are retried — a permission error is
+ * returned immediately rather than hammered three more times, which would add
+ * load to an account that may already be throttling.
+ */
+async function withRetry(
+  attempt: (signal: AbortSignal) => Promise<{ result: AwsCallResult; retryAfter: string | null }>,
+  opts: AwsCallOptions,
+): Promise<AwsCallResult> {
+  const policy = opts.retry ?? DEFAULT_RETRY_POLICY;
+  const sleep = opts.sleep ?? realSleep;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  let last: AwsCallResult | null = null;
+
+  for (let tries = 0; tries < Math.max(1, policy.maxAttempts); tries++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let outcome: { result: AwsCallResult; retryAfter: string | null };
+    try {
+      outcome = await attempt(controller.signal);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const result = { ...outcome.result, attempts: tries + 1 };
+    if (result.ok) return result;
+
+    result.normalizedCode = classifyAwsError({ status: result.status, errorCode: result.errorCode, errorMessage: result.errorMessage });
+    last = result;
+
+    const isLastAttempt = tries === Math.max(1, policy.maxAttempts) - 1;
+    if (!isRetryable(result.normalizedCode) || isLastAttempt) return result;
+
+    const advised = retryAfterMs(outcome.retryAfter);
+    await sleep(advised ?? backoffDelayMs(tries, policy, opts.random));
+  }
+
+  return last!;
 }
 
 /**
@@ -26,49 +95,62 @@ export interface AwsCallResult {
 export async function callQueryApi(
   creds: AwsCreds,
   opts: { service: string; region: string; host: string; action: string; version: string; params?: Record<string, string> },
+  callOpts: AwsCallOptions = {},
 ): Promise<AwsCallResult> {
   const client = new AwsClient({ accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey, sessionToken: creds.sessionToken, service: opts.service, region: opts.region });
   const body = new URLSearchParams({ Action: opts.action, Version: opts.version, ...(opts.params ?? {}) }).toString();
-  let res: Response;
-  try {
-    res = await client.fetch(`https://${opts.host}/`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body,
-    });
-  } catch (err) {
-    // Same transport-level failure mode as callJsonApi above (see its
-    // comment) — a service without an endpoint in this region throws here
-    // instead of returning a response, and every caller already has a
-    // graceful !result.ok path that this reuses instead of letting the
-    // exception propagate as an uncaught step error.
-    return { ok: false, status: 0, body: '', errorCode: 'FETCH_FAILED', errorMessage: err instanceof Error ? err.message : 'Network request failed' };
-  }
-  const text = await res.text();
-  if (!res.ok) {
-    return {
-      ok: false,
-      status: res.status,
-      body: text,
-      errorCode: extractXmlField(text, 'Code') ?? undefined,
-      errorMessage: extractXmlField(text, 'Message') ?? undefined,
-    };
-  }
-  return { ok: true, status: res.status, body: text };
+
+  return withRetry(async (signal) => {
+    let res: Response;
+    try {
+      res = await client.fetch(`https://${opts.host}/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+        signal,
+      });
+    } catch (err) {
+      // Same transport-level failure mode as callJsonApi below (see its
+      // comment) — a service without an endpoint in this region throws here
+      // instead of returning a response, and every caller already has a
+      // graceful !result.ok path that this reuses instead of letting the
+      // exception propagate as an uncaught step error. An abort from the
+      // timeout above also lands here and classifies as TIMEOUT.
+      const message = err instanceof Error ? err.message : 'Network request failed';
+      return { result: { ok: false, status: 0, body: '', errorCode: 'FETCH_FAILED', errorMessage: signal.aborted ? 'Request timed out' : message }, retryAfter: null };
+    }
+    const text = await res.text();
+    if (!res.ok) {
+      return {
+        result: {
+          ok: false,
+          status: res.status,
+          body: text,
+          errorCode: extractXmlField(text, 'Code') ?? undefined,
+          errorMessage: extractXmlField(text, 'Message') ?? undefined,
+        },
+        retryAfter: res.headers.get('retry-after'),
+      };
+    }
+    return { result: { ok: true, status: res.status, body: text }, retryAfter: null };
+  }, callOpts);
 }
 
 /** JSON-protocol call (Organizations, CloudTrail, Cost Explorer, Resource Groups Tagging API). */
 export async function callJsonApi(
   creds: AwsCreds,
   opts: { service: string; region: string; host: string; target: string; body: Record<string, unknown> },
+  callOpts: AwsCallOptions = {},
 ): Promise<AwsCallResult> {
   const client = new AwsClient({ accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey, sessionToken: creds.sessionToken, service: opts.service, region: opts.region });
+  return withRetry(async (signal) => {
   let res: Response;
   try {
     res = await client.fetch(`https://${opts.host}/`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-amz-json-1.1', 'X-Amz-Target': opts.target },
       body: JSON.stringify(opts.body),
+      signal,
     });
   } catch (err) {
     // A handful of services (Timestream is the known case — its
@@ -81,21 +163,26 @@ export async function callJsonApi(
     // shape (rather than letting it propagate as an uncaught step error)
     // lets that existing handling cover this case too, instead of every
     // caller needing its own try/catch around the same failure mode.
-    return { ok: false, status: 0, body: {}, errorCode: 'FETCH_FAILED', errorMessage: err instanceof Error ? err.message : 'Network request failed' };
+    const message = err instanceof Error ? err.message : 'Network request failed';
+    return { result: { ok: false, status: 0, body: {}, errorCode: 'FETCH_FAILED', errorMessage: signal.aborted ? 'Request timed out' : message }, retryAfter: null };
   }
   const text = await res.text();
   const parsed = text ? safeJsonParse(text) : {};
   if (!res.ok) {
     const errObj = safeJsonParse(text) as { __type?: string; message?: string; Message?: string } | null;
     return {
-      ok: false,
-      status: res.status,
-      body: parsed,
-      errorCode: errObj?.__type?.split('#').pop(),
-      errorMessage: errObj?.message ?? errObj?.Message,
+      result: {
+        ok: false,
+        status: res.status,
+        body: parsed,
+        errorCode: errObj?.__type?.split('#').pop(),
+        errorMessage: errObj?.message ?? errObj?.Message,
+      },
+      retryAfter: res.headers.get('retry-after'),
     };
   }
-  return { ok: true, status: res.status, body: parsed };
+  return { result: { ok: true, status: res.status, body: parsed }, retryAfter: null };
+  }, callOpts);
 }
 
 /** Raw signed client for calls that don't fit the Query/JSON request shapes above (e.g. S3 object GETs, where the response body is a stream, not XML/JSON to buffer). */
@@ -133,15 +220,63 @@ export function createAwsClient(creds: AwsCreds, service: string, region: string
  * would defeat that, and CUR files are the one caller not reading `.text()`
  * immediately anyway.
  */
-export async function safeFetch(client: AwsClient, url: string, init?: RequestInit, opts: { bufferBody?: boolean } = {}): Promise<Response> {
+export async function safeFetch(
+  client: AwsClient,
+  url: string,
+  init?: RequestInit,
+  opts: { bufferBody?: boolean } & AwsCallOptions = {},
+): Promise<Response> {
   const bufferBody = opts.bufferBody ?? true;
+  const policy = opts.retry ?? DEFAULT_RETRY_POLICY;
+  const sleep = opts.sleep ?? realSleep;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+
+  /**
+   * Retries here as well as in callJson/QueryApi, because a large share of
+   * scanners talk to `createAwsClient` directly and would otherwise keep the
+   * original single-shot behaviour — the throttle-to-empty-result-to-mass-
+   * delete path is identical whichever helper the scanner happens to use.
+   *
+   * A non-buffered call (the CUR download) is deliberately NOT retried: its
+   * body is a stream the caller consumes itself, so a retry could hand back a
+   * second response while the first is still being read.
+   */
+  let last: Response | null = null;
+  const attempts = bufferBody ? Math.max(1, policy.maxAttempts) : 1;
+
+  for (let tries = 0; tries < attempts; tries++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await client.fetch(url, { ...(init ?? {}), signal: controller.signal });
+      if (!bufferBody) return res;
+      const buf = await res.arrayBuffer();
+      const buffered = new Response(buf, { status: res.status, statusText: res.statusText, headers: res.headers });
+      if (res.ok) return buffered;
+      last = buffered;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Network request failed';
+      last = new Response(JSON.stringify({ message: controller.signal.aborted ? 'Request timed out' : message }), { status: 599, statusText: 'Fetch Failed' });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const code = classifyAwsError({ status: last.status, errorMessage: await peekMessage(last) });
+    const isLastAttempt = tries === attempts - 1;
+    if (!isRetryable(code) || isLastAttempt) return last;
+    await sleep(retryAfterMs(last.headers.get('retry-after')) ?? backoffDelayMs(tries, policy, opts.random));
+  }
+
+  return last!;
+}
+
+/** Reads a failed response's message without consuming it — the body is already an in-memory buffer here, so cloning is cheap. */
+async function peekMessage(res: Response): Promise<string | undefined> {
   try {
-    const res = await client.fetch(url, init);
-    if (!bufferBody) return res;
-    const buf = await res.arrayBuffer();
-    return new Response(buf, { status: res.status, statusText: res.statusText, headers: res.headers });
-  } catch (err) {
-    return new Response(JSON.stringify({ message: err instanceof Error ? err.message : 'Network request failed' }), { status: 599, statusText: 'Fetch Failed' });
+    const text = await res.clone().text();
+    return extractXmlField(text, 'Message') ?? (safeJsonParse(text) as { message?: string } | null)?.message ?? text.slice(0, 200);
+  } catch {
+    return undefined;
   }
 }
 

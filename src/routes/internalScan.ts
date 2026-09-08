@@ -116,9 +116,15 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
       ].slice(0, MAX_STEPS_PER_CONNECTION);
 
       const stepErrors: StepErrorInput[] = [];
+      // Resource types whose coverage was incomplete this run. Passed to
+      // finalize so a throttled or denied Describe* cannot be read as "these
+      // resources were deleted" -- the scheduled scan is where that would do
+      // the most damage, because nothing is watching it run.
+      const degradedResourceTypes = new Set<string>();
       const failedStepIds = new Set<string>();
       for (const stepId of steps) {
         const result = await runOneStep(db, row.org_id, c.env, row.id, stepId);
+        for (const t of result.degradedResourceTypes ?? []) degradedResourceTypes.add(t);
         if (result.error) {
           stepErrors.push({ message: `${stepId}: ${result.error}`, severity: result.errorSeverity ?? 'error' });
           // 'info' (e.g. "service not enabled in this region") is a genuine,
@@ -148,7 +154,7 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
         ...Object.keys(REGIONAL_SCANNERS).filter((name) => regions.every((r) => stepSet.has(`regional:${name}:${r}`) && !failedStepIds.has(`regional:${name}:${r}`))).flatMap((name) => SCANNER_RESOURCE_TYPES[name] ?? []),
       ];
 
-      const outcome = await runFinalize(db, row.org_id, null, connection, runStartedAt, stepErrors, c.env, coveredResourceTypes, steps.length);
+      const outcome = await runFinalize(db, row.org_id, null, connection, runStartedAt, stepErrors, c.env, coveredResourceTypes, steps.length, [...degradedResourceTypes]);
       const nextScan = new Date(Date.now() + row.scan_interval_hours * 60 * 60 * 1000).toISOString();
       await db.update('cloud_connections', { id: `eq.${row.id}` }, { next_scheduled_scan_at: nextScan }, 'return=minimal');
 
@@ -222,9 +228,15 @@ internalScanRoutes.post('/internal/run-first-scans', (c) =>
       ].slice(0, MAX_STEPS_PER_CONNECTION);
 
       const stepErrors: StepErrorInput[] = [];
+      // Resource types whose coverage was incomplete this run. Passed to
+      // finalize so a throttled or denied Describe* cannot be read as "these
+      // resources were deleted" -- the scheduled scan is where that would do
+      // the most damage, because nothing is watching it run.
+      const degradedResourceTypes = new Set<string>();
       const failedStepIds = new Set<string>();
       for (const stepId of steps) {
         const result = await runOneStep(db, row.org_id, c.env, row.id, stepId);
+        for (const t of result.degradedResourceTypes ?? []) degradedResourceTypes.add(t);
         if (result.error) {
           stepErrors.push({ message: `${stepId}: ${result.error}`, severity: result.errorSeverity ?? 'error' });
           if ((result.errorSeverity ?? 'error') !== 'info') failedStepIds.add(stepId);
@@ -237,7 +249,7 @@ internalScanRoutes.post('/internal/run-first-scans', (c) =>
         ...Object.keys(REGIONAL_SCANNERS).filter((name) => regions.every((r) => stepSet.has(`regional:${name}:${r}`) && !failedStepIds.has(`regional:${name}:${r}`))).flatMap((name) => SCANNER_RESOURCE_TYPES[name] ?? []),
       ];
 
-      const outcome = await runFinalize(db, row.org_id, null, connection, runStartedAt, stepErrors, c.env, coveredResourceTypes, steps.length);
+      const outcome = await runFinalize(db, row.org_id, null, connection, runStartedAt, stepErrors, c.env, coveredResourceTypes, steps.length, [...degradedResourceTypes]);
       // Enters the normal daily cadence from here on — run-due-scans above
       // now sees this connection, since runFinalize just moved its status
       // off 'pending'. scan_interval_hours isn't loaded here (loadConnection

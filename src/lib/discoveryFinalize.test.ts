@@ -69,3 +69,58 @@ describe('computeFinalizeResult', () => {
     expect(result.activeCount).toBe(3);
   });
 });
+
+/**
+ * The 2026-09-08 data-loss guard.
+ *
+ * "Absent from the scan" was treated as proof of "deleted in AWS". But a
+ * scanner reports absence for two very different reasons: the resource is
+ * genuinely gone, or the API call that would have listed it failed. Scanners
+ * swallow a failed sub-call and return an empty body, so one throttled
+ * DescribeInstances made every EC2 instance look vanished -- and finalize
+ * soft-deleted the customer's entire live inventory while the connection
+ * still said `connected` and the run still said `succeeded`.
+ */
+describe('computeFinalizeResult — degraded coverage must not delete', () => {
+  const runStartedAt = '2026-09-08T12:00:00Z';
+  const stale = '2026-09-08T11:00:00Z'; // not seen this run
+
+  const inventory: FinalizeCandidateResource[] = [
+    { id: 'i-1', resource_type_key: 'ec2_instance', category: 'Compute', last_seen_at: stale, deleted_at: null },
+    { id: 'i-2', resource_type_key: 'ec2_instance', category: 'Compute', last_seen_at: stale, deleted_at: null },
+    { id: 'v-1', resource_type_key: 'ebs_volume', category: 'Storage', last_seen_at: stale, deleted_at: null },
+    { id: 'b-1', resource_type_key: 's3_bucket', category: 'Storage', last_seen_at: stale, deleted_at: null },
+  ];
+
+  it('still deletes vanished resources when coverage was clean (unchanged behaviour)', () => {
+    const r = computeFinalizeResult(inventory, ['ec2_instance', 'ebs_volume'], runStartedAt, []);
+    expect(r.vanishedIds.sort()).toEqual(['i-1', 'i-2', 'v-1']);
+  });
+
+  it('deletes NOTHING of a degraded type — the throttled-EC2 mass-delete case', () => {
+    const r = computeFinalizeResult(inventory, ['ec2_instance', 'ebs_volume'], runStartedAt, ['ec2_instance', 'ebs_volume']);
+    expect(r.vanishedIds).toEqual([]);
+  });
+
+  it('protects only the degraded types, so unrelated cleanup still runs', () => {
+    // A failed DescribeInstances must not freeze cleanup for every other
+    // service scanned in the same run.
+    const r = computeFinalizeResult(inventory, ['ec2_instance', 'ebs_volume', 's3_bucket'], runStartedAt, ['ec2_instance']);
+    expect(r.vanishedIds.sort()).toEqual(['b-1', 'v-1']);
+    expect(r.vanishedIds).not.toContain('i-1');
+  });
+
+  it('keeps degraded resources counted as ACTIVE, so the total does not silently drop', () => {
+    // If they were excluded from deletion but also dropped from the count,
+    // the customer would still see their estate shrink for no stated reason.
+    const r = computeFinalizeResult(inventory, ['ec2_instance'], runStartedAt, ['ec2_instance']);
+    expect(r.activeCount).toBe(4);
+    expect(r.activeCategoryCounts.Compute).toBe(2);
+  });
+
+  it('defaults to the previous behaviour when no degraded list is passed', () => {
+    // Backwards compatibility for any caller not yet threading the list.
+    const r = computeFinalizeResult(inventory, ['ec2_instance'], runStartedAt);
+    expect(r.vanishedIds.sort()).toEqual(['i-1', 'i-2']);
+  });
+});

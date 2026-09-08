@@ -111,7 +111,7 @@ import { scanInspectorFindings } from '../lib/scanners/inspectorFindings';
 import { scanAwsConfigFindings } from '../lib/scanners/awsConfigFindings';
 import { scanTrustedAdvisorFindings } from '../lib/scanners/trustedAdvisorFindings';
 import { scanEc2CpuMetrics } from '../lib/scanners/ec2Metrics';
-import type { ScannedResource, ScannerFn } from '../lib/scanners/types';
+import type { ScannedResource, ScannerFn, ApiFailure } from '../lib/scanners/types';
 import type { ScannedFinding, FindingScannerFn } from '../lib/scanners/findingTypes';
 import type { ScannedMetric } from '../lib/scanners/metricTypes';
 import { computeFinalizeResult } from '../lib/discoveryFinalize';
@@ -501,6 +501,13 @@ export interface StepResult {
   error?: string;
   /** 'info' = the account/region just doesn't have this service turned on — not a real failure. */
   errorSeverity?: 'error' | 'info';
+  /**
+   * Resource types whose coverage this step could not complete (an AWS call
+   * failed and the scanner continued with partial data). The caller passes
+   * these to finalize, which excludes them from vanished-resource deletion --
+   * otherwise a throttled Describe* reads as "everything was deleted".
+   */
+  degradedResourceTypes?: string[];
 }
 
 const EXPECTED_ACCOUNT_STATE_PATTERNS = [/needs a subscription for the service/i, /is not subscribed to/i, /opt.?in/i, /not.{0,20}(enabled|activated)/i];
@@ -658,14 +665,26 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
   const resolved = await resolveCredentials(env, connection);
   if ('error' in resolved) return { stepId, resourceCount: 0, created: 0, error: resolved.error, errorSeverity: 'error' };
 
+  // Collects sub-call failures the scanner absorbed while continuing with
+  // partial data. Without this they were invisible: the step reported success
+  // and finalize deleted everything the failed call would have returned.
+  const degraded = new Set<string>();
+  const onApiFailure = (f: ApiFailure) => {
+    for (const t of f.affectedResourceTypes) degraded.add(t);
+    console.warn(`[degraded] ${f.service}:${f.action} ${f.region} -> ${f.normalizedCode}; ${f.affectedResourceTypes.length} resource type(s) protected from deletion this run`);
+  };
+
   let scanned: ScannedResource[];
   try {
-    scanned = await scanner({ creds: resolved.creds, region });
+    scanned = await scanner({ creds: resolved.creds, region, onApiFailure });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Scan failed';
     return { stepId, resourceCount: 0, created: 0, error: message, errorSeverity: classifyError(message) };
   }
-  if (scanned.length === 0) return { stepId, resourceCount: 0, created: 0 };
+  const degradedResourceTypes = degraded.size > 0 ? [...degraded] : undefined;
+  // Returned even on the zero-resource path: an empty result caused by a
+  // failed call is exactly the case finalize must not read as deletion.
+  if (scanned.length === 0) return { stepId, resourceCount: 0, created: 0, degradedResourceTypes };
 
   const typeKeys = [...new Set(scanned.map((r) => r.resourceTypeKey))];
   const [catalogRows, existing] = await Promise.all([
@@ -819,7 +838,7 @@ export interface FinalizeOutcome { totalResources: number; deleted: number; find
  * deleted resources whose region simply hadn't been re-checked yet this
  * cycle, not resources that had actually vanished from AWS.
  */
-export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], env: Env, coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES, totalSteps = 0): Promise<FinalizeOutcome> {
+export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], env: Env, coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES, totalSteps = 0, degradedResourceTypes: readonly string[] = []): Promise<FinalizeOutcome> {
   const existing = await db.select<{ id: string; resource_type_key: string; category: string; last_seen_at: string; deleted_at: string | null }[]>('cloud_resources', {
     select: 'id,resource_type_key,category,last_seen_at,deleted_at',
     filters: { connection_id: `eq.${connection.id}` },
@@ -829,7 +848,7 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   // Only resource types a currently-implemented scanner actually checked
   // this run are eligible to be marked vanished — see the coveredResourceTypes
   // param above and lib/discoveryFinalize.ts (extracted so this is unit-testable).
-  const { vanishedIds, activeCategoryCounts, activeCount } = computeFinalizeResult(existing, coveredResourceTypes, runStartedAt);
+  const { vanishedIds, activeCategoryCounts, activeCount } = computeFinalizeResult(existing, coveredResourceTypes, runStartedAt, degradedResourceTypes);
   const now = new Date().toISOString();
   if (vanishedIds.length > 0) {
     await db.update('cloud_resources', { id: `in.(${vanishedIds.join(',')})` }, { deleted_at: now, status: 'deleted' }, 'return=minimal');
@@ -932,13 +951,13 @@ discoveryRoutes.post('/accounts/:id/discovery/finalize', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
-    const body = (await c.req.json().catch(() => ({}))) as { runStartedAt?: string; stepErrors?: StepErrorInput[]; totalSteps?: number };
+    const body = (await c.req.json().catch(() => ({}))) as { runStartedAt?: string; stepErrors?: StepErrorInput[]; totalSteps?: number; degradedResourceTypes?: string[] };
     if (!body.runStartedAt) return errJson(400, 'runStartedAt is required');
 
     const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
 
-    const outcome = await runFinalize(db, orgId, auth.userId, connection, body.runStartedAt, body.stepErrors ?? [], c.env, COVERED_RESOURCE_TYPES, body.totalSteps ?? 0);
+    const outcome = await runFinalize(db, orgId, auth.userId, connection, body.runStartedAt, body.stepErrors ?? [], c.env, COVERED_RESOURCE_TYPES, body.totalSteps ?? 0, body.degradedResourceTypes ?? []);
     return okJson(outcome);
   }),
 );
