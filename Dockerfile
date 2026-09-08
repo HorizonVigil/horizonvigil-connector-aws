@@ -3,22 +3,32 @@ FROM node:22-slim AS build
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && update-ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY package.json ./
-# npm's own git-dependency resolver (hosted-git-info) has been unreliable in
-# this build environment (anonymous GitHub access getting rejected), so this
-# clones the pinned tag directly with an authenticated URL (GH_PAT is a
-# read-only token scoped to just this one public repo, mounted via
-# --mount=type=secret rather than --build-arg so it never lands in image
-# layer history; fine-grained GitHub PATs require the literal username
-# "x-access-token") and installs the built package straight into
-# node_modules, the same end state npm's own git installer would reach.
+# The shared-lib version is whatever package.json says, and nothing else.
+#
+# This used to `git clone --branch <hardcoded tag>` and then DELETE
+# @horizonvigil/shared-lib from package.json before installing, which made the
+# Dockerfile the real source of truth and package.json decorative. That is not
+# a style problem: the deploy workflow's build-and-test job installs the
+# package.json version, so bumping the dependency turned CI green while the
+# deployed image kept building an older library. Two shared-lib rollouts
+# (deny-by-default resource scope, then server-side scope isolation) were
+# merged, passed CI, and reported a successful deploy without the new code ever
+# reaching production.
+#
+# npm resolves the git dependency itself now. The earlier workaround existed
+# because ANONYMOUS GitHub access was being rejected in this build environment;
+# the ~/.netrc below authenticates instead. This is byte-for-byte the pattern
+# connector-gcp and connector-azure have always used, and the same thing
+# build-and-test does, so it is proven in this exact environment. GH_PAT is
+# read-only and mounted via --mount=type=secret rather than --build-arg, so it
+# never lands in image layer history (fine-grained GitHub PATs require the
+# literal username "x-access-token").
 RUN --mount=type=secret,id=gh_pat \
-    git clone --depth 1 --branch v1.0.15 https://x-access-token:$(cat /run/secrets/gh_pat)@github.com/kknr8367/cloudops-shared-lib.git /tmp/shared-lib \
-    && cd /tmp/shared-lib && npm install && npm run build && rm -rf node_modules
-RUN node -e "const p=require('./package.json'); delete p.dependencies['@horizonvigil/shared-lib']; require('fs').writeFileSync('./package.json', JSON.stringify(p, null, 2));" \
-    && npm install \
-    && mkdir -p node_modules/@horizonvigil/shared-lib \
-    && cp -r /tmp/shared-lib/dist /tmp/shared-lib/package.json node_modules/@horizonvigil/shared-lib/ \
-    && rm -rf /tmp/shared-lib
+    git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"; \
+    if [ -f /run/secrets/gh_pat ]; then \
+      printf "machine github.com\nlogin x-access-token\npassword %s\n" "$(cat /run/secrets/gh_pat)" > ~/.netrc && chmod 600 ~/.netrc; \
+    fi && \
+    npm install && rm -f ~/.netrc
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
@@ -26,17 +36,14 @@ RUN npm run build
 FROM node:22-slim
 WORKDIR /app
 ENV NODE_ENV=production
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && update-ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY package.json ./
-# Reuse the shared-lib package already built in the `build` stage above --
-# no need to clone+build it a second time (and NODE_ENV=production here
-# would skip the typescript devDependency that build needs anyway). The
-# shared-lib copy happens AFTER npm install, not before -- with no
-# package-lock.json present, npm reconciles node_modules against
-# package.json and prunes anything it doesn't recognize, which silently
-# deleted this exact directory when it was copied in first.
-RUN node -e "const p=require('./package.json'); delete p.dependencies['@horizonvigil/shared-lib']; require('fs').writeFileSync('./package.json', JSON.stringify(p, null, 2));" \
-    && npm install --omit=dev
-COPY --from=build /app/node_modules/@horizonvigil/shared-lib ./node_modules/@horizonvigil/shared-lib
+RUN --mount=type=secret,id=gh_pat \
+    git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"; \
+    if [ -f /run/secrets/gh_pat ]; then \
+      printf "machine github.com\nlogin x-access-token\npassword %s\n" "$(cat /run/secrets/gh_pat)" > ~/.netrc && chmod 600 ~/.netrc; \
+    fi; \
+    npm install --omit=dev; status=$?; rm -f ~/.netrc; exit $status
 COPY --from=build /app/dist ./dist
 RUN useradd -r -u 10001 -g node appuser && chown -R appuser:node /app
 USER appuser
