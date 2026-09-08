@@ -69,3 +69,40 @@ export function isConnectionPurgeEnabled(env: unknown): boolean {
 export function purgeDisabledResponse(): Response {
   return errJson(403, 'entitlement_required: connection_purge');
 }
+
+/**
+ * Fail-closed gate for the cross-account AssumeRole connection method
+ * (Phase 1 containment, 2026-09-08 AWS connector audit AWS-P0-02).
+ *
+ * The audit's finding is confirmed by the product's own UI, which states
+ * "Live scanning via sts:AssumeRole isn't wired up yet in this build" on the
+ * very screen where the method was default-selected, badged "Recommended",
+ * and submittable. A customer could therefore complete onboarding into a
+ * connection that can never collect anything.
+ *
+ * The audit's disposition: "Until certified, hide or disable the role
+ * option, bulk onboarding, related claims, and role APIs with a stable
+ * capability_not_available response."
+ *
+ * Gating the METHOD rather than only the wizard is what makes this real: the
+ * create and role-update endpoints are reachable directly, and AWS
+ * Organizations hierarchy + bulk import depend on this same path, so a
+ * UI-only change would leave the broken flow callable.
+ *
+ * This is deliberately a gate and not a deletion. resolveCredentials already
+ * implements AssumeRole for connections that have a role ARN, so the work to
+ * certify it is validation and testing (external-ID generation, trust-policy
+ * verification, account match, live STS probe), not reimplementation. Flip
+ * ASSUME_ROLE_ENABLED to 'true' once that acceptance suite passes.
+ */
+export function isAssumeRoleEnabled(env: unknown): boolean {
+  return (env as { ASSUME_ROLE_ENABLED?: string } | null)?.ASSUME_ROLE_ENABLED === 'true';
+}
+
+/** Stable denial for the un-certified cross-account role path. */
+export function assumeRoleDisabledResponse(): Response {
+  return errJson(
+    403,
+    'capability_not_available: cross_account_role — this connection method is not enabled in this build. Use IAM access keys until AssumeRole is certified.',
+  );
+}

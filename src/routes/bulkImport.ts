@@ -1,5 +1,6 @@
 import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireRole, writeAuditLog, guarded, okJson, errJson, enforceRateLimit, type Db } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
+import { isAssumeRoleEnabled, assumeRoleDisabledResponse } from '../lib/capabilities';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
 import { listOrganizationAccounts, type OrgAccount } from '../lib/scanners/organizations';
 
@@ -171,6 +172,15 @@ bulkImportRoutes.get('/accounts/bulk-import/preview', (c) =>
  */
 bulkImportRoutes.post('/accounts/bulk-import-from-organization', (c) =>
   guarded(async () => {
+    /**
+     * AWS-P0-02: bulk onboarding walks AWS Organizations and creates member
+     * connections that would use the cross-account role path, which is not
+     * certified. The audit's disposition is explicit -- "Do not expose while
+     * AssumeRole/external-ID flow is broken" -- so this is denied at the
+     * entrypoint rather than failing partway through a partial import.
+     */
+    if (!isAssumeRoleEnabled(c.env)) return assumeRoleDisabledResponse();
+
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);

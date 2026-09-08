@@ -1,7 +1,7 @@
 import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit, checkCloudAccountLimit, getOrgConnectionIds, getActiveScope, inFilter } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '../lib/crypto';
-import { isConnectionPurgeEnabled, purgeDisabledResponse } from '../lib/capabilities';
+import { isConnectionPurgeEnabled, purgeDisabledResponse, isAssumeRoleEnabled, assumeRoleDisabledResponse } from '../lib/capabilities';
 
 export const accountsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -133,6 +133,13 @@ accountsRoutes.post('/accounts', (c) =>
     if (body.connectionMethod !== 'access_key' && body.connectionMethod !== 'cross_account_role') {
       return errJson(400, "connectionMethod must be 'access_key' or 'cross_account_role'");
     }
+    // AWS-P0-02: the cross-account role path is not certified (the product's
+    // own UI says live sts:AssumeRole scanning is not wired up). Refuse it
+    // here rather than only in the wizard, so a direct API call cannot create
+    // a connection that can never collect.
+    if (body.connectionMethod === 'cross_account_role' && !isAssumeRoleEnabled(c.env)) {
+      return assumeRoleDisabledResponse();
+    }
 
     const insert: Record<string, unknown> = {
       org_id: orgId,
@@ -162,6 +169,42 @@ accountsRoutes.post('/accounts', (c) =>
       if (!body.roleArn || !/^arn:aws:iam::\d{12}:role\//.test(body.roleArn)) return errJson(400, 'roleArn must be a valid IAM role ARN');
       insert.role_arn = body.roleArn;
       insert.external_id = body.externalId || crypto.randomUUID();
+    }
+
+    /**
+     * Duplicate connections are a DOMAIN conflict, not a database error.
+     *
+     * 2026-09-08 AWS connector audit, AWS-P0-03: the create flow used to let
+     * the unique-constraint failure reach the browser, which matched on the
+     * raw constraint name (`cloud_connections_org_id_aws_account_id_key`) and
+     * then called updateAccountCredentials/updateAccountRole -- so a second
+     * "Add account" submit silently ROTATED the credentials of an existing
+     * connection. Creating and rotating are different operations with
+     * different blast radius, and one must never become the other.
+     *
+     * Disconnect is a soft status flip rather than a row delete, so a
+     * disconnected account still occupies the (org_id, aws_account_id) key.
+     * That case is reported explicitly, because "already connected" would be
+     * confusing for a connection the user deliberately disconnected.
+     */
+    const existingRows = await db.select<{ id: string; connection_name: string; status: string }[]>('cloud_connections', {
+      select: 'id,connection_name,status',
+      filters: { org_id: `eq.${orgId}`, provider: 'eq.aws', aws_account_id: `eq.${body.awsAccountId}` },
+    });
+    const existing = existingRows[0];
+    if (existing) {
+      return c.json(
+        {
+          ok: false,
+          code: 'connection_already_exists',
+          error:
+            existing.status === 'disconnected'
+              ? `AWS account ${body.awsAccountId} already has a disconnected connection in this organization. Reconnect it instead of creating a new one.`
+              : `AWS account ${body.awsAccountId} is already connected to this organization.`,
+          existingConnection: { id: existing.id, name: existing.connection_name, status: existing.status },
+        },
+        409,
+      );
     }
 
     const [created] = await db.insert<Record<string, unknown>[]>('cloud_connections', insert);
@@ -323,6 +366,10 @@ accountsRoutes.put('/accounts/:id/role', (c) =>
     if (account.connection_method !== 'cross_account_role') {
       return errJson(400, 'Only cross-account-role connections have a role to update — access-key connections use /credentials instead.');
     }
+
+    // Same gate as create: an un-certified method must not be reachable by
+    // updating an existing connection into it either.
+    if (!isAssumeRoleEnabled(c.env)) return assumeRoleDisabledResponse();
 
     const body = (await c.req.json().catch(() => ({}))) as UpdateRoleBody;
     if (!body.roleArn || !/^arn:aws:iam::\d{12}:role\//.test(body.roleArn)) return errJson(400, 'roleArn must be a valid IAM role ARN');
