@@ -175,10 +175,22 @@ export function computeHealth(
 
   const score = Math.round((weighted / denom) * 100);
   const connFail = signals.find((s) => s.key === 'connection')?.status === 'fail';
+  // FIXED 2026-09-08 (live audit): excluding 'unknown' signals from the
+  // denominator (rather than counting them against the account) was a
+  // deliberate choice to avoid punishing brand-new connections -- but its
+  // side effect is exactly what the audit caught live: a connection whose
+  // permissions have NEVER been validated can still average its other four
+  // signals to 100/'healthy', silently implying full health. Per the
+  // capability-health standard this must satisfy ("unknown or never-run
+  // checks cannot yield a perfect score"), any unknown signal caps the
+  // achievable state at 'warning' -- the per-signal detail text already
+  // says exactly which check was never run, this just stops the rollup
+  // from hiding that behind a clean top-line score.
+  const hasUnknownSignal = signals.some((s) => s.status === 'unknown');
 
   let state: HealthState;
   if (connFail) state = 'critical';
-  else if (score >= 85) state = 'healthy';
+  else if (score >= 85) state = hasUnknownSignal ? 'warning' : 'healthy';
   else if (score >= 60) state = 'warning';
   else state = 'critical';
 

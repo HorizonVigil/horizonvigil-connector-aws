@@ -89,6 +89,19 @@ describe('computeHealth', () => {
     const h = computeHealth(conn({ connection_method: 'access_key', key_rotated_at: daysAgo(80) }), okRun, NOW);
     expect(h.signals.find((s) => s.key === 'credentials')?.status).toBe('warn');
   });
+
+  it('permissions never checked cannot yield a healthy state, even if every other signal is ok (real production bug, fixed 2026-09-08)', () => {
+    // Every other signal ok (connection/discovery/sync/credentials), but
+    // permissions was never run -- last_permission_check_at null, no run.
+    // Live-audited: this scored 100/'healthy' before the fix, silently
+    // implying a connection whose permissions have literally never been
+    // validated was fully healthy.
+    const h = computeHealth(conn({ last_permission_check_at: null }), null, NOW);
+    expect(h.signals.find((s) => s.key === 'permissions')?.status).toBe('unknown');
+    expect(h.signals.filter((s) => s.status === 'ok')).toHaveLength(4); // the other 4 signals really are ok
+    expect(h.state).not.toBe('healthy');
+    expect(h.state).toBe('warning');
+  });
 });
 
 describe('summarizeHealth', () => {
