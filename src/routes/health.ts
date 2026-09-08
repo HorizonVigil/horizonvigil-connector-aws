@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, inFilter, guarded, okJson, errJson } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, getActiveScope, inFilter, guarded, okJson, errJson, requirePermittedConnection } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { computeHealth, summarizeHealth, type HealthConnectionInput, type HealthValidationInput } from '../lib/health';
 
@@ -82,9 +82,15 @@ healthRoutes.get('/health/detailed', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // Bounded by the permitted set, not the org: this response renders
+    // connection names, status and health directly, so an org-wide read
+    // disclosed accounts outside the caller's grants and outside the
+    // active folder/project scope.
+    const permittedIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
+
     const connections = await db.select<ConnRow[]>('cloud_connections', {
       select: HEALTH_SELECT,
-      filters: { org_id: `eq.${orgId}`, provider: 'eq.aws' },
+      filters: { id: inFilter(permittedIds), org_id: `eq.${orgId}`, provider: 'eq.aws' },
       limit: 5000,
     });
 
@@ -117,6 +123,10 @@ healthRoutes.get('/accounts/:id/health', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // Authorize the caller for THIS connection before reading it: an
+    // id + org_id filter proves org ownership, not that this caller is
+    // permitted the connection (resource grants / active scope).
+    await requirePermittedConnection(db, orgId, auth.userId, c.req.param('id'), getActiveScope(c.req.raw, orgId));
     const rows = await db.select<ConnRow[]>('cloud_connections', {
       select: HEALTH_SELECT,
       filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },

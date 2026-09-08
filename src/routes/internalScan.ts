@@ -71,10 +71,14 @@ const ABANDONED_SCAN_THRESHOLD_MINUTES = 30;
 
 interface ConnectionDue { id: string; org_id: string; scan_interval_hours: number }
 
+// null userId: this is the scheduled scan worker, which runs with the
+// service-role key across every org and has no requesting user to authorize
+// against. Its connection set comes from the due-scan query, not from a
+// caller-supplied id, so there is nothing for a permitted-set check to bound.
 async function runOneStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string) {
-  if (stepId.startsWith('finding:')) return runFindingStep(db, orgId, env, connectionId, stepId);
-  if (stepId.startsWith('metric:')) return runMetricStep(db, orgId, env, connectionId, stepId);
-  return runResourceStep(db, orgId, env, connectionId, stepId);
+  if (stepId.startsWith('finding:')) return runFindingStep(db, orgId, null, env, connectionId, stepId);
+  if (stepId.startsWith('metric:')) return runMetricStep(db, orgId, null, env, connectionId, stepId);
+  return runResourceStep(db, orgId, null, env, connectionId, stepId);
 }
 
 internalScanRoutes.post('/internal/run-due-scans', (c) =>
@@ -99,7 +103,7 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
 
     const results = [];
     for (const row of due) {
-      const connection = await loadConnection(db, row.org_id, row.id);
+      const connection = await loadConnection(db, row.org_id, null, row.id);
       if (!connection) continue;
 
       const runStartedAt = new Date().toISOString();
@@ -205,7 +209,7 @@ internalScanRoutes.post('/internal/run-first-scans', (c) =>
 
     const results = [];
     for (const row of pending) {
-      const connection = await loadConnection(db, row.org_id, row.id);
+      const connection = await loadConnection(db, row.org_id, null, row.id);
       if (!connection) continue;
 
       const runStartedAt = new Date().toISOString();

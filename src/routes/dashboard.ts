@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, getActiveScope, inFilter, guarded, okJson } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { notCurrentlyExcludedFilter } from '../lib/exclusions';
 
@@ -43,9 +43,15 @@ dashboardRoutes.get('/dashboard', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // Bounded by the permitted set, not the org: this response renders
+    // connection names, status and health directly, so an org-wide read
+    // disclosed accounts outside the caller's grants and outside the
+    // active folder/project scope.
+    const permittedIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
+
     const connections = await db.select<ConnectionRow[]>('cloud_connections', {
       select: 'id,connection_name,status,environment,scan_regions,last_sync_at,last_discovery_at,last_permission_check_at,error_message,resource_summary,key_rotated_at',
-      filters: { org_id: `eq.${orgId}`, provider: 'eq.aws' },
+      filters: { id: inFilter(permittedIds), org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     const connectionIds = connections.map((conn) => conn.id);
 

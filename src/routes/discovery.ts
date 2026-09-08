@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, inFilter, writeAuditLog, guarded, okJson, errJson, type Db } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, inFilter, writeAuditLog, guarded, okJson, errJson, type Db, requirePermittedConnection } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
 import { resolveFindingResourceIds } from '../lib/arnResourceLookup';
@@ -440,7 +440,12 @@ export interface ConnectionForDiscovery extends ResolvableConnection {
   scan_regions: string[] | null;
 }
 
-export async function loadConnection(db: Db, orgId: string, id: string): Promise<ConnectionForDiscovery | null> {
+export async function loadConnection(db: Db, orgId: string, userId: string | null, id: string): Promise<ConnectionForDiscovery | null> {
+  // Compile-enforced authorization: `userId` is required so every call site
+  // has to decide. An id + org_id filter proves only that the connection
+  // belongs to the caller's org, never that this caller is permitted it.
+  // Pass null ONLY from internal/scheduled paths that run without a user.
+  if (userId) await requirePermittedConnection(db, orgId, userId, id);
   const rows = await db.select<ConnectionForDiscovery[]>('cloud_connections', {
     select: 'id,aws_account_id,connection_method,credentials_encrypted,role_arn,external_id,default_region,scan_regions',
     filters: { id: `eq.${id}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
@@ -469,7 +474,7 @@ discoveryRoutes.get('/accounts/:id/discovery/steps', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
-    const connection = await loadConnection(db, orgId, c.req.param('id'));
+    const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
 
     const regionalNames = Object.keys(REGIONAL_SCANNERS);
@@ -516,7 +521,7 @@ interface CatalogRow { key: string; category: string; service: string }
  * AWS (PostgREST's `resolution=merge-duplicates` only touches columns
  * actually present in the payload).
  */
-export async function runFindingStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+export async function runFindingStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
   const rest = stepId.slice('finding:'.length);
   const sep = rest.indexOf(':');
   if (sep === -1) return { stepId, resourceCount: 0, created: 0, error: `Malformed stepId "${stepId}"`, errorSeverity: 'error' };
@@ -525,7 +530,7 @@ export async function runFindingStep(db: Db, orgId: string, env: Env, connection
   const scanner = FINDING_SCANNERS[scannerName];
   if (!scanner) return { stepId, resourceCount: 0, created: 0, error: `Unknown finding scanner "${scannerName}"`, errorSeverity: 'error' };
 
-  const connection = await loadConnection(db, orgId, connectionId);
+  const connection = await loadConnection(db, orgId, userId, connectionId);
   if (!connection) return { stepId, resourceCount: 0, created: 0, error: 'Account not found', errorSeverity: 'error' };
 
   const resolved = await resolveCredentials(env, connection);
@@ -582,7 +587,7 @@ export async function runFindingStep(db: Db, orgId: string, env: Env, connection
  * instance that isn't running, so pulling their metrics would just waste
  * subrequests on empty responses.
  */
-export async function runMetricStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+export async function runMetricStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
   const rest = stepId.slice('metric:'.length);
   const sep = rest.indexOf(':');
   if (sep === -1) return { stepId, resourceCount: 0, created: 0, error: `Malformed stepId "${stepId}"`, errorSeverity: 'error' };
@@ -590,7 +595,7 @@ export async function runMetricStep(db: Db, orgId: string, env: Env, connectionI
   const region = rest.slice(sep + 1);
   if (metricName !== METRIC_STEP_NAME) return { stepId, resourceCount: 0, created: 0, error: `Unknown metric step "${metricName}"`, errorSeverity: 'error' };
 
-  const connection = await loadConnection(db, orgId, connectionId);
+  const connection = await loadConnection(db, orgId, userId, connectionId);
   if (!connection) return { stepId, resourceCount: 0, created: 0, error: 'Account not found', errorSeverity: 'error' };
 
   const resolved = await resolveCredentials(env, connection);
@@ -627,7 +632,7 @@ export async function runMetricStep(db: Db, orgId: string, env: Env, connectionI
  * routes/internalScan.ts's scheduled-scan path can drive the exact same
  * upsert logic server-side instead of duplicating it.
  */
-export async function runResourceStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+export async function runResourceStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
   let scanner: ScannerFn | undefined;
   let region: string;
   let scannerName: string;
@@ -647,7 +652,7 @@ export async function runResourceStep(db: Db, orgId: string, env: Env, connectio
   }
   if (!scanner) return { stepId, resourceCount: 0, created: 0, error: `Unknown scanner in stepId "${stepId}"`, errorSeverity: 'error' };
 
-  const connection = await loadConnection(db, orgId, connectionId);
+  const connection = await loadConnection(db, orgId, userId, connectionId);
   if (!connection) return { stepId, resourceCount: 0, created: 0, error: 'Account not found', errorSeverity: 'error' };
 
   const resolved = await resolveCredentials(env, connection);
@@ -759,12 +764,12 @@ discoveryRoutes.post('/accounts/:id/discovery/run-step', (c) =>
     if (!stepId) return errJson(400, 'stepId is required, e.g. "regional:ec2:us-east-1", "global:iam", or "finding:guardduty:us-east-1"');
 
     if (stepId.startsWith('finding:')) {
-      return okJson(await runFindingStep(db, orgId, c.env, c.req.param('id'), stepId));
+      return okJson(await runFindingStep(db, orgId, auth.userId, c.env, c.req.param('id'), stepId));
     }
     if (stepId.startsWith('metric:')) {
-      return okJson(await runMetricStep(db, orgId, c.env, c.req.param('id'), stepId));
+      return okJson(await runMetricStep(db, orgId, auth.userId, c.env, c.req.param('id'), stepId));
     }
-    return okJson(await runResourceStep(db, orgId, c.env, c.req.param('id'), stepId));
+    return okJson(await runResourceStep(db, orgId, auth.userId, c.env, c.req.param('id'), stepId));
   }),
 );
 
@@ -930,7 +935,7 @@ discoveryRoutes.post('/accounts/:id/discovery/finalize', (c) =>
     const body = (await c.req.json().catch(() => ({}))) as { runStartedAt?: string; stepErrors?: StepErrorInput[]; totalSteps?: number };
     if (!body.runStartedAt) return errJson(400, 'runStartedAt is required');
 
-    const connection = await loadConnection(db, orgId, c.req.param('id'));
+    const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
 
     const outcome = await runFinalize(db, orgId, auth.userId, connection, body.runStartedAt, body.stepErrors ?? [], c.env, COVERED_RESOURCE_TYPES, body.totalSteps ?? 0);

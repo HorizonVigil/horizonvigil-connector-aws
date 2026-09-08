@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, writeAuditLog, guarded, okJson, errJson } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, writeAuditLog, guarded, okJson, errJson, requirePermittedConnection, getActiveScope } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
 import {
@@ -37,6 +37,10 @@ recommendationsSyncRoutes.post('/accounts/:id/recommendations/sync', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
+    // Authorize the caller for THIS connection before reading it: an
+    // id + org_id filter proves org ownership, not that this caller is
+    // permitted the connection (resource grants / active scope).
+    await requirePermittedConnection(db, orgId, auth.userId, c.req.param('id'), getActiveScope(c.req.raw, orgId));
     const rows = await db.select<(ResolvableConnection & { id: string; savings_plans_recommendation_id: string | null; savings_plans_generation_started_at: string | null })[]>('cloud_connections', {
       select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region,savings_plans_recommendation_id,savings_plans_generation_started_at',
       filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
