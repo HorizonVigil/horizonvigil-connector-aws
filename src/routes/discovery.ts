@@ -111,7 +111,8 @@ import { scanInspectorFindings } from '../lib/scanners/inspectorFindings';
 import { scanAwsConfigFindings } from '../lib/scanners/awsConfigFindings';
 import { scanTrustedAdvisorFindings } from '../lib/scanners/trustedAdvisorFindings';
 import { scanEc2CpuMetrics } from '../lib/scanners/ec2Metrics';
-import type { ScannedResource, ScannerFn, ApiFailure } from '../lib/scanners/types';
+import type { ScannedResource, ScannerFn } from '../lib/scanners/types';
+import type { AwsCallFailure } from '../lib/awsApi';
 import type { ScannedFinding, FindingScannerFn } from '../lib/scanners/findingTypes';
 import type { ScannedMetric } from '../lib/scanners/metricTypes';
 import { computeFinalizeResult } from '../lib/discoveryFinalize';
@@ -665,18 +666,32 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
   const resolved = await resolveCredentials(env, connection);
   if ('error' in resolved) return { stepId, resourceCount: 0, created: 0, error: resolved.error, errorSeverity: 'error' };
 
-  // Collects sub-call failures the scanner absorbed while continuing with
-  // partial data. Without this they were invisible: the step reported success
-  // and finalize deleted everything the failed call would have returned.
+  /**
+   * Collects sub-call failures the scanner absorbed while continuing with
+   * partial data. Without this they were invisible: the step reported success
+   * and finalize deleted everything the failed call would have returned.
+   *
+   * The sink hangs off the CREDENTIALS rather than being reported by each
+   * scanner, because creds are the one object all 111 scanners already thread
+   * into every AWS call regardless of which helper they use. Any failed call
+   * therefore degrades this scanner's resource types automatically -- and a
+   * scanner written next month is covered without anyone remembering to wire
+   * it.
+   *
+   * The affected types come from SCANNER_RESOURCE_TYPES, the same map that
+   * builds COVERED_RESOURCE_TYPES, so a failure protects exactly what this
+   * scanner would have been trusted to delete and nothing else.
+   */
   const degraded = new Set<string>();
-  const onApiFailure = (f: ApiFailure) => {
-    for (const t of f.affectedResourceTypes) degraded.add(t);
-    console.warn(`[degraded] ${f.service}:${f.action} ${f.region} -> ${f.normalizedCode}; ${f.affectedResourceTypes.length} resource type(s) protected from deletion this run`);
+  const ownedTypes: readonly string[] = SCANNER_RESOURCE_TYPES[scannerName] ?? [];
+  const onCallFailure = (f: AwsCallFailure) => {
+    for (const t of ownedTypes) degraded.add(t);
+    console.warn(`[degraded] ${f.service}:${f.action} ${f.region} -> ${f.normalizedCode} after ${f.attempts} attempt(s); ${ownedTypes.length} resource type(s) protected from deletion this run`);
   };
 
   let scanned: ScannedResource[];
   try {
-    scanned = await scanner({ creds: resolved.creds, region, onApiFailure });
+    scanned = await scanner({ creds: { ...resolved.creds, onCallFailure }, region });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Scan failed';
     return { stepId, resourceCount: 0, created: 0, error: message, errorSeverity: classifyError(message) };

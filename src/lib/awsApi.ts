@@ -9,10 +9,33 @@ import {
   type RetryPolicy,
 } from './awsErrors';
 
+/** One AWS call that exhausted its retries. Reported to `AwsCreds.onCallFailure`. */
+export interface AwsCallFailure {
+  service: string;
+  /** API action for Query/JSON protocols, or the request URL's path for raw fetches. */
+  action: string;
+  region: string;
+  normalizedCode: NormalizedErrorCode;
+  attempts: number;
+}
+
 export interface AwsCreds {
   accessKeyId: string;
   secretAccessKey: string;
   sessionToken?: string;
+  /**
+   * Per-run sink for calls that failed after retrying.
+   *
+   * This lives on the credentials rather than on ScannerContext because the
+   * creds object is the one thing EVERY scanner already threads into EVERY
+   * AWS call — all 111 scanner files, whichever helper they happen to use.
+   * Hanging the sink here means a scan reports its degraded coverage without
+   * any scanner being edited, and a scanner added tomorrow is covered the day
+   * it is written rather than the day someone remembers to wire it.
+   *
+   * Optional, so every existing caller and test keeps working unchanged.
+   */
+  onCallFailure?: (failure: AwsCallFailure) => void;
 }
 
 export interface AwsCallResult {
@@ -52,6 +75,7 @@ const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(reso
 async function withRetry(
   attempt: (signal: AbortSignal) => Promise<{ result: AwsCallResult; retryAfter: string | null }>,
   opts: AwsCallOptions,
+  report?: { creds: AwsCreds; service: string; region: string; action: string },
 ): Promise<AwsCallResult> {
   const policy = opts.retry ?? DEFAULT_RETRY_POLICY;
   const sleep = opts.sleep ?? realSleep;
@@ -75,7 +99,25 @@ async function withRetry(
     last = result;
 
     const isLastAttempt = tries === Math.max(1, policy.maxAttempts) - 1;
-    if (!isRetryable(result.normalizedCode) || isLastAttempt) return result;
+    if (!isRetryable(result.normalizedCode) || isLastAttempt) {
+      // Terminal: retries are exhausted or the error is not retryable. This
+      // is the moment the scanner is about to receive an empty body and carry
+      // on, so it is the moment the run has to record degraded coverage.
+      // UNSUPPORTED_CAPABILITY is excluded deliberately -- "this account has
+      // not enabled Macie" is a settled answer, not incomplete coverage, and
+      // treating it as degraded would permanently freeze cleanup for every
+      // service the customer does not use.
+      if (report && result.normalizedCode !== 'UNSUPPORTED_CAPABILITY') {
+        report.creds.onCallFailure?.({
+          service: report.service,
+          action: report.action,
+          region: report.region,
+          normalizedCode: result.normalizedCode,
+          attempts: result.attempts ?? tries + 1,
+        });
+      }
+      return result;
+    }
 
     const advised = retryAfterMs(outcome.retryAfter);
     await sleep(advised ?? backoffDelayMs(tries, policy, opts.random));
@@ -133,7 +175,7 @@ export async function callQueryApi(
       };
     }
     return { result: { ok: true, status: res.status, body: text }, retryAfter: null };
-  }, callOpts);
+  }, callOpts, { creds, service: opts.service, region: opts.region, action: opts.action });
 }
 
 /** JSON-protocol call (Organizations, CloudTrail, Cost Explorer, Resource Groups Tagging API). */
@@ -182,12 +224,28 @@ export async function callJsonApi(
     };
   }
   return { result: { ok: true, status: res.status, body: parsed }, retryAfter: null };
-  }, callOpts);
+  }, callOpts, { creds, service: opts.service, region: opts.region, action: opts.target.split('.').pop() ?? opts.target });
 }
 
-/** Raw signed client for calls that don't fit the Query/JSON request shapes above (e.g. S3 object GETs, where the response body is a stream, not XML/JSON to buffer). */
-export function createAwsClient(creds: AwsCreds, service: string, region: string): AwsClient {
-  return new AwsClient({ accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey, sessionToken: creds.sessionToken, service, region });
+/**
+ * Raw signed client for calls that don't fit the Query/JSON request shapes
+ * above (e.g. S3 object GETs, where the response body is a stream, not
+ * XML/JSON to buffer).
+ *
+ * The reporting context is attached to the returned client so `safeFetch` can
+ * report failures the same way the Query/JSON helpers do. 38 scanner files
+ * build their client here and then call safeFetch with it; carrying the
+ * context on the client is what lets those scanners report degraded coverage
+ * without any of them being edited.
+ */
+export type ReportingAwsClient = AwsClient & { __hvReport?: { creds: AwsCreds; service: string; region: string } };
+
+export function createAwsClient(creds: AwsCreds, service: string, region: string): ReportingAwsClient {
+  const client = new AwsClient({ accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey, sessionToken: creds.sessionToken, service, region }) as ReportingAwsClient;
+  // Non-enumerable so it never lands in a JSON.stringify of the client, which
+  // would put credentials into a log line.
+  Object.defineProperty(client, '__hvReport', { value: { creds, service, region }, enumerable: false, writable: false });
+  return client;
 }
 
 /**
@@ -221,7 +279,7 @@ export function createAwsClient(creds: AwsCreds, service: string, region: string
  * immediately anyway.
  */
 export async function safeFetch(
-  client: AwsClient,
+  client: ReportingAwsClient,
   url: string,
   init?: RequestInit,
   opts: { bufferBody?: boolean } & AwsCallOptions = {},
@@ -263,7 +321,21 @@ export async function safeFetch(
 
     const code = classifyAwsError({ status: last.status, errorMessage: await peekMessage(last) });
     const isLastAttempt = tries === attempts - 1;
-    if (!isRetryable(code) || isLastAttempt) return last;
+    if (!isRetryable(code) || isLastAttempt) {
+      // Same terminal-failure reporting as the Query/JSON helpers -- see
+      // withRetry. UNSUPPORTED_CAPABILITY is likewise not degraded coverage.
+      const rep = client.__hvReport;
+      if (rep && code !== 'UNSUPPORTED_CAPABILITY') {
+        rep.creds.onCallFailure?.({
+          service: rep.service,
+          action: safePathOf(url),
+          region: rep.region,
+          normalizedCode: code,
+          attempts: tries + 1,
+        });
+      }
+      return last;
+    }
     await sleep(retryAfterMs(last.headers.get('retry-after')) ?? backoffDelayMs(tries, policy, opts.random));
   }
 
@@ -298,4 +370,13 @@ function safeJsonParse(text: string): unknown {
 export function extractXmlField(xml: string, tag: string): string | null {
   const match = new RegExp(`<${tag}>([^<]*)</${tag}>`).exec(xml);
   return match ? match[1] : null;
+}
+
+/** The URL's path only — a raw AWS URL can carry bucket names and object keys, which do not belong in a failure record. */
+function safePathOf(url: string): string {
+  try {
+    return new URL(url).pathname || '/';
+  } catch {
+    return 'unknown';
+  }
 }

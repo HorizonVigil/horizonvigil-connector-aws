@@ -183,7 +183,7 @@ export async function runFullValidation(creds: AwsCreds, region: string): Promis
     return { identity: null, checks: [stsResult] };
   }
 
-  const [iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks] = await Promise.all([
+  const [iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks, config, securityHub, computeOptimizer, trustedAdvisor] = await Promise.all([
     checkIam(creds),
     checkOrganizations(creds),
     checkCloudWatch(creds, region),
@@ -191,7 +191,111 @@ export async function runFullValidation(creds: AwsCreds, region: string): Promis
     checkTaggingApi(creds, region),
     checkCostExplorer(creds),
     checkEks(creds, region),
+    checkConfig(creds, region),
+    checkSecurityHub(creds, region),
+    checkComputeOptimizer(creds, region),
+    checkTrustedAdvisor(creds),
   ]);
 
-  return { identity, checks: [stsResult, iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks] };
+  return { identity, checks: [stsResult, iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks, config, securityHub, computeOptimizer, trustedAdvisor] };
+}
+
+/**
+ * The four capabilities below are SCANNED by discovery but were never PROBED
+ * here, so the account-health view reported "connected" while the scan for
+ * them failed every night on a missing permission. That is the specific thing
+ * §5C of the connector spec forbids: reporting a connection as working when
+ * half the required permissions are absent.
+ *
+ * All four distinguish "not enabled" from "not permitted", because those need
+ * different words in front of a customer — only one of them is fixed by
+ * editing an IAM policy. They are `verified: false` on the same convention
+ * the existing unconfirmed checks use: an unexpected response shape degrades
+ * to an honest `error`, never to a wrong `granted`.
+ */
+export async function checkConfig(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  const base = { service: 'config', label: 'AWS Config', verified: false };
+  try {
+    const res = await callJsonApi(creds, {
+      service: 'config', region, host: `config.${region}.amazonaws.com`,
+      target: 'StarlingDoveService.DescribeConfigurationRecorders', body: {},
+    });
+    if (!res.ok) {
+      if (res.normalizedCode === 'UNSUPPORTED_CAPABILITY') return { ...base, status: 'not_applicable', detail: 'AWS Config is not enabled in this region.' };
+      return { ...base, status: res.normalizedCode === 'PERMISSION_DENIED' ? 'denied' : 'error', detail: res.errorMessage ?? res.normalizedCode ?? `HTTP ${res.status}` };
+    }
+    const recorders = (res.body as { ConfigurationRecorders?: unknown[] })?.ConfigurationRecorders ?? [];
+    // Readable but with no recorder is a real, distinct state: compliance
+    // evidence will be empty for an honest reason, not a permissions one.
+    if (recorders.length === 0) return { ...base, status: 'not_applicable', detail: 'Permission confirmed, but no configuration recorder exists in this region — Config has no evidence to return.' };
+    return { ...base, status: 'granted', detail: `Read access to AWS Config confirmed — ${recorders.length} configuration recorder(s) in ${region}` };
+  } catch (err) {
+    return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
+  }
+}
+
+export async function checkSecurityHub(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  const base = { service: 'securityhub', label: 'Security Hub', verified: false };
+  try {
+    const client = createAwsClient(creds, 'securityhub', region);
+    const res = await client.fetch(`https://securityhub.${region}.amazonaws.com/accounts`, { method: 'GET' });
+    if (res.status === 404 || res.status === 400) {
+      // Security Hub answers "not subscribed" rather than "forbidden" when the
+      // service was never enabled for the account.
+      return { ...base, status: 'not_applicable', detail: 'Security Hub is not enabled in this region.' };
+    }
+    if (!res.ok) {
+      return { ...base, status: res.status === 403 ? 'denied' : 'error', detail: `AWS returned HTTP ${res.status} for Security Hub.` };
+    }
+    return { ...base, status: 'granted', detail: 'Read access to Security Hub confirmed' };
+  } catch (err) {
+    return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
+  }
+}
+
+export async function checkComputeOptimizer(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  const base = { service: 'compute_optimizer', label: 'Compute Optimizer', verified: false };
+  try {
+    const res = await callJsonApi(creds, {
+      service: 'compute-optimizer', region, host: `compute-optimizer.${region}.amazonaws.com`,
+      target: 'ComputeOptimizerService.GetEnrollmentStatus', body: {},
+    });
+    if (!res.ok) {
+      if (res.normalizedCode === 'UNSUPPORTED_CAPABILITY') return { ...base, status: 'not_applicable', detail: 'Compute Optimizer is not available for this account.' };
+      return { ...base, status: res.normalizedCode === 'PERMISSION_DENIED' ? 'denied' : 'error', detail: res.errorMessage ?? res.normalizedCode ?? `HTTP ${res.status}` };
+    }
+    const status = (res.body as { status?: string })?.status;
+    // Opt-in is the common real case, and it is NOT a permission problem —
+    // saying "denied" here would send someone to edit an IAM policy that is
+    // already correct.
+    if (status && status !== 'Active') {
+      return { ...base, status: 'not_applicable', detail: `Compute Optimizer is not enrolled for this account (status: ${status}).` };
+    }
+    return { ...base, status: 'granted', detail: 'Read access to Compute Optimizer confirmed and the account is enrolled' };
+  } catch (err) {
+    return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
+  }
+}
+
+export async function checkTrustedAdvisor(creds: AwsCreds): Promise<PermissionCheckResult> {
+  const base = { service: 'trusted_advisor', label: 'Trusted Advisor', verified: false };
+  try {
+    // Support API is global and only resolves via us-east-1.
+    const res = await callJsonApi(creds, {
+      service: 'support', region: 'us-east-1', host: 'support.us-east-1.amazonaws.com',
+      target: 'AWSSupport_20130415.DescribeTrustedAdvisorChecks', body: { language: 'en' },
+    });
+    if (!res.ok) {
+      // Trusted Advisor's full check set requires Business/Enterprise support.
+      // A Basic-plan account is not misconfigured, so this is not_applicable.
+      if (res.normalizedCode === 'UNSUPPORTED_CAPABILITY' || /subscription/i.test(res.errorMessage ?? '')) {
+        return { ...base, status: 'not_applicable', detail: 'Trusted Advisor checks require a Business or Enterprise support plan on this account.' };
+      }
+      return { ...base, status: res.normalizedCode === 'PERMISSION_DENIED' ? 'denied' : 'error', detail: res.errorMessage ?? res.normalizedCode ?? `HTTP ${res.status}` };
+    }
+    const checks = (res.body as { checks?: unknown[] })?.checks ?? [];
+    return { ...base, status: 'granted', detail: `Read access to Trusted Advisor confirmed — ${checks.length} check(s) available` };
+  } catch (err) {
+    return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
+  }
 }

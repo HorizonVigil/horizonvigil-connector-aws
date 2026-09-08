@@ -32,25 +32,11 @@ export async function scanEc2(ctx: ScannerContext): Promise<ScannedResource[]> {
     const result = await callQueryApi(ctx.creds, { service: 'ec2', region: ctx.region, host: endpoint, action, version: VERSION, params });
     if (!result.ok) {
       console.error(`EC2 ${action} failed in ${ctx.region} (continuing without it): ${result.normalizedCode ?? result.errorCode ?? result.status}`);
-      /**
-       * Continuing with partial data is still the right call — one failed
-       * Describe* should not lose the other fifteen. What was wrong is that
-       * the failure stopped here: the step reported success and finalize then
-       * read "no instances returned" as "every instance was deleted".
-       *
-       * Reporting it marks EC2's resource types degraded for this run, so
-       * they are excluded from vanished-resource deletion. Scoped to
-       * EC2_RESOURCE_TYPES rather than everything, so a failed
-       * DescribeInstances protects EC2 inventory without also freezing
-       * cleanup for unrelated services scanned in the same run.
-       */
-      ctx.onApiFailure?.({
-        service: 'ec2',
-        action,
-        region: ctx.region,
-        normalizedCode: result.normalizedCode ?? 'UNKNOWN',
-        affectedResourceTypes: EC2_RESOURCE_TYPES,
-      });
+      // Continuing with partial data is still the right call — one failed
+      // Describe* should not lose the other fifteen. The failure is reported
+      // automatically by the creds sink in awsApi.ts, which marks this
+      // scanner's resource types degraded so finalize cannot read the missing
+      // instances as deletions.
       return '';
     }
     return result.body as string;

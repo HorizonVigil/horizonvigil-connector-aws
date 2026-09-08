@@ -21,6 +21,7 @@ import { logsRoutes } from './routes/logs';
 import { bulkImportRoutes } from './routes/bulkImport';
 import { identitiesRoutes } from './routes/identities';
 import { healthRoutes } from './routes/health';
+import { capabilityRoutes } from './routes/capabilities';
 
 const app = createApp();
 
@@ -62,5 +63,52 @@ app.route('/api/aws-accounts', logsRoutes);
 app.route('/api/aws-accounts', bulkImportRoutes);
 app.route('/api/aws-accounts', identitiesRoutes);
 app.route('/api/aws-accounts', healthRoutes);
+app.route('/api/aws-accounts', capabilityRoutes);
+
+
+/**
+ * Versioned alias for the same handlers (connector spec §23).
+ *
+ * `/api/aws-accounts` is kept as-is because 25 frontend call sites and four
+ * Cloud Scheduler jobs point at it; renaming it would be a breaking change
+ * dressed up as an improvement. `/api/v1/aws` is the contract new consumers
+ * and future provider adapters should use, and gives the connector somewhere
+ * to put a v2 shape later without a flag day.
+ *
+ * Both prefixes mount the SAME route objects, so there is no second
+ * implementation to drift — including the remediation gate below, which is
+ * re-registered for the versioned path so it cannot be bypassed by calling
+ * the new URL.
+ */
+app.use('/api/v1/aws/remediation', async (c, next) => {
+  if (!isProviderRemediationEnabled(c.env)) return remediationDisabledResponse();
+  await next();
+});
+app.use('/api/v1/aws/remediation/*', async (c, next) => {
+  if (!isProviderRemediationEnabled(c.env)) return remediationDisabledResponse();
+  await next();
+});
+app.route('/api/v1/aws', accountsRoutes);
+app.route('/api/v1/aws', dashboardRoutes);
+app.route('/api/v1/aws', orgHierarchyRoutes);
+app.route('/api/v1/aws', permissionsRoutes);
+app.route('/api/v1/aws', regionsRoutes);
+app.route('/api/v1/aws', costRoutes);
+app.route('/api/v1/aws', recommendationsRoutes);
+app.route('/api/v1/aws', recommendationsSyncRoutes);
+app.route('/api/v1/aws', k8sCostRoutes);
+app.route('/api/v1/aws', activityRoutes);
+app.route('/api/v1/aws', cloudtrailEventsRoutes);
+app.route('/api/v1/aws', reportsRoutes);
+app.route('/api/v1/aws', discoveryRoutes);
+app.route('/api/v1/aws', internalScanRoutes);
+app.route('/api/v1/aws', internalRegistryTokenRoutes);
+app.route('/api/v1/aws', remediationRoutes);
+app.route('/api/v1/aws', curRoutes);
+app.route('/api/v1/aws', logsRoutes);
+app.route('/api/v1/aws', bulkImportRoutes);
+app.route('/api/v1/aws', identitiesRoutes);
+app.route('/api/v1/aws', healthRoutes);
+app.route('/api/v1/aws', capabilityRoutes);
 
 export default app;

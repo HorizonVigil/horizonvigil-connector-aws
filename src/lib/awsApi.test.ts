@@ -134,3 +134,72 @@ describe('callJsonApi retry', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * The creds sink is what makes degraded-coverage reporting universal.
+ *
+ * It hangs off the credentials rather than ScannerContext because creds are
+ * the one object all 111 scanner files already thread into every AWS call,
+ * whichever helper they use (18 use callQueryApi, 57 callJsonApi, 38
+ * safeFetch). These assert each helper reports, which is the basis for
+ * claiming coverage without having edited any scanner.
+ */
+describe('creds.onCallFailure — universal degraded-coverage reporting', () => {
+  it('reports a terminal failure from callQueryApi', async () => {
+    const seen: unknown[] = [];
+    fetchMock.mockImplementation(() => Promise.resolve(xmlError('UnauthorizedOperation', 'nope')));
+
+    await callQueryApi({ ...creds, onCallFailure: (f) => seen.push(f) }, queryOpts, noSleep);
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ service: 'ec2', action: 'DescribeInstances', region: 'us-east-1', normalizedCode: 'PERMISSION_DENIED' });
+  });
+
+  it('reports only after retries are exhausted, not once per attempt', async () => {
+    // One failed call must degrade the scanner once, not three times.
+    const seen: unknown[] = [];
+    fetchMock.mockImplementation(() => Promise.resolve(xmlError('RequestLimitExceeded')));
+
+    await callQueryApi({ ...creds, onCallFailure: () => seen.push(1) }, queryOpts, { ...noSleep, retry: { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 2 } });
+
+    expect(seen).toHaveLength(1);
+  });
+
+  it('does NOT report a call that eventually succeeded', async () => {
+    const seen: unknown[] = [];
+    fetchMock
+      .mockResolvedValueOnce(xmlError('RequestLimitExceeded'))
+      .mockResolvedValueOnce(new Response('<ok/>', { status: 200 }));
+
+    await callQueryApi({ ...creds, onCallFailure: () => seen.push(1) }, queryOpts, noSleep);
+
+    expect(seen).toHaveLength(0);
+  });
+
+  it('does NOT report UNSUPPORTED_CAPABILITY as degraded coverage', async () => {
+    // "This account has not enabled Macie" is a settled answer, not incomplete
+    // coverage. Treating it as degraded would permanently freeze vanished-
+    // resource cleanup for every service the customer does not use.
+    const seen: unknown[] = [];
+    fetchMock.mockImplementation(() => Promise.resolve(new Response(JSON.stringify({ __type: 'x#OptInRequired', message: 'not subscribed' }), { status: 400 })));
+
+    await callJsonApi({ ...creds, onCallFailure: () => seen.push(1) }, { service: 'macie2', region: 'us-east-1', host: 'macie2.us-east-1.amazonaws.com', target: 'X.ListFindings', body: {} }, noSleep);
+
+    expect(seen).toHaveLength(0);
+  });
+
+  it('reports from callJsonApi with the action derived from the X-Amz-Target', async () => {
+    const seen: { action?: string }[] = [];
+    fetchMock.mockImplementation(() => Promise.resolve(new Response(JSON.stringify({ __type: 'x#AccessDeniedException', message: 'no' }), { status: 403 })));
+
+    await callJsonApi({ ...creds, onCallFailure: (f) => seen.push(f) }, { service: 'eks', region: 'eu-west-1', host: 'eks.eu-west-1.amazonaws.com', target: 'EKS.ListClusters', body: {} }, noSleep);
+
+    expect(seen[0].action).toBe('ListClusters');
+  });
+
+  it('works for a scanner that never opts in — no sink means no crash', async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(xmlError('UnauthorizedOperation')));
+    const res = await callQueryApi(creds, queryOpts, noSleep);
+    expect(res.normalizedCode).toBe('PERMISSION_DENIED');
+  });
+});
