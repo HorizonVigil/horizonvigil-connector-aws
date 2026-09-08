@@ -15,6 +15,7 @@ import { discoveryRoutes } from './routes/discovery';
 import { internalScanRoutes } from './routes/internalScan';
 import { internalRegistryTokenRoutes } from './routes/internalRegistryToken';
 import { remediationRoutes } from './routes/remediation';
+import { isProviderRemediationEnabled, remediationDisabledResponse } from './lib/capabilities';
 import { curRoutes } from './routes/cur';
 import { logsRoutes } from './routes/logs';
 import { bulkImportRoutes } from './routes/bulkImport';
@@ -40,6 +41,21 @@ app.route('/api/aws-accounts', reportsRoutes);
 app.route('/api/aws-accounts', discoveryRoutes);
 app.route('/api/aws-accounts', internalScanRoutes);
 app.route('/api/aws-accounts', internalRegistryTokenRoutes);
+/**
+ * Direct provider mutation is disabled in V1 (2026-09-08 production-
+ * readiness audits: "No direct provider mutation ships in V1"). Denied
+ * before any handler runs, so a crafted request cannot reach an AWS call
+ * even if a client bypasses the UI. See lib/capabilities.ts for why the
+ * whole capability is gated rather than only the mutating endpoints.
+ */
+app.use('/api/aws-accounts/remediation', async (c, next) => {
+  if (!isProviderRemediationEnabled(c.env)) return remediationDisabledResponse();
+  await next();
+});
+app.use('/api/aws-accounts/remediation/*', async (c, next) => {
+  if (!isProviderRemediationEnabled(c.env)) return remediationDisabledResponse();
+  await next();
+});
 app.route('/api/aws-accounts', remediationRoutes);
 app.route('/api/aws-accounts', curRoutes);
 app.route('/api/aws-accounts', logsRoutes);
