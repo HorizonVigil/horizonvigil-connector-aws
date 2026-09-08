@@ -10,7 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@horizonvigil/shared-lib": "git+https://github.com/HorizonVigil/horizonvigil-shared-lib.git#v1.0.18",
+    "@horizonvigil/shared-lib": "git+https://github.com/HorizonVigil/horizonvigil-shared-lib.git#v1.0.19",
     "@hono/node-server": "^1.13.7",
     "aws4fetch": "^1.0.20",
     "hono": "^4.6.0",

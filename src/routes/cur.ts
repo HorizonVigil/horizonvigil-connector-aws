@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, writeAuditLog, guarded, okJson, errJson, type Db } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, writeAuditLog, guarded, okJson, errJson, type Db, requirePermittedConnection } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
 import { discoverCurReport, fetchCurManifest, parseCurBatch, type CurConnectionConfig } from '../lib/curIngest';
@@ -12,7 +12,12 @@ interface CurConnectionRow extends ResolvableConnection {
   cur_s3_region: string | null;
 }
 
-async function loadConnection(db: Db, orgId: string, id: string): Promise<CurConnectionRow | null> {
+async function loadConnection(db: Db, orgId: string, userId: string | null, id: string): Promise<CurConnectionRow | null> {
+  // Compile-enforced authorization: `userId` is required so every call site
+  // has to decide. An id + org_id filter proves only that the connection
+  // belongs to the caller's org, never that this caller is permitted it.
+  // Pass null ONLY from internal/scheduled paths that run without a user.
+  if (userId) await requirePermittedConnection(db, orgId, userId, id);
   const rows = await db.select<CurConnectionRow[]>('cloud_connections', {
     select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region,cur_report_name,cur_s3_bucket,cur_s3_prefix,cur_s3_region',
     filters: { id: `eq.${id}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
@@ -28,7 +33,7 @@ curRoutes.post('/accounts/:id/cur/discover', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
-    const connection = await loadConnection(db, orgId, c.req.param('id'));
+    const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
     const resolved = await resolveCredentials(c.env, connection);
     if ('error' in resolved) return errJson(400, resolved.error);
@@ -54,7 +59,7 @@ curRoutes.get('/accounts/:id/cur/manifest', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
-    const connection = await loadConnection(db, orgId, c.req.param('id'));
+    const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
     if (!connection.cur_s3_bucket || !connection.cur_s3_prefix || !connection.cur_report_name || !connection.cur_s3_region) {
       return errJson(400, 'No Cost & Usage Report configured for this account yet — run Discover first.');
@@ -95,7 +100,7 @@ curRoutes.post('/accounts/:id/cur/ingest-step', (c) =>
     if (!body.reportKey) return errJson(400, 'reportKey is required');
     const skipRows = body.skipRows ?? 0;
 
-    const connection = await loadConnection(db, orgId, c.req.param('id'));
+    const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
     if (!connection.cur_s3_bucket || !connection.cur_s3_region) return errJson(400, 'No Cost & Usage Report configured for this account yet.');
     const resolved = await resolveCredentials(c.env, connection);
@@ -128,7 +133,7 @@ curRoutes.post('/accounts/:id/cur/finalize', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
-    const connection = await loadConnection(db, orgId, c.req.param('id'));
+    const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
     if (!connection) return errJson(404, 'Account not found');
 
     const now = new Date().toISOString();

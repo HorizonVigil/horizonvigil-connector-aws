@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, guarded, okJson, errJson } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, getActiveScope, inFilter, guarded, okJson, errJson, requirePermittedConnection } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
 import { listOrganizationTree, type OrgTreeNode } from '../lib/scanners/organizations';
@@ -18,9 +18,12 @@ orgHierarchyRoutes.get('/organizations', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // This response lists connection names and account ids directly, so it
+    // must be bounded by the permitted set rather than the whole org.
+    const permittedIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
     const rows = await db.select<{ aws_account_id: string; connection_name: string; environment: string; status: string }[]>('cloud_connections', {
       select: 'aws_account_id,connection_name,environment,status',
-      filters: { org_id: `eq.${orgId}`, provider: 'eq.aws' },
+      filters: { id: inFilter(permittedIds), org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
 
     const groups = new Map<string, typeof rows>();
@@ -54,9 +57,14 @@ orgHierarchyRoutes.get('/organizations/hierarchy', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // Same bounding as /organizations above. This set also decides which
+    // accounts in the live AWS Organizations tree get annotated as
+    // "connected", so an unbounded read would disclose the existence of
+    // connections the caller is not permitted to see.
+    const permittedIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
     const connectedRows = await db.select<{ aws_account_id: string; id: string; connection_name: string; status: string; environment: string }[]>('cloud_connections', {
       select: 'aws_account_id,id,connection_name,status,environment',
-      filters: { org_id: `eq.${orgId}`, provider: 'eq.aws' },
+      filters: { id: inFilter(permittedIds), org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     const connectedById = new Map(connectedRows.map((r) => [r.aws_account_id, r]));
 
@@ -76,6 +84,10 @@ orgHierarchyRoutes.get('/organizations/hierarchy', (c) =>
     const managementConnectionId = c.req.query('managementConnectionId');
     if (!managementConnectionId) return flat();
 
+    // This id is caller-supplied and its credentials are then used to walk the
+    // real AWS Organizations tree, so it needs the same permitted-set check as
+    // a path parameter would.
+    await requirePermittedConnection(db, orgId, auth.userId, managementConnectionId, getActiveScope(c.req.raw, orgId));
     const rows = await db.select<(ResolvableConnection & { id: string })[]>('cloud_connections', {
       select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
       filters: { id: `eq.${managementConnectionId}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
@@ -112,9 +124,12 @@ orgHierarchyRoutes.get('/cross-account-roles', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // Lists connection names, account ids and role ARNs, so it is bounded by
+    // the permitted set like every other connection listing.
+    const permittedIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
     const rows = await db.select('cloud_connections', {
       select: 'id,connection_name,aws_account_id,role_arn,external_id,status,created_at',
-      filters: { org_id: `eq.${orgId}`, connection_method: 'eq.cross_account_role' },
+      filters: { id: inFilter(permittedIds), org_id: `eq.${orgId}`, connection_method: 'eq.cross_account_role' },
     });
     return okJson({ roles: rows });
   }),
@@ -128,6 +143,10 @@ orgHierarchyRoutes.get('/credentials/:id', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // Authorize the caller for THIS connection before reading it: an
+    // id + org_id filter proves org ownership, not that this caller is
+    // permitted the connection (resource grants / active scope).
+    await requirePermittedConnection(db, orgId, auth.userId, c.req.param('id'), getActiveScope(c.req.raw, orgId));
     const rows = await db.select<
       { connection_method: string; masked_access_key: string | null; key_rotated_at: string | null; role_arn: string | null; external_id: string | null }[]
     >('cloud_connections', {

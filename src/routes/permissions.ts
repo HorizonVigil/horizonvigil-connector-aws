@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson, type Db, getActiveScope } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson, type Db, getActiveScope, requirePermittedConnection } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { decryptCredentials } from '../lib/crypto';
 import { assumeConnectionRole } from '../lib/assumeRole';
@@ -143,6 +143,10 @@ permissionsRoutes.post('/accounts/:id/permissions/validate', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
+    // Authorize the caller for THIS connection before reading it: an
+    // id + org_id filter proves org ownership, not that this caller is
+    // permitted the connection (resource grants / active scope).
+    await requirePermittedConnection(db, orgId, auth.userId, c.req.param('id'), getActiveScope(c.req.raw, orgId));
     const rows = await db.select<ResolvableConnection[]>('cloud_connections', {
       select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
       filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
