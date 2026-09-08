@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson, errJson, parsePagination, paginatedEnvelope } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson, errJson, parsePagination, paginatedEnvelope, getActiveScope } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 
 export const identitiesRoutes = new Hono<{ Bindings: Env }>();
@@ -23,7 +23,7 @@ identitiesRoutes.get('/identities', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
-    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
 
     const url = new URL(c.req.url);
     const pagination = parsePagination(url);
@@ -84,7 +84,7 @@ identitiesRoutes.get('/identities/summary', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
-    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
     const rows = await db.select<{ identity_type: string; is_human: boolean; privilege_level: string | null; mfa_enabled: boolean | null }[]>('cloud_identities', {
       select: 'identity_type,is_human,privilege_level,mfa_enabled',
       filters: { connection_id: inFilter(connectionIds), deleted_at: 'is.null' },
@@ -111,7 +111,7 @@ identitiesRoutes.get('/identities/:id', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
-    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
     const rows = await db.select<Record<string, unknown>[]>('cloud_identities', {
       select: `${LIST_SELECT},metadata`,
       filters: { id: `eq.${c.req.param('id')}`, connection_id: inFilter(connectionIds) },
@@ -137,7 +137,7 @@ identitiesRoutes.get('/identities/:id/edges', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
-    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
     const identityId = c.req.param('id');
     const select = 'id,relationship_type,confidence,source_engine,source_resource_id,source_identity_id,target_resource_id,target_identity_id,metadata,first_seen_at,last_seen_at';
     const [asSource, asTarget] = await Promise.all([

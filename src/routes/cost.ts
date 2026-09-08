@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson, type Db } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson, type Db, getActiveScope } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { callJsonApi, type AwsCreds } from '../lib/awsApi';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
@@ -171,7 +171,7 @@ costRoutes.get('/cost-summary', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
-    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
     const [connections, costRows] = await Promise.all([
       db.select<{ id: string; connection_name: string }[]>('cloud_connections', { select: 'id,connection_name', filters: { id: inFilter(connectionIds), provider: 'eq.aws' } }),
       db.select<{ connection_id: string; unblended_cost: string }[]>('cost_snapshots', {
