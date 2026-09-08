@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson, type Env } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson, type Env, getActiveScope } from '@horizonvigil/shared-lib';
 import { notCurrentlyExcludedFilter } from '../lib/exclusions';
 
 export const recommendationsRoutes = new Hono<{ Bindings: Env }>();
@@ -31,7 +31,7 @@ recommendationsRoutes.get('/recommendations', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'optimization', 'read');
 
-    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
     const rows = await db.select<{ potential_monthly_savings: string }[]>('cost_recommendations', {
       select: 'potential_monthly_savings',
       filters: { connection_id: inFilter(connectionIds), status: 'eq.open', or: notCurrentlyExcludedFilter() },
