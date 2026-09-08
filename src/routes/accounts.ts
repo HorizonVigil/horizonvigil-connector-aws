@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit, checkCloudAccountLimit } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit, checkCloudAccountLimit, getOrgConnectionIds, getActiveScope, inFilter } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '../lib/crypto';
 import { isConnectionPurgeEnabled, purgeDisabledResponse } from '../lib/capabilities';
@@ -18,7 +18,21 @@ accountsRoutes.get('/accounts', (c) =>
 
     const url = new URL(c.req.url);
     const pagination = parsePagination(url);
-    const filters: Record<string, string> = { org_id: `eq.${orgId}`, provider: 'eq.aws' };
+    // The account list is a permitted-set read, not just an org read.
+    //
+    // Filtering on org_id alone made this endpoint bypass BOTH controls that
+    // are supposed to bound it: resource grants (Phase 0.7 -- a user with no
+    // grants gets no connections from getOrgConnectionIds, yet still saw every
+    // account in the org here) and the active folder/project scope (Phase 1 --
+    // selecting a folder left the full global account list on screen, which is
+    // one of the specific symptoms the 2026-09-08 audits reported).
+    //
+    // getOrgConnectionIds already applies org membership, grants and scope, so
+    // intersecting on `id` is the whole fix. inFilter([]) yields a filter that
+    // matches nothing, so "no permitted accounts" renders as an empty list
+    // rather than falling open to the org.
+    const permittedIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
+    const filters: Record<string, string> = { id: inFilter(permittedIds), org_id: `eq.${orgId}`, provider: 'eq.aws' };
     const status = url.searchParams.get('status');
     const environment = url.searchParams.get('environment');
     const method = url.searchParams.get('connectionMethod');
@@ -62,9 +76,17 @@ accountsRoutes.get('/accounts/:id', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // Same permitted-set check as the list route above: org membership alone
+    // let any member fetch any connection in the org by id, regardless of
+    // resource grants. 404 rather than 403 so the response doesn't confirm
+    // that an id the caller may not see exists.
+    const id = c.req.param('id');
+    const permittedIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
+    if (!permittedIds.includes(id)) return errJson(404, 'Account not found');
+
     const rows = await db.select('cloud_connections', {
       select: LIST_SELECT,
-      filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
+      filters: { id: `eq.${id}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     const account = (rows as unknown[])[0];
     if (!account) return errJson(404, 'Account not found');
