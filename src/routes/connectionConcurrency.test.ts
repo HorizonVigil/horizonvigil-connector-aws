@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 /**
  * §14.4 on the one mutation where a lost update actually costs something:
@@ -15,16 +17,8 @@ import { describe, it, expect } from 'vitest';
  * use — the alternative is standing up auth, RBAC, ABAC and PostgREST to
  * observe one header being compared.
  */
-const sources = import.meta.glob(['./accounts.ts'], {
-  query: '?raw',
-  import: 'default',
-  eager: true,
-}) as Record<string, string>;
-
-function source(endsWith: string): string {
-  const hit = Object.entries(sources).find(([path]) => path.endsWith(endsWith));
-  expect(hit, `source not found for ${endsWith}`).toBeTruthy();
-  return hit![1];
+function source(file: string): string {
+  return readFileSync(join(__dirname, file), 'utf8');
 }
 
 function code(text: string): string {
@@ -32,7 +26,7 @@ function code(text: string): string {
 }
 
 describe('the connection update carries an optimistic-concurrency check', () => {
-  const accounts = code(source('/accounts.ts'));
+  const accounts = code(source('accounts.ts'));
 
   it('computes an ETag from the row it just read', () => {
     expect(accounts).toMatch(/strongEtag\(versionParts\(existing\)\)/);
