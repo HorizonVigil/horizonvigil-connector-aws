@@ -1,0 +1,53 @@
+# Phase 1J — integration and isolation tests, separate from unit tests.
+#
+# Separate workflow, not another step in deploy.yml, for two reasons: these
+# need credentials the unit suite does not, and a red isolation run should
+# be legible as "isolation broke" rather than buried in a deploy log.
+#
+# The suite FAILS when the database is unreachable. It never skips: a
+# skipped tenant-isolation test reports green while proving nothing, which
+# is the exact failure this phase exists to remove.
+name: Integration & Isolation Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install
+        run: npm install
+        env:
+          # The shared-lib git dependency needs an authenticated fetch.
+          GH_PAT: ${{ secrets.GH_PAT }}
+
+      # Guard rail: without this a missing secret would surface as an
+      # obscure sign-in error deep in the run rather than a clear failure.
+      - name: Verify integration credentials are present
+        run: |
+          if [ -z "${INTEGRATION_SUPABASE_URL}" ] || [ -z "${INTEGRATION_SUPABASE_ANON_KEY}" ]; then
+            echo "::error::INTEGRATION_SUPABASE_URL / INTEGRATION_SUPABASE_ANON_KEY are not set."
+            echo "::error::The integration suite must FAIL rather than skip when it cannot reach a database."
+            exit 1
+          fi
+        env:
+          INTEGRATION_SUPABASE_URL: ${{ secrets.INTEGRATION_SUPABASE_URL }}
+          INTEGRATION_SUPABASE_ANON_KEY: ${{ secrets.INTEGRATION_SUPABASE_ANON_KEY }}
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Integration & isolation tests
+        run: npm run test:integration
+        env:
+          INTEGRATION_SUPABASE_URL: ${{ secrets.INTEGRATION_SUPABASE_URL }}
+          INTEGRATION_SUPABASE_ANON_KEY: ${{ secrets.INTEGRATION_SUPABASE_ANON_KEY }}
