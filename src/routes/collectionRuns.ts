@@ -9,6 +9,9 @@ import {
   createOrGetActiveRun, claimRun, checkpoint, finalizeRun, toRunResponse, isLeaseExpired,
   STEPS_PER_SLICE, type CollectionRunRow,
 } from '../lib/collectionRuns';
+import { fetchCurManifest, parseCurBatch } from '../lib/curIngest';
+import { resolveCredentials } from './permissions';
+import { ingestCurFile, advanceCheckpoint, allFilesComplete, finalizeCurRun, type CurCheckpoint } from '../lib/curWorkflow';
 
 export const collectionRunRoutes = new Hono<{ Bindings: Env }>();
 
@@ -80,6 +83,71 @@ collectionRunRoutes.post('/accounts/:id/collection-runs', (c) =>
     return new Response(JSON.stringify({ ok: true, ...toRunResponse(run), created, location }), {
       // 202 for a new job; 200 when an identical one is already in flight, so
       // clicking Sync Now twice is idempotent rather than an error.
+      status: created ? 202 : 200,
+      headers: { 'Content-Type': 'application/json', Location: location, 'Retry-After': '5' },
+    });
+  }),
+);
+
+/**
+ * POST /accounts/:id/cur-runs — request a server-owned CUR ingestion.
+ *
+ * Replaces the browser's nested loop over report files and row chunks (§3.4).
+ * Same durable-job contract as discovery: 202 + Location, one active run per
+ * connection, resumable across worker ticks.
+ */
+collectionRunRoutes.post('/accounts/:id/cur-runs', (c) =>
+  guarded(async () => {
+    const auth = getAuthContext(c.req.raw);
+    const orgId = requireOrgId(c.req.raw);
+    const db = createDb(c.env, auth.accessToken);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
+
+    const connectionId = c.req.param('id');
+    await requirePermittedConnection(db, orgId, auth.userId, connectionId, getActiveScope(c.req.raw, orgId));
+
+    const connection = await loadConnection(db, orgId, auth.userId, connectionId);
+    if (!connection) return errJson(404, 'Account not found');
+
+    const cfg = await db.select<{ cur_s3_bucket: string | null; cur_s3_region: string | null; cur_s3_prefix: string | null; cur_report_name: string | null }[]>(
+      'cloud_connections',
+      { select: 'cur_s3_bucket,cur_s3_region,cur_s3_prefix,cur_report_name', filters: { id: `eq.${connectionId}` } },
+    );
+    if (!cfg[0]?.cur_s3_bucket) {
+      // Honest refusal rather than queuing a job that can only fail.
+      return c.json({ ok: false, code: 'cur_not_configured', error: 'No Cost & Usage Report is configured for this account yet.' }, 409);
+    }
+
+    const resolved = await resolveCredentials(c.env, connection as never);
+    if ('error' in resolved) return errJson(400, resolved.error);
+
+    // The manifest IS the plan: one step per report file, discovered
+    // server-side rather than fetched by the browser.
+    const manifest = await fetchCurManifest(resolved.creds, {
+      bucket: cfg[0].cur_s3_bucket, region: cfg[0].cur_s3_region ?? 'us-east-1',
+      prefix: cfg[0].cur_s3_prefix ?? '', reportName: cfg[0].cur_report_name ?? '',
+    } as never);
+    if ('error' in manifest) return errJson(400, manifest.error);
+    const reportKeys = manifest.manifest.reportKeys ?? [];
+    if (reportKeys.length === 0) {
+      return c.json({ ok: false, code: 'cur_no_data_published', error: 'The report exists but no data files are published for this billing period yet.' }, 409);
+    }
+
+    const { run, created } = await createOrGetActiveRun(db, {
+      orgId, connectionId, requestedBy: auth.userId, trigger: 'user',
+      plannedSteps: reportKeys,
+      idempotencyKey: c.req.header('Idempotency-Key') ?? `cur:${connectionId}:${Date.now()}`,
+    });
+    if (created) {
+      await db.update('collection_runs', { id: `eq.${run.id}` }, { capability: 'billing_cur' }, 'return=minimal');
+      await writeAuditLog(db, {
+        orgId, actorId: auth.userId, action: 'aws_account.cur_run_queued',
+        targetType: 'cloud_connection', targetId: connectionId, metadata: { runId: run.id, files: reportKeys.length },
+      });
+    }
+
+    const location = `/api/aws-accounts/collection-runs/${run.id}`;
+    return new Response(JSON.stringify({ ok: true, ...toRunResponse(run), created, location }), {
       status: created ? 202 : 200,
       headers: { 'Content-Type': 'application/json', Location: location, 'Retry-After': '5' },
     });
@@ -241,6 +309,18 @@ collectionRunRoutes.post('/internal/advance-collection-runs', (c) =>
 
       if (!(await claimRun(db, run, leaseOwner, now))) continue;
 
+      /**
+       * CUR ingestion resumes mid-FILE, so it advances one file per tick with
+       * a wall-clock budget rather than looping steps. This is the branch
+       * that replaces the browser's nested for/while over report files and
+       * row chunks (§3.4).
+       */
+      if (run.capability === 'billing_cur') {
+        const outcome = await advanceCurRun(db, c.env, run, now);
+        results.push(outcome);
+        continue;
+      }
+
       const steps = run.planned_steps ?? [];
       const start = run.step_cursor;
       const end = Math.min(start + STEPS_PER_SLICE, steps.length);
@@ -307,3 +387,99 @@ collectionRunRoutes.post('/internal/advance-collection-runs', (c) =>
     return okJson({ advanced: results.length, results });
   }),
 );
+
+/**
+ * Advances one CUR run by a single file.
+ *
+ * One file per tick keeps each slice comfortably inside the request budget
+ * and makes progress durable between them. Ingestion is an idempotent upsert
+ * on (connection_id, resource_id, usage_date), so re-running a partially
+ * ingested file corrects rather than duplicates -- the checkpoint is an
+ * efficiency measure, not a correctness one.
+ */
+async function advanceCurRun(db: Db, env: Env, run: CollectionRunRow, now: number): Promise<unknown> {
+  const files = run.planned_steps ?? [];
+  const checkpointData = ((run as unknown as { checkpoint_data?: CurCheckpoint }).checkpoint_data) ?? {};
+  const nextFile = files[run.step_cursor];
+
+  if (!nextFile) {
+    // Every file finished. cur_last_synced_at is stamped ONLY here, because
+    // it is what the UI reads as "your billing data is current as of" --
+    // stamping it on a partial ingest would make incomplete cost data look
+    // complete.
+    if (allFilesComplete(files, new Set(Object.keys(checkpointData)))) {
+      await finalizeCurRun(db, run.connection_id, new Date(now).toISOString());
+    }
+    const status = await finalizeRun(db, run, {}, now);
+    return { runId: run.id, capability: 'billing_cur', status };
+  }
+
+  const connection = await loadConnection(db, run.org_id, null, run.connection_id);
+  if (!connection) {
+    await finalizeRun(db, run, {}, now);
+    return { runId: run.id, capability: 'billing_cur', status: 'FAILED', error: 'connection_missing' };
+  }
+
+  const cfg = await db.select<{ cur_s3_bucket: string | null; cur_s3_region: string | null }[]>('cloud_connections', {
+    select: 'cur_s3_bucket,cur_s3_region',
+    filters: { id: `eq.${run.connection_id}` },
+  });
+  const resolved = await resolveCredentials(env, connection as never);
+  if ('error' in resolved || !cfg[0]?.cur_s3_bucket) {
+    await finalizeRun(db, run, {}, now);
+    return { runId: run.id, capability: 'billing_cur', status: 'FAILED', error: 'credentials_or_config_unavailable' };
+  }
+
+  const outcome = await ingestCurFile(nextFile, checkpointData, async (key, skipRows) => {
+    const batch = await parseCurBatch(resolved.creds, cfg[0].cur_s3_bucket!, cfg[0].cur_s3_region ?? 'us-east-1', key, skipRows);
+    if ('error' in batch) return { error: batch.error };
+    if (batch.costRows.length > 0) {
+      const grouped = new Map<string, { resource_id: string; service: string; region: string | null; usage_date: string; unblended_cost: number }>();
+      for (const row of batch.costRows) {
+        const k = `${row.resource_id}:${row.usage_date}`;
+        const existing = grouped.get(k);
+        if (existing) existing.unblended_cost += row.unblended_cost;
+        else grouped.set(k, { ...row });
+      }
+      const rows = [...grouped.values()].map((row) => ({ connection_id: run.connection_id, ...row, unblended_cost: Math.round(row.unblended_cost * 100) / 100 }));
+      await db.insert('resource_costs?on_conflict=connection_id,resource_id,usage_date', rows, 'resolution=merge-duplicates,return=minimal');
+    }
+    return { rowsProcessed: batch.rowsProcessed, done: batch.done };
+  });
+
+  const nextCheckpoint = advanceCheckpoint(checkpointData, nextFile, outcome.rowsProcessed);
+
+  await db.insert(
+    'collection_run_steps',
+    {
+      run_id: run.id, step_id: nextFile, step_index: run.step_cursor,
+      status: outcome.error ? 'failed' : outcome.done ? 'succeeded' : 'skipped',
+      records_written: outcome.rowsProcessed,
+      error_message: outcome.error ?? null,
+      finished_at: new Date(now).toISOString(),
+    },
+    'return=minimal',
+  ).catch(() => {
+    // Duplicate step row means this file is being resumed across ticks, which
+    // is the normal path for a large file.
+  });
+
+  await db.update(
+    'collection_runs',
+    { id: `eq.${run.id}` },
+    {
+      // Only advance past the file once it genuinely finished; an interrupted
+      // file keeps the cursor so the next tick resumes it.
+      step_cursor: outcome.done ? run.step_cursor + 1 : run.step_cursor,
+      completed_steps: outcome.done ? run.completed_steps + 1 : run.completed_steps,
+      failed_steps: outcome.error ? run.failed_steps + 1 : run.failed_steps,
+      checkpoint_data: nextCheckpoint,
+      heartbeat_at: new Date(now).toISOString(),
+      lease_expires_at: new Date(now + 15 * 60 * 1000).toISOString(),
+      updated_at: new Date(now).toISOString(),
+    },
+    'return=minimal',
+  );
+
+  return { runId: run.id, capability: 'billing_cur', file: nextFile, rows: outcome.rowsProcessed, done: outcome.done };
+}
