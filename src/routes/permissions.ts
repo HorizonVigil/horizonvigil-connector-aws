@@ -1,4 +1,5 @@
 import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson, type Db, getActiveScope, requirePermittedConnection } from '@horizonvigil/shared-lib';
+import { buildCapabilityStatuses, writeCapabilityStatuses } from '../lib/capabilityStatus';
 import type { Env } from '../env';
 import { decryptCredentials } from '../lib/crypto';
 import { assumeConnectionRole } from '../lib/assumeRole';
@@ -76,7 +77,24 @@ export async function runConnectionValidation(
     }
 
     const { identity, checks } = await runFullValidation(resolved.creds, connection.default_region || 'us-east-1');
-    const overallStatus = checks[0]?.status === 'granted' ? 'succeeded' : 'failed';
+
+    /**
+     * A validation run cannot be `succeeded` without evidence (§6.1: "An
+     * empty required check list cannot be succeeded").
+     *
+     * This read `checks[0]?.status === 'granted'` -- positional, so it
+     * depended entirely on STS happening to be first in the array, and an
+     * empty checks array evaluated to `failed` only by accident of
+     * `undefined`. Naming the required check makes the rule explicit and
+     * order-independent.
+     *
+     * Denials on OTHER services deliberately do not fail the run: an account
+     * that has not enabled Cost Explorer is not a broken connection. That
+     * distinction is now carried per capability in
+     * connector_capability_status rather than collapsed into one boolean.
+     */
+    const stsCheck = checks.find((ck) => ck.service === 'sts');
+    const overallStatus = checks.length > 0 && stsCheck?.status === 'granted' ? 'succeeded' : 'failed';
 
     await db.update(
       'connection_validation_runs',
@@ -99,6 +117,24 @@ export async function runConnectionValidation(
         'return=minimal',
       );
     }
+
+    /**
+     * Per-capability health from this snapshot (§2.3). One blended score per
+     * connection cannot say "inventory is fine but Cost Explorer is denied",
+     * which is the only form of this information a customer can act on.
+     */
+    // Skipped when there is no org context (a path that cannot attribute the
+    // row); the validation itself is unaffected either way.
+    if (actor?.orgId) await writeCapabilityStatuses(
+      db,
+      buildCapabilityStatuses({
+        orgId: actor?.orgId ?? '',
+        connectionId: connection.id,
+        checks,
+        snapshotId: run.id,
+        connectionStatus: overallStatus === 'succeeded' ? 'connected' : 'error',
+      }),
+    );
 
     const connectionPatch: Record<string, unknown> = { last_permission_check_at: new Date().toISOString() };
     if (overallStatus === 'succeeded') {
@@ -215,7 +251,24 @@ permissionsRoutes.post('/internal/run-due-permission-checks', (c) =>
 async function latestRunFor(db: Db, connectionId: string) {
   const runs = await db.select<{ id: string; status: string; identity_arn: string | null; identity_account_id: string | null; started_at: string; finished_at: string | null; error_message: string | null }[]>(
     'connection_validation_runs',
-    { select: 'id,status,identity_arn,identity_account_id,started_at,finished_at,error_message', filters: { connection_id: `eq.${connectionId}` }, order: 'started_at.desc', limit: 1 },
+    {
+      select: 'id,status,identity_arn,identity_account_id,started_at,finished_at,error_message',
+      /**
+       * AWS-P0-04: this had NO run_type filter, so it returned the latest run
+       * of ANY type. Discovery runs outnumber validations 96:24 in
+       * production, so the "Latest Validation Run" shown to customers was
+       * almost always a DISCOVERY run -- reported as `succeeded`, with its
+       * permission checks looked up by that run's id and therefore empty.
+       *
+       * Verified before the fix: both AWS connections showed
+       * latest_run_type=discovery, status=succeeded, 0 checks displayed --
+       * while 8 real permission checks existed for each. The evidence was
+       * always there; the query threw it away.
+       */
+      filters: { connection_id: `eq.${connectionId}`, run_type: 'eq.permission_validation' },
+      order: 'started_at.desc',
+      limit: 1,
+    },
   );
   const run = runs[0];
   if (!run) return null;

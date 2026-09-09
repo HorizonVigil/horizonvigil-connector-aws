@@ -67,7 +67,9 @@ describe('computeHealth', () => {
     const fresh = computeHealth(conn(), okRun, NOW);
     const stale = computeHealth(conn({ last_sync_at: daysAgo(30) }), okRun, NOW);
     expect(stale.signals.find((s) => s.key === 'sync_freshness')?.status).toBe('fail');
-    expect(stale.score).toBeLessThan(fresh.score);
+    // Both are connected, so both are scored; the null case is asserted
+    // separately below for disconnected connections.
+    expect(stale.score!).toBeLessThan(fresh.score!);
   });
 
   it('failed permission run fails the permissions signal', () => {
@@ -118,5 +120,39 @@ describe('summarizeHealth', () => {
 
   it('all-unknown → healthPercent null', () => {
     expect(summarizeHealth([{ connectionId: 'a', score: 0, state: 'unknown', signals: [] }]).healthPercent).toBeNull();
+  });
+});
+
+/**
+ * The audit found a DISCONNECTED account reporting `score: 100, state:
+ * unknown`, and AWS summarised as 100% healthy while one of its two
+ * connections was disconnected. The state had been corrected but the score
+ * was left behind, so any aggregate reading `score` still saw a perfect
+ * account.
+ */
+describe('a disconnected connection has no score at all', () => {
+  it('returns null, not 100 and not 0', () => {
+    const h = computeHealth(conn({ status: 'disconnected' }), okRun, NOW);
+    expect(h.score).toBeNull();
+    expect(h.state).toBe('unknown');
+  });
+
+  it('is null even when every other signal looks perfect', () => {
+    // This is the exact shape that produced 100: healthy permissions,
+    // discovery, freshness and credentials on a disconnected connection.
+    const h = computeHealth(conn({ status: 'disconnected', last_sync_at: daysAgo(0), last_discovery_at: daysAgo(0) }), okRun, NOW);
+    expect(h.score).toBeNull();
+  });
+
+  it('cannot contribute a number to a provider rollup', () => {
+    // A rollup that sums `score` must get nothing from this connection.
+    const h = computeHealth(conn({ status: 'disconnected' }), okRun, NOW);
+    expect(typeof h.score).not.toBe('number');
+  });
+
+  it('returns null rather than 0 when nothing is measurable', () => {
+    // 0 reads as "scored, and failing"; null reads as "not scored".
+    const h = computeHealth(conn({ status: 'disconnected' }), null, NOW);
+    expect(h.score).toBeNull();
   });
 });

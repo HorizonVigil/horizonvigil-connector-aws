@@ -146,3 +146,41 @@ healthRoutes.get('/accounts/:id/health', (c) =>
     });
   }),
 );
+
+/**
+ * GET /accounts/:id/capabilities — per-capability health (§2.3, §6.2).
+ *
+ * The blended per-connection score cannot express "inventory is fine but Cost
+ * Explorer is denied". This returns the state of each capability with the
+ * permission snapshot that proves it, so every claim can be drilled into
+ * rather than taken on trust.
+ */
+healthRoutes.get('/accounts/:id/capabilities', (c) =>
+  guarded(async () => {
+    const auth = getAuthContext(c.req.raw);
+    const orgId = requireOrgId(c.req.raw);
+    const db = createDb(c.env, auth.accessToken);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
+
+    const id = c.req.param('id');
+    await requirePermittedConnection(db, orgId, auth.userId, id, getActiveScope(c.req.raw, orgId));
+
+    const rows = await db.select<Record<string, unknown>[]>('connector_capability_status', {
+      select: 'capability,state,reason_code,source,expected_scope,covered_scope,last_attempt_at,last_success_at,permission_snapshot_id,updated_at',
+      filters: { connection_id: `eq.${id}`, org_id: `eq.${orgId}` },
+      order: 'capability.asc',
+      limit: 100,
+    });
+
+    return okJson({
+      items: rows,
+      total: rows.length,
+      // An empty list is "never evaluated", not "all healthy" -- stated
+      // explicitly so a client cannot read absence as success.
+      evaluated: rows.length > 0,
+      explanation: rows.length === 0
+        ? 'Capability health has not been evaluated for this connection yet. Run Validate Permissions to populate it.'
+        : null,
+    });
+  }),
+);

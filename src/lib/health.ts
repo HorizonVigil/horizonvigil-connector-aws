@@ -36,7 +36,16 @@ export interface HealthSignal {
 
 export interface AccountHealth {
   connectionId: string;
-  score: number; // 0-100, rounded; 0 when state is 'unknown'
+  /**
+   * 0-100, or NULL when there is no basis for a score at all.
+   *
+   * Null rather than 0 because 0 reads as "scored, and terrible" -- the
+   * audit caught a DISCONNECTED account reporting score 100 with state
+   * 'unknown', which is worse still. Per the capability-health standard,
+   * disconnected and suspended connections have no health score and do not
+   * contribute to provider-level health.
+   */
+  score: number | null;
   state: HealthState;
   signals: HealthSignal[];
 }
@@ -169,8 +178,24 @@ export function computeHealth(
     denom += s.weight;
   }
 
+  // Nothing measurable at all: no score, rather than a 0 that reads as a
+  // failing grade.
   if (denom === 0) {
-    return { connectionId: conn.id, score: 0, state: 'unknown', signals };
+    return { connectionId: conn.id, score: null, state: 'unknown', signals };
+  }
+
+  /**
+   * A disconnected connection is not being collected from, so there is no
+   * current evidence to score. Returning early means it cannot contribute a
+   * number to any provider rollup either.
+   *
+   * The audit found this reported as `score: 100, state: unknown` -- the
+   * state was corrected but the score was left, so an aggregate that read
+   * `score` still saw a perfect account. AWS was summarised as 100% healthy
+   * with one of two connections disconnected.
+   */
+  if (conn.status === 'disconnected') {
+    return { connectionId: conn.id, score: null, state: 'unknown', signals };
   }
 
   const score = Math.round((weighted / denom) * 100);
@@ -193,9 +218,6 @@ export function computeHealth(
   else if (score >= 85) state = hasUnknownSignal ? 'warning' : 'healthy';
   else if (score >= 60) state = 'warning';
   else state = 'critical';
-
-  // A disconnected connection short-circuits to unknown regardless of score.
-  if (conn.status === 'disconnected') state = 'unknown';
 
   return { connectionId: conn.id, score, state, signals };
 }
