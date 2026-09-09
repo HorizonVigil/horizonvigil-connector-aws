@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit, checkCloudAccountLimit, getOrgConnectionIds, getActiveScope, inFilter, requirePermittedConnection } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit, checkCloudAccountLimit, getOrgConnectionIds, getActiveScope, inFilter, requirePermittedConnection, strongEtag, versionParts, requirePrecondition } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '../lib/crypto';
 import { validateCandidate, activateCandidate, rollbackToPrevious } from '../lib/credentialRotation';
@@ -250,12 +250,31 @@ accountsRoutes.put('/accounts/:id', (c) =>
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
 
-    const [existing] = await db.select<{ environment: string }[]>('cloud_connections', {
-      select: 'environment',
+    const [existing] = await db.select<{ id: string; environment: string; updated_at: string | null }[]>('cloud_connections', {
+      select: 'id,environment,updated_at',
       filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     if (!existing) return errJson(404, 'Account not found');
     await requireMenuPermissionWithAbac(db, auth.userId, orgId, 'cloud', 'write', { environment: existing.environment, provider: 'aws' });
+
+    /**
+     * §14.4 optimistic concurrency.
+     *
+     * The failure this prevents is quiet, which is why it needs a mechanism
+     * rather than care: two people open this connection's settings, one
+     * changes the scan regions and the other the schedule, and the second
+     * save overwrites the first with a payload built from stale data.
+     * Nothing errors and nothing is logged; the first person finds their
+     * change missing days later and reasonably concludes we lost it.
+     *
+     * `required: false` while the client is migrated. A caller that sends
+     * no If-Match keeps working exactly as before; a caller that sends a
+     * STALE one is refused either way, so opting out of the requirement
+     * does not opt out of the check. The ETag is returned on every response
+     * below so clients can adopt it before it is enforced.
+     */
+    const etag = await strongEtag(versionParts(existing));
+    requirePrecondition(c.req.header('If-Match'), etag, { required: false });
 
     const body = (await c.req.json().catch(() => ({}))) as UpdateBody;
     const patch: Record<string, unknown> = {};
@@ -273,7 +292,11 @@ accountsRoutes.put('/accounts/:id', (c) =>
 
     await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.updated', targetType: 'cloud_connection', targetId: c.req.param('id'), metadata: patch });
     const { credentials_encrypted: _omit, ...safe } = rows[0];
-    return okJson(safe);
+    // The NEW version, so the client can chain a second edit without
+    // re-reading -- and so a client that just adopted If-Match has
+    // somewhere to get its first value.
+    const newEtag = await strongEtag(versionParts(safe as { id?: unknown; updated_at?: unknown }));
+    return okJson(safe, 200, { ETag: newEtag });
   }),
 );
 
