@@ -89,41 +89,16 @@ interface IngestStepBody {
  * resource+day split across two different steps' batches will overwrite
  * rather than sum, since PostgREST upsert has no additive mode.
  */
-curRoutes.post('/accounts/:id/cur/ingest-step', (c) =>
-  guarded(async () => {
-    const auth = getAuthContext(c.req.raw);
-    const orgId = requireOrgId(c.req.raw);
-    const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
-
-    const body = (await c.req.json().catch(() => ({}))) as IngestStepBody;
-    if (!body.reportKey) return errJson(400, 'reportKey is required');
-    const skipRows = body.skipRows ?? 0;
-
-    const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
-    if (!connection) return errJson(404, 'Account not found');
-    if (!connection.cur_s3_bucket || !connection.cur_s3_region) return errJson(400, 'No Cost & Usage Report configured for this account yet.');
-    const resolved = await resolveCredentials(c.env, connection);
-    if ('error' in resolved) return errJson(400, resolved.error);
-
-    const result = await parseCurBatch(resolved.creds, connection.cur_s3_bucket, connection.cur_s3_region, body.reportKey, skipRows);
-    if ('error' in result) return errJson(400, result.error);
-
-    if (result.costRows.length > 0) {
-      const grouped = new Map<string, { resource_id: string; service: string; region: string | null; usage_date: string; unblended_cost: number }>();
-      for (const row of result.costRows) {
-        const key = `${row.resource_id}:${row.usage_date}`;
-        const existing = grouped.get(key);
-        if (existing) existing.unblended_cost += row.unblended_cost;
-        else grouped.set(key, { ...row });
-      }
-      const rows = Array.from(grouped.values()).map((row) => ({ connection_id: connection.id, ...row, unblended_cost: Math.round(row.unblended_cost * 100) / 100 }));
-      await db.insert('resource_costs?on_conflict=connection_id,resource_id,usage_date', rows, 'resolution=merge-duplicates,return=minimal');
-    }
-
-    return okJson({ rowsProcessed: result.rowsProcessed, rowsIngestedThisBatch: result.rowsIngestedThisBatch, done: result.done });
-  }),
-);
+/**
+ * REMOVED (Phase 12 verification pass): `POST .../cur/ingest-step`, the
+ * per-chunk endpoint the browser's unbounded ingest loop used to call.
+ *
+ * Phase 7 replaced it with server-owned cur-runs; the route stayed mounted
+ * and I wrongly reported it removed after probing it with the wrong method.
+ * Ingestion is an idempotent upsert, so this could not corrupt data -- but
+ * it could advance a billing period's ingest with nothing recording where
+ * it stopped, which is the exact defect Phase 7 exists to fix.
+ */
 
 /** POST /api/aws-accounts/accounts/:id/cur/finalize — called once after every reportKey finishes ingesting; records the sync timestamp. */
 curRoutes.post('/accounts/:id/cur/finalize', (c) =>

@@ -786,26 +786,7 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
  * always fit inside one invocation's CPU/subrequest budget regardless of
  * how many scanners/regions exist in total.
  */
-discoveryRoutes.post('/accounts/:id/discovery/run-step', (c) =>
-  guarded(async () => {
-    const auth = getAuthContext(c.req.raw);
-    const orgId = requireOrgId(c.req.raw);
-    const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
-    const body = (await c.req.json().catch(() => ({}))) as { stepId?: string };
-    const stepId = body.stepId;
-    if (!stepId) return errJson(400, 'stepId is required, e.g. "regional:ec2:us-east-1", "global:iam", or "finding:guardduty:us-east-1"');
-
-    if (stepId.startsWith('finding:')) {
-      return okJson(await runFindingStep(db, orgId, auth.userId, c.env, c.req.param('id'), stepId));
-    }
-    if (stepId.startsWith('metric:')) {
-      return okJson(await runMetricStep(db, orgId, auth.userId, c.env, c.req.param('id'), stepId));
-    }
-    return okJson(await runResourceStep(db, orgId, auth.userId, c.env, c.req.param('id'), stepId));
-  }),
-);
 
 export interface StepErrorInput { message: string; severity: 'error' | 'info' }
 
@@ -959,20 +940,24 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   return { totalResources: activeCount, deleted: vanishedIds.length, findingsResolved: resolvedFindings.length, categoryCounts: activeCategoryCounts, errors: stepErrors };
 }
 
-discoveryRoutes.post('/accounts/:id/discovery/finalize', (c) =>
-  guarded(async () => {
-    const auth = getAuthContext(c.req.raw);
-    const orgId = requireOrgId(c.req.raw);
-    const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
-
-    const body = (await c.req.json().catch(() => ({}))) as { runStartedAt?: string; stepErrors?: StepErrorInput[]; totalSteps?: number; degradedResourceTypes?: string[] };
-    if (!body.runStartedAt) return errJson(400, 'runStartedAt is required');
-
-    const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
-    if (!connection) return errJson(404, 'Account not found');
-
-    const outcome = await runFinalize(db, orgId, auth.userId, connection, body.runStartedAt, body.stepErrors ?? [], c.env, COVERED_RESOURCE_TYPES, body.totalSteps ?? 0, body.degradedResourceTypes ?? []);
-    return okJson(outcome);
-  }),
-);
+/**
+ * REMOVED (Phase 12 verification pass): the browser-era worker endpoints
+ * `POST .../discovery/run-step` and `POST .../discovery/finalize`.
+ *
+ * The audit's disposition for both was "internal worker operation only" /
+ * "remove; server computes terminal result". Phase 1 removed the browser's
+ * calls and Phase 3 replaced the whole loop with durable collection runs,
+ * but the ROUTES stayed mounted. I previously reported them as removed --
+ * that was wrong. I probed with GET on POST-only routes, read the 404 as
+ * "gone", and did not check the source.
+ *
+ * They were not merely redundant. A hand-crafted authenticated request
+ * could drive a scan step outside the durable job machinery entirely: no
+ * lease, no checkpoint, no run row. The partial unique index that makes
+ * "one job despite repeated clicks" true guards `collection_runs`, and a
+ * caller who never creates one is not covered by it.
+ *
+ * The step FUNCTIONS (runResourceStep, runFindingStep, runMetricStep,
+ * runFinalize) are exported and unchanged -- collectionRuns.ts imports them
+ * directly. Only the HTTP surface is gone.
+ */
