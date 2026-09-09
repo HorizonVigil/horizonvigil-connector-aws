@@ -129,6 +129,21 @@ export async function checkCostExplorer(creds: AwsCreds): Promise<PermissionChec
     });
     if (!res.ok) {
       if (res.errorCode === 'DataUnavailableException') return { service: 'cost_explorer', label: 'Cost Explorer', status: 'not_applicable', detail: 'Cost Explorer has not accumulated data for this account yet', verified: false };
+      /**
+       * Cost Explorer must be switched on in Billing preferences before ANY
+       * principal can query it, and AWS reports that as a plain error rather
+       * than a distinct code. Verified live on a real account: the message is
+       * "User not enabled for cost explorer access".
+       *
+       * This matters because it is the reason cost renders as "no billing
+       * data" for this account -- and "enable Cost Explorer in Billing
+       * preferences" is a completely different instruction from "your IAM
+       * role is missing ce:GetCostAndUsage". Reporting it as a failure sends
+       * someone to fix a policy that is already correct.
+       */
+      if (/not enabled for cost explorer/i.test(res.errorMessage ?? '')) {
+        return { service: 'cost_explorer', label: 'Cost Explorer', status: 'not_applicable', detail: 'Cost Explorer is not enabled for this AWS account. Enable it in the Billing console; data appears within ~24 hours.', verified: false };
+      }
       return { service: 'cost_explorer', label: 'Cost Explorer', status: res.status === 403 ? 'denied' : 'error', detail: res.errorMessage ?? res.errorCode ?? `HTTP ${res.status}`, verified: false };
     }
     return { service: 'cost_explorer', label: 'Cost Explorer', status: 'granted', detail: 'Read access to Cost Explorer confirmed', verified: false };
