@@ -1,6 +1,7 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit, checkCloudAccountLimit, getOrgConnectionIds, getActiveScope, inFilter } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit, checkCloudAccountLimit, getOrgConnectionIds, getActiveScope, inFilter, requirePermittedConnection } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '../lib/crypto';
+import { validateCandidate, activateCandidate, rollbackToPrevious } from '../lib/credentialRotation';
 import { isConnectionPurgeEnabled, purgeDisabledResponse, isAssumeRoleEnabled, assumeRoleDisabledResponse } from '../lib/capabilities';
 
 export const accountsRoutes = new Hono<{ Bindings: Env }>();
@@ -299,8 +300,8 @@ accountsRoutes.put('/accounts/:id/credentials', (c) =>
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
     await enforceRateLimit(db, `aws-account:rotate-credentials:${orgId}`, 30, 3600);
 
-    const rows = await db.select<{ id: string; connection_method: string }[]>('cloud_connections', {
-      select: 'id,connection_method',
+    const rows = await db.select<{ id: string; connection_method: string; aws_account_id: string; credentials_encrypted: unknown }[]>('cloud_connections', {
+      select: 'id,connection_method,aws_account_id,credentials_encrypted',
       filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     const account = rows[0];
@@ -313,27 +314,51 @@ accountsRoutes.put('/accounts/:id/credentials', (c) =>
     if (!body.accessKeyId || !looksLikeValidAccessKeyId(body.accessKeyId)) return errJson(400, 'accessKeyId does not look like a valid AWS access key id');
     if (!body.secretAccessKey || body.secretAccessKey.length < 20) return errJson(400, 'secretAccessKey is required');
 
-    const credentials_encrypted = await encryptCredentials(c.env.ENCRYPTION_KEY, {
-      accessKeyId: body.accessKeyId,
-      secretAccessKey: body.secretAccessKey,
+    /**
+     * Validate BEFORE activating (§5, AWS-P0-03).
+     *
+     * This used to encrypt the new keys straight over the live credential,
+     * set the connection to `pending`, and rely on a later validation to
+     * notice a problem. A typo therefore took a working connection down, and
+     * the credential that worked had already been destroyed -- nothing to
+     * roll back to.
+     *
+     * Now: prove the candidate, archive the outgoing secret, then swap. A
+     * failed candidate never touches the live connection, so the worst
+     * outcome of a bad paste is an error message.
+     */
+    const candidate = { accessKeyId: body.accessKeyId, secretAccessKey: body.secretAccessKey };
+    const validation = await validateCandidate(c.env, candidate, account.aws_account_id);
+    if (!validation.ok) {
+      await writeAuditLog(db, {
+        orgId, actorId: auth.userId, action: 'aws_account.credential_rotation_rejected',
+        targetType: 'cloud_connection', targetId: c.req.param('id'),
+        metadata: { code: validation.code },
+      });
+      return c.json({ ok: false, code: validation.code, error: validation.message }, 400);
+    }
+
+    const versionId = await activateCandidate(db, c.env, {
+      orgId,
+      connectionId: account.id,
+      actorId: auth.userId,
+      candidate,
+      identityArn: validation.identityArn ?? null,
+      accountId: validation.accountId ?? null,
+      outgoingEncrypted: account.credentials_encrypted,
     });
 
-    const updated = await db.update<Record<string, unknown>[]>(
-      'cloud_connections',
-      { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
-      {
-        credentials_encrypted,
-        masked_access_key: maskAccessKey(body.accessKeyId),
-        key_rotated_at: new Date().toISOString(),
-        status: 'pending',
-        error_message: null,
-        updated_at: new Date().toISOString(),
-      },
-    );
+    await writeAuditLog(db, {
+      orgId, actorId: auth.userId, action: 'aws_account.credentials_rotated',
+      targetType: 'cloud_connection', targetId: c.req.param('id'),
+      metadata: { versionId, identityArn: validation.identityArn, rollbackAvailable: Boolean(account.credentials_encrypted) },
+    });
 
-    await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.credentials_updated', targetType: 'cloud_connection', targetId: c.req.param('id') });
-    const { credentials_encrypted: _omit, ...safe } = updated[0];
-    return okJson(safe);
+    const rows2 = await db.select<Record<string, unknown>[]>('cloud_connections', {
+      select: LIST_SELECT,
+      filters: { id: `eq.${account.id}` },
+    });
+    return okJson({ ...rows2[0], credentialVersionId: versionId, validatedIdentity: validation.identityArn });
   }),
 );
 
@@ -350,6 +375,33 @@ interface UpdateRoleBody {
  * the only real way to fix a cross-account-role connection whose role was
  * misconfigured or needs re-pointing.
  */
+/**
+ * POST /accounts/:id/credentials/rollback — restore the previous credential.
+ *
+ * Only possible because activation archives the outgoing encrypted blob
+ * before overwriting it. Without that step this endpoint could exist but
+ * could not do anything, which is worse than not offering it.
+ */
+accountsRoutes.post('/accounts/:id/credentials/rollback', (c) =>
+  guarded(async () => {
+    const auth = getAuthContext(c.req.raw);
+    const orgId = requireOrgId(c.req.raw);
+    const db = createDb(c.env, auth.accessToken);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
+    await requirePermittedConnection(db, orgId, auth.userId, c.req.param('id'), getActiveScope(c.req.raw, orgId));
+
+    const result = await rollbackToPrevious(db, c.req.param('id'));
+    if (!result.ok) return c.json({ ok: false, code: result.code, error: result.message }, 409);
+
+    await writeAuditLog(db, {
+      orgId, actorId: auth.userId, action: 'aws_account.credential_rollback',
+      targetType: 'cloud_connection', targetId: c.req.param('id'),
+      metadata: { restoredVersionId: result.versionId },
+    });
+    return okJson({ restoredVersionId: result.versionId });
+  }),
+);
+
 accountsRoutes.put('/accounts/:id/role', (c) =>
   guarded(async () => {
     const auth = getAuthContext(c.req.raw);
