@@ -21,6 +21,25 @@ interface ParsedDetail {
   requestParameters?: unknown; responseElements?: unknown; managementEvent?: boolean; eventType?: string;
 }
 
+/**
+ * AWS access-key identifiers, temporary (ASIA) or long-lived (AKIA).
+ *
+ * AWS-P1-05: "Temporary AWS session access-key identifiers can appear in
+ * event summaries." CloudTrail puts the access key id in `Username` for
+ * some event shapes -- notably an IAM user acting without a resolvable user
+ * name. Rule 12 forbids exposing temporary access-key IDs in UI, logs,
+ * events, reports or telemetry, and a change feed is all four at once.
+ *
+ * Redacted rather than dropped: "an IAM principal we could not name" is
+ * still useful attribution, and blanking the actor entirely would make the
+ * row look like a system event.
+ */
+const ACCESS_KEY_ID = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
+
+function redactKeyIds(value: string | null): string | null {
+  return value === null ? null : value.replace(ACCESS_KEY_ID, '[redacted access key]');
+}
+
 function mapEvent(e: RawCloudTrailEvent) {
   let detail: ParsedDetail = {};
   try { detail = JSON.parse(e.CloudTrailEvent) as ParsedDetail; } catch { /* leave detail empty if AWS ever returns a malformed string */ }
@@ -29,9 +48,9 @@ function mapEvent(e: RawCloudTrailEvent) {
     eventName: e.EventName,
     eventTime: new Date(e.EventTime * 1000).toISOString(),
     eventSource: e.EventSource,
-    username: e.Username ?? detail.userIdentity?.userName ?? null,
+    username: redactKeyIds(e.Username ?? detail.userIdentity?.userName ?? null),
     userIdentityType: detail.userIdentity?.type ?? null,
-    userIdentityArn: detail.userIdentity?.arn ?? detail.userIdentity?.sessionContext?.sessionIssuer?.arn ?? null,
+    userIdentityArn: redactKeyIds(detail.userIdentity?.arn ?? detail.userIdentity?.sessionContext?.sessionIssuer?.arn ?? null),
     sourceIpAddress: detail.sourceIPAddress ?? null,
     userAgent: detail.userAgent ?? null,
     awsRegion: detail.awsRegion ?? null,
@@ -94,9 +113,30 @@ cloudtrailEventsRoutes.get('/accounts/:id/cloudtrail-events', (c) =>
     const from = url.searchParams.get('from');
     const to = url.searchParams.get('to');
 
+    /**
+     * AWS-P1-05: this endpoint backs a surface called "Changes", and it was
+     * returning every Describe, List and Get call the account made. Read
+     * traffic dwarfs configuration changes by orders of magnitude, so the
+     * genuinely useful rows -- who changed what -- were buried.
+     *
+     * Default is now changes only. `includeReadOnly=true` brings the reads
+     * back for anyone who wants the full audit view.
+     *
+     * Pushed down to AWS as a LookupAttribute when we can, because filtering
+     * after the fact would return a page of 50 reads and display two rows.
+     * LookupEvents accepts exactly ONE attribute per call (an AWS
+     * constraint, not ours), so when the caller is already filtering by
+     * something else the ReadOnly filter is applied to the mapped results
+     * instead -- correct either way, just less efficient.
+     */
+    const includeReadOnly = url.searchParams.get('includeReadOnly') === 'true';
+    const callerFiltering = Boolean(attributeKey && attributeValue && LOOKUP_ATTRIBUTE_KEYS.has(attributeKey));
+
     const body: Record<string, unknown> = { MaxResults: 50 };
-    if (attributeKey && attributeValue && LOOKUP_ATTRIBUTE_KEYS.has(attributeKey)) {
+    if (callerFiltering) {
       body.LookupAttributes = [{ AttributeKey: attributeKey, AttributeValue: attributeValue }];
+    } else if (!includeReadOnly) {
+      body.LookupAttributes = [{ AttributeKey: 'ReadOnly', AttributeValue: 'false' }];
     }
     // CloudTrail only retains 90 days of default Event History regardless of
     // what's requested, so an unset "from" doesn't need clamping here — AWS
@@ -118,6 +158,23 @@ cloudtrailEventsRoutes.get('/accounts/:id/cloudtrail-events', (c) =>
     }
 
     const responseBody = result.body as { Events?: RawCloudTrailEvent[]; NextToken?: string };
-    return okJson({ events: (responseBody.Events ?? []).map(mapEvent), nextToken: responseBody.NextToken ?? null, region });
+    let events = (responseBody.Events ?? []).map(mapEvent);
+
+    // The fallback path described above. `readOnly` is null when CloudTrail
+    // did not state it; such an event is KEPT, because dropping an event we
+    // cannot classify would silently hide changes.
+    const filteredLocally = callerFiltering && !includeReadOnly;
+    if (filteredLocally) events = events.filter((e) => e.readOnly !== true);
+
+    return okJson({
+      events,
+      nextToken: responseBody.NextToken ?? null,
+      region,
+      // Stated so the UI never has to guess which view it is showing.
+      filter: {
+        includeReadOnly,
+        appliedBy: includeReadOnly ? 'none' : filteredLocally ? 'server' : 'aws',
+      },
+    });
   }),
 );
