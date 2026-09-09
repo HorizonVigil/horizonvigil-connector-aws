@@ -21,6 +21,7 @@ import { logsRoutes } from './routes/logs';
 import { bulkImportRoutes } from './routes/bulkImport';
 import { identitiesRoutes } from './routes/identities';
 import { healthRoutes } from './routes/health';
+import { collectionRunRoutes } from './routes/collectionRuns';
 import { capabilityRoutes } from './routes/capabilities';
 
 const app = createApp();
@@ -64,6 +65,7 @@ app.route('/api/aws-accounts', bulkImportRoutes);
 app.route('/api/aws-accounts', identitiesRoutes);
 app.route('/api/aws-accounts', healthRoutes);
 app.route('/api/aws-accounts', capabilityRoutes);
+app.route('/api/aws-accounts', collectionRunRoutes);
 
 
 /**
@@ -110,5 +112,6 @@ app.route('/api/v1/aws', bulkImportRoutes);
 app.route('/api/v1/aws', identitiesRoutes);
 app.route('/api/v1/aws', healthRoutes);
 app.route('/api/v1/aws', capabilityRoutes);
+app.route('/api/v1/aws', collectionRunRoutes);
 
 export default app;
