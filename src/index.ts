@@ -24,7 +24,13 @@ import { healthRoutes } from './routes/health';
 import { collectionRunRoutes } from './routes/collectionRuns';
 import { capabilityRoutes } from './routes/capabilities';
 
-const app = createApp();
+// §14.6: publish this service's contract at /openapi.json, generated
+// from the routes registered below rather than hand-maintained.
+const app = createApp({
+  title: 'HorizonVigil AWS Connector API',
+  version: '1.0.0',
+  description: 'AWS connection lifecycle, credential versions, permission snapshots, capability health and durable collection runs.',
+});
 
 app.get('/', (c) => okJson({ service: 'connector-aws', status: 'ok' }));
 
