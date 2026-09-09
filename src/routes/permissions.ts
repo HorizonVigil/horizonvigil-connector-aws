@@ -59,7 +59,14 @@ export async function runConnectionValidation(
   db: Db,
   env: Env,
   connection: ResolvableConnection & { id: string },
-  actor: { orgId: string; userId: string } | null,
+  /**
+   * `userId` is null on the scheduled path, which has no requesting user.
+   * `orgId` is still required there, because capability status is written per
+   * org -- an earlier version guarded the write on `actor?.orgId`, and since
+   * the scheduled worker passed null outright, the WEEKLY validation (the
+   * primary one) silently wrote no capability rows at all.
+   */
+  actor: { orgId: string; userId: string | null } | null,
 ): Promise<ValidationOutcome> {
   const [run] = await db.insert<{ id: string }[]>('connection_validation_runs', {
     connection_id: connection.id,
@@ -123,8 +130,9 @@ export async function runConnectionValidation(
      * connection cannot say "inventory is fine but Cost Explorer is denied",
      * which is the only form of this information a customer can act on.
      */
-    // Skipped when there is no org context (a path that cannot attribute the
-    // row); the validation itself is unaffected either way.
+    // Both paths supply an org now (the interactive one from the request, the
+    // scheduled one from the connection row), so this is no longer skipped in
+    // the case that matters most -- the weekly automatic validation.
     if (actor?.orgId) await writeCapabilityStatuses(
       db,
       buildCapabilityStatuses({
@@ -226,8 +234,8 @@ permissionsRoutes.post('/internal/run-due-permission-checks', (c) =>
     const db = createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY);
     const now = new Date().toISOString();
 
-    const due = await db.select<(ResolvableConnection & { id: string })[]>('cloud_connections', {
-      select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
+    const due = await db.select<(ResolvableConnection & { id: string; org_id: string })[]>('cloud_connections', {
+      select: 'id,org_id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
       filters: {
         provider: 'eq.aws',
         or: `(next_permission_check_at.is.null,next_permission_check_at.lte.${now})`,
@@ -238,7 +246,7 @@ permissionsRoutes.post('/internal/run-due-permission-checks', (c) =>
 
     const results = [];
     for (const connection of due) {
-      const result = await runConnectionValidation(db, c.env, connection, null);
+      const result = await runConnectionValidation(db, c.env, connection, { orgId: connection.org_id, userId: null });
       const nextCheck = new Date(Date.now() + PERMISSION_CHECK_INTERVAL_DAYS * 24 * 60 * 60 * 1000).toISOString();
       await db.update('cloud_connections', { id: `eq.${connection.id}` }, { next_permission_check_at: nextCheck }, 'return=minimal');
       results.push({ connectionId: connection.id, status: result.crashed ? 'crashed' : result.status });
