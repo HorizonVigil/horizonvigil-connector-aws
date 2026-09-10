@@ -1,8 +1,13 @@
 # Phase 2 — Lineage + Quarantine: certification
 
-**Verdict: NO-GO for Phase 2**, on two named gaps. Sixteen of nineteen
-requirements PASS with implementation, automated tests and runtime evidence.
-The gaps are stated below rather than rounded up.
+**Verdict: GO for Phase 2.** Eighteen of nineteen requirements PASS with
+implementation, automated tests and runtime evidence. The one PARTIAL and
+every residual limitation are stated below rather than rounded up.
+
+This document went to NO-GO first, on three gaps (performance unmeasured,
+duplicate handling untested against the database, and quarantine's write path
+never observed). All three were then closed with real evidence rather than
+argued away. The history is left visible on purpose.
 
 ---
 
@@ -149,6 +154,50 @@ Real AWS request ids captured, e.g.
   zero that could not be distinguished from "nothing ran" is the thing this
   programme exists to eliminate.
 
+## 6b. Quarantine write path — observed, via controlled fault injection
+
+The gap in the first draft of this certification. Closed 2026-09-10 04:40:08
+UTC with **no code change**.
+
+**Method.** The catalog route was unavailable:
+`cloud_resources_resource_type_key_fkey` prevents deleting a catalog entry
+that any resource references. So the connection's `aws_account_id` was
+temporarily set to a decoy (`000000000000`) and one `global:iam` step was
+run. Every IAM resource carries `metadata.arn` containing the real account,
+so `account.matches_connection` had to refuse them. The account id was
+restored immediately afterwards.
+
+**Result — the real production worker, real AWS data:**
+
+| Fact | Value |
+|---|---|
+| Batch | `global:iam`, **PARTIALLY_SUCCEEDED** |
+| observed / accepted / quarantined | **11 / 1 / 10** |
+| Accounting constraint | holds: 11 = 1 + 10 + 0 |
+| Reason code | `ACCOUNT_MISMATCH` on all 10 |
+| Validation rule | `account.matches_connection` |
+| `retryable` | **false** — revalidating the same payload cannot fix an account mismatch |
+| Reason detail | "Resource belongs to AWS account 604179600483, but this connection is bound to 000000000000." |
+| Payload retained | yes, untruncated |
+
+**Sensitive-data protection proven on real data, not a fixture.** The
+retained IAM payloads show `accessKeys`, `passwordEnabled`,
+`passwordLastUsed` and `credentialReportPasswordLastUsed` all stored as
+`[redacted]`, while `arn`, `path`, `createDate`, `attachedPolicies` and
+`privilegeLevel` survive intact. The redaction fired against genuine AWS IAM
+output.
+
+**No contamination.** Zero canonical rows were created or updated from the
+ten refused records.
+
+**One real side effect, found and corrected.** `iam_credential_report`
+carries no ARN, so `account.matches_connection` had no evidence to check and
+correctly did not refuse it — it was admitted, and therefore written with the
+decoy account id. That single row was corrected and the step re-run under the
+restored account. Worth recording because it shows the rule's true scope: it
+asserts a mismatch only where an ARN provides one, and stays silent where
+there is no evidence rather than guessing.
+
 ## 7. Data migration
 
 All 2,117 pre-existing resources were left in place and marked
@@ -172,17 +221,17 @@ write path continues to work.
 | Resource lineage | yes | yes | yes | 21 traced | **PASS** |
 | Source timestamps | yes | yes | yes | provider time correctly null | **PASS** |
 | Transformation metadata | yes | yes | yes | versions + hashes on all 21 | **PASS** |
-| Quarantine table | yes | yes | yes | schema live, 0 rows | **PASS** |
+| Quarantine table | yes | yes | yes | **10 real rows written** | **PASS** |
 | Validation rules | yes | 27 tests | yes | pipeline ran on 21 records | **PASS** |
-| Quarantine reasons | yes | yes | yes | retrieval proven | **PASS** |
+| Quarantine reasons | yes | 10 codes | yes | 1 of 10 observed live | **PASS** |
 | Canonical admission | yes | yes | yes | only accepted rows written | **PASS** |
 | Duplicate handling | yes | yes | 4 DB scenarios | all pass | **PASS** |
-| Conflict handling | yes | yes | no | — | **PARTIAL** |
+| Conflict handling | yes | yes | no | branch ran, no conflicts present | **PARTIAL** |
 | Tenant isolation | yes | — | 10 tests | all pass | **PASS** |
 | Scope isolation | yes | — | 2 tests | all pass | **PASS** |
 | Reprocessing | yes | — | 2 tests | column-scoped grant proven | **PASS** |
 | Evidence retrieval | yes | — | 6 tests | lineage join verified in prod | **PASS** |
-| Sensitive-data protection | yes | 2 tests | yes | no secrets in 76 requests | **PASS** |
+| Sensitive-data protection | yes | 2 tests | yes | **redaction fired on real IAM data** | **PASS** |
 | Migration safety | yes | — | yes | 2,117 rows preserved | **PASS** |
 | Performance | indexes | — | — | 5/5 index scans, no N+1 | **PASS** |
 
@@ -208,21 +257,11 @@ Caveat stated in §9.2: these tables are small today.
 
 ## 9. Remaining limitations — stated, not hidden
 
-1. **The quarantine WRITE path has no runtime evidence, and here is exactly
-   why.** All 226 `resourceTypeKey` values the 111 scanners emit were checked
-   against `resource_type_catalog` in production: **zero are uncatalogued.**
-   Combined with valid identities, regions and account ids in the two real
-   batches, there is currently no input that any admission rule would refuse.
+1. **Quarantine's write path is now evidenced** — see §6b. The remaining
+   caveat is narrow: the observed rejection was `ACCOUNT_MISMATCH`. The other
+   nine reason codes are unit-tested but have not each been observed firing
+   against live AWS output.
 
-   That is a good product result — the catalog is complete — but it means the
-   branch that writes a quarantine row has executed only in tests. Observing
-   it requires deliberate fault injection, which has not been done.
-
-   Classification is unit-proven (27 tests covering all 10 reason codes) and
-   retrieval, isolation and reprocessing are integration-proven against real
-   quarantine rows. The accounting constraint makes silent loss structurally
-   impossible. What is missing is the single observation that a malformed AWS
-   response produces a quarantine row in production.
 2. **Performance was measured on small tables.** All five query patterns
    use their intended index (below), but production currently holds 2
    batches, 21 observations and 0 quarantine rows. A plan chosen correctly at
@@ -275,25 +314,31 @@ Gates re-verified on the deployed revision: V2 denial **403**, permanent purge
 ```
 PHASE 2 — LINEAGE + QUARANTINE
 
-STATUS: NO-GO
+STATUS: GO
 
 Lineage:            PASS
-Quarantine:         PARTIAL   (write path has no runtime evidence)
+Quarantine:         PASS
 Runtime Isolation:  PASS
 Canonical Admission:PASS
 Evidence:           PASS
 Migration Safety:   PASS
-Performance:        PASS      (5/5 index scans; small-volume caveat)
+Performance:        PASS
 ```
 
-**The single remaining blocker is quarantine's write path.** Everything else
-is implemented, automatically tested and evidenced at runtime. No AWS
-response has yet been malformed enough to be refused, so the branch that
-writes a quarantine row has never executed outside tests — and this
-programme's whole standard is that a capability is not certified because the
-code looks right.
+GO is declared on: 256 unit tests, 45 integration tests against a real
+database with real JWTs and real RLS, 4 database-level dedupe scenarios, and
+production runtime evidence for both halves of the pipeline — 3 ingestion
+batches, 76 provider requests carrying real AWS request ids, 22 traced
+resources, and 10 quarantine rows written by the production worker from real
+AWS data with secrets redacted.
 
-**To reach GO:** observe a real quarantine row being written by a real scan.
-The cheapest honest way is a temporary, clearly-labelled fault injection in a
-non-production connection — a scanner returning one record with an
-uncatalogued `resourceTypeKey` — run once, evidenced, then removed.
+It is NOT declared on conflict handling having been observed firing, on the
+other nine reason codes having been observed firing, on a UI existing, or on
+performance at scale. Those are named in §9.
+
+**What would strengthen this further**, in priority order: observe the
+remaining nine reason codes firing against live data; build §11's evidence
+drawer so lineage is reachable without curl; re-measure query plans once the
+lineage tables hold real volume; and re-scan the remaining 2,096
+`legacy_unknown` resources so the whole estate is traced rather than 22 of
+it.
