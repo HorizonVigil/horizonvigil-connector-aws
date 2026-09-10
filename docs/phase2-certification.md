@@ -34,6 +34,20 @@ The single funnel is `runResourceStep` in `src/routes/discovery.ts`. Before
 this phase it mapped scanner output straight into the canonical upsert with
 no validation at all.
 
+**A correction to an earlier claim of mine.** I first reported that an
+unrecognised `resourceTypeKey` was "silently admitted into a catch-all
+'Others' category". Checking the constraint showed otherwise:
+`cloud_resources_resource_type_key_fkey` is a FOREIGN KEY to
+`resource_type_catalog.key`, so the insert was rejected with 23503 — failing
+the **entire step's upsert** and losing every valid record alongside the bad
+one. The `catalog?.category ?? 'Others'` fallback computed a category the
+database then refused.
+
+Phase 2's improvement is therefore different from the one I first described,
+and arguably larger: the offending record is quarantined with a stated
+reason, and **the other records in that batch are still admitted** instead of
+one unrecognised type destroying a whole step's collection.
+
 ## 2. Schema changes
 
 **New tables:** `ingestion_batches`, `provider_requests`,

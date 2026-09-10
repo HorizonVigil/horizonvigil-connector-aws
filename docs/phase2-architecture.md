@@ -24,10 +24,10 @@ runResourceStep()   src/routes/discovery.ts        ← THE admission funnel
   │   resolveCredentials
   │   scanner({ creds, region })
   │   ✗ no validation   ✗ no fingerprint   ✗ no lineage
-  │   catalog lookup:  category ?? 'Others'        ← unknown type ADMITTED
+  │   catalog lookup:  category ?? 'Others'        ← FK then rejects the
   ↓
 db.insert('cloud_resources?on_conflict=connection_id,resource_type_key,resource_id',
-          'resolution=merge-duplicates')
+          'resolution=merge-duplicates')   ← whole step fails on 23503
   ↓
 CANONICAL  (public.cloud_resources)
 ```
@@ -58,9 +58,21 @@ model, and no quarantine.
 
 ### The specific silent-admission paths found
 
-1. **Unknown resource type** → `catalog?.category ?? 'Others'`. A typo'd or
-   brand-new `resourceTypeKey` becomes a real inventory row in a catch-all
-   category. Nothing records that it was unrecognised.
+1. **Unknown resource type** → the record could not be admitted, but not
+   silently. `cloud_resources_resource_type_key_fkey` is a FOREIGN KEY from
+   `cloud_resources.resource_type_key` to `resource_type_catalog.key`, so an
+   uncatalogued type made the **entire step's upsert fail with 23503** —
+   taking every valid record in that batch down with it. The local
+   `catalog?.category ?? 'Others'` fallback computed a category that the
+   database then refused.
+
+   **This corrects an earlier statement in this document** that an unknown
+   type was "silently admitted in a catch-all category". It was not; it was
+   loudly rejected, along with everything else in the step. Phase 2's
+   improvement is therefore different from the one first claimed: the bad
+   record is quarantined and **the other records in the batch are still
+   admitted**, instead of one unrecognised type destroying a whole step's
+   collection.
 2. **No identity validation** — a `ScannedResource` with an empty
    `resourceId` upserts on a conflict key containing an empty string.
 3. **No account check** — a scanner returning a resource from a different
