@@ -74,10 +74,47 @@ jobs:
           case "${INTEGRATION_SUPABASE_ANON_KEY}" in
             *"<"*|*">"*) fail "INTEGRATION_SUPABASE_ANON_KEY still contains placeholder text. Set it to the real anon key." ;;
           esac
-          # A Supabase anon key is a JWT: three dot-separated segments.
+
+          # Both secrets are usually set in one sitting, so the value meant
+          # for DATABASE_URL landing here is a real and easy mistake -- and
+          # it is one an earlier version of this check let through, because
+          # it only asked whether the value contained two dots. A connection
+          # string ("...@db.<ref>.supabase.co:5432/postgres") contains two
+          # dots, so it passed, and the run then failed at sign-in with
+          # "Invalid API key" -- pointing at the database rather than at the
+          # paste. Name that case explicitly.
           case "${INTEGRATION_SUPABASE_ANON_KEY}" in
-            *.*.*) : ;;
-            *) fail "INTEGRATION_SUPABASE_ANON_KEY does not look like a JWT." ;;
+            postgres://*|postgresql://*)
+              fail "INTEGRATION_SUPABASE_ANON_KEY is a Postgres connection string, not an anon key. Check whether DATABASE_URL's value was pasted here by mistake." ;;
+          esac
+
+          # A Supabase anon key is a JWT: three base64url segments whose
+          # first decodes to a JSON header carrying "alg". Only the header is
+          # inspected -- it is the same for every Supabase key and carries no
+          # secret. Lengths are reported on failure because a wrong value is
+          # diagnosable by size (a real anon key runs to ~200 characters) and
+          # a length is not the secret; no value is ever echoed.
+          jwt_header=${INTEGRATION_SUPABASE_ANON_KEY%%.*}
+          jwt_rest=${INTEGRATION_SUPABASE_ANON_KEY#*.}
+          jwt_payload=${jwt_rest%%.*}
+          jwt_sig=${jwt_rest#*.}
+          if [ "$jwt_header" = "${INTEGRATION_SUPABASE_ANON_KEY}" ] \
+             || [ "$jwt_payload" = "$jwt_rest" ] \
+             || [ -z "$jwt_header" ] || [ -z "$jwt_payload" ] || [ -z "$jwt_sig" ]; then
+            fail "INTEGRATION_SUPABASE_ANON_KEY is not a three-segment JWT (it is ${#INTEGRATION_SUPABASE_ANON_KEY} characters long)."
+          fi
+
+          # base64url -> base64, then pad to a multiple of 4 so base64 -d
+          # accepts it; JWT segments are unpadded by spec.
+          b64=$(printf '%s' "$jwt_header" | tr '_-' '/+')
+          case $(( ${#b64} % 4 )) in
+            2) b64="${b64}==" ;;
+            3) b64="${b64}=" ;;
+          esac
+          decoded=$(printf '%s' "$b64" | base64 -d 2>/dev/null || true)
+          case "$decoded" in
+            *'"alg"'*) : ;;
+            *) fail "INTEGRATION_SUPABASE_ANON_KEY's first segment is not a JWT header (the key is ${#INTEGRATION_SUPABASE_ANON_KEY} characters long; a Supabase anon key is roughly 200). Copy it from Settings > API > Project API keys > anon public." ;;
           esac
         env:
           INTEGRATION_SUPABASE_URL: ${{ secrets.INTEGRATION_SUPABASE_URL }}
