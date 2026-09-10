@@ -150,6 +150,24 @@ describe('aggregates never count another tenant', () => {
       expect(totals).not.toContain('999999999999');
     }
   });
+
+  it('the dashboard actually returns alerts, so the check above is not vacuous', async () => {
+    /**
+     * This assertion exists because the one above was vacuous for a while
+     * and nobody could tell. The integration project's `alerts` table had
+     * been hand-approximated with `title`/`created_at` where production has
+     * `alert_name`/`triggered_at`, so the dashboard's alerts query failed
+     * with 42703 and returned nothing for EVERY tenant. A leak through the
+     * alerts block would have passed.
+     *
+     * Naming Tenant A's own alert is what makes the negative meaningful:
+     * the block has to be capable of returning a row before "it returned no
+     * Tenant B row" says anything at all.
+     */
+    const res = await callApi(env, { path: '/api/aws-accounts/dashboard', token: tokenA, orgId: FIXTURES.tenantA.orgId });
+    expect(res.status).toBe(200);
+    expect(res.raw).toContain('A-scope-A-alert');
+  });
 });
 
 describe('disjoint scopes inside one tenant', () => {

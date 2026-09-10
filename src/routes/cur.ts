@@ -100,20 +100,15 @@ interface IngestStepBody {
  * it stopped, which is the exact defect Phase 7 exists to fix.
  */
 
-/** POST /api/aws-accounts/accounts/:id/cur/finalize — called once after every reportKey finishes ingesting; records the sync timestamp. */
-curRoutes.post('/accounts/:id/cur/finalize', (c) =>
-  guarded(async () => {
-    const auth = getAuthContext(c.req.raw);
-    const orgId = requireOrgId(c.req.raw);
-    const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
-
-    const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
-    if (!connection) return errJson(404, 'Account not found');
-
-    const now = new Date().toISOString();
-    await db.update('cloud_connections', { id: `eq.${connection.id}` }, { cur_last_synced_at: now }, 'return=minimal');
-    await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.cur_synced', targetType: 'cloud_connection', targetId: connection.id });
-    return okJson({ syncedAt: now });
-  }),
-);
+/**
+ * POST /accounts/:id/cur/finalize was REMOVED (Phase B cleanup, 2026-09-10).
+ *
+ * It stamped `cur_last_synced_at = now()` unconditionally, with no check that
+ * any report file had actually completed -- a direct bypass of the property
+ * curWorkflow.ts:markCurSyncComplete exists to hold, which stamps that column
+ * ONLY when every file finished. `cur_last_synced_at` is what the UI reads as
+ * "cost data current as of", so an authenticated caller could mark cost data
+ * current without a single row having been ingested.
+ *
+ * The durable cur-runs path stamps it correctly and is the only writer now.
+ */

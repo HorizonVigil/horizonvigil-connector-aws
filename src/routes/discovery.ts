@@ -112,7 +112,21 @@ import { scanAwsConfigFindings } from '../lib/scanners/awsConfigFindings';
 import { scanTrustedAdvisorFindings } from '../lib/scanners/trustedAdvisorFindings';
 import { scanEc2CpuMetrics } from '../lib/scanners/ec2Metrics';
 import type { ScannedResource, ScannerFn } from '../lib/scanners/types';
-import type { AwsCallFailure } from '../lib/awsApi';
+import type { AwsCallFailure, AwsCallRecord } from '../lib/awsApi';
+import { admitObservations } from '../lib/admission';
+import { NORMALIZATION_VERSION, SOURCE_SCHEMA_VERSION } from '../lib/lineage';
+import { closeBatch, openBatch, recordObservations, recordProviderRequests, recordQuarantine } from '../lib/ingestion';
+
+/**
+ * Cap on provider-request rows kept per ingestion batch.
+ *
+ * A scanner fanning out over hundreds of resources can make hundreds of
+ * calls, and a step's lineage should not become the largest thing in the
+ * database. When the cap bites it is RECORDED on the batch, not applied
+ * silently -- truncated evidence that claims to be complete is the exact
+ * failure this phase exists to remove.
+ */
+const MAX_PROVIDER_REQUESTS_PER_BATCH = 200;
 import type { ScannedFinding, FindingScannerFn } from '../lib/scanners/findingTypes';
 import type { ScannedMetric } from '../lib/scanners/metricTypes';
 import { computeFinalizeResult } from '../lib/discoveryFinalize';
@@ -459,41 +473,19 @@ export function regionsFor(connection: ConnectionForDiscovery): string[] {
 }
 
 /**
- * GET /api/aws-accounts/accounts/:id/discovery/steps — the ordered step
- * list this account's scan regions require, for the frontend's step-loop.
- * Also stamps scan_started_at, even though this is nominally a GET — this
- * is genuinely the first call of every interactive scan (see
- * syncContext.tsx's startDiscovery), so it's the one reliable place to
- * record "a scan began here" for the abandoned-scan sweep in
- * internalScan.ts to detect a tab that closed before finishing. Bumped to
- * requiring 'write' rather than 'read' to match that real side effect.
+ * GET /accounts/:id/discovery/steps was REMOVED (Phase B cleanup, 2026-09-10).
+ *
+ * It served the browser's step-loop, which Phase 1 removed and Phase 3
+ * replaced with durable, server-owned collection runs. `planSteps` in
+ * routes/collectionRuns.ts now builds the same plan server-side, so this was
+ * a second, unauthenticated-by-the-worker way to enumerate a scan.
+ *
+ * It also stamped `scan_started_at` as a side effect of a GET. Nothing else
+ * writes that column, so the abandoned-scan branch in internalStep.ts that
+ * reads it has been inert since the browser stopped calling this -- see the
+ * note there, which is now corrected rather than left implying a check that
+ * cannot fire.
  */
-discoveryRoutes.get('/accounts/:id/discovery/steps', (c) =>
-  guarded(async () => {
-    const auth = getAuthContext(c.req.raw);
-    const orgId = requireOrgId(c.req.raw);
-    const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
-
-    const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
-    if (!connection) return errJson(404, 'Account not found');
-
-    const regionalNames = Object.keys(REGIONAL_SCANNERS);
-    const globalNames = Object.keys(GLOBAL_SCANNERS);
-    const findingNames = Object.keys(FINDING_SCANNERS);
-    const regions = regionsFor(connection);
-    const steps = [
-      ...regions.flatMap((region) => regionalNames.map((name) => `regional:${name}:${region}`)),
-      ...globalNames.map((name) => `global:${name}`),
-      ...regions.flatMap((region) => findingNames.map((name) => `finding:${name}:${region}`)),
-      ...regions.map((region) => `metric:${METRIC_STEP_NAME}:${region}`),
-    ];
-
-    await db.update('cloud_connections', { id: `eq.${connection.id}` }, { scan_started_at: new Date().toISOString() }, 'return=minimal');
-
-    return okJson({ steps, regions, scannerCount: regionalNames.length + globalNames.length + findingNames.length + 1 });
-  }),
-);
 
 export interface StepResult {
   stepId: string;
@@ -689,17 +681,59 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
     console.warn(`[degraded] ${f.service}:${f.action} ${f.region} -> ${f.normalizedCode} after ${f.attempts} attempt(s); ${ownedTypes.length} resource type(s) protected from deletion this run`);
   };
 
+  /**
+   * Phase 2: every AWS call this step makes, for provider-request lineage.
+   *
+   * Capped because a scanner fanning out over hundreds of resources can make
+   * hundreds of calls, and a step's lineage should not become the largest
+   * thing in the database. The cap is recorded on the batch rather than
+   * silently applied -- a truncated record that claims to be complete is the
+   * failure mode this phase exists to remove.
+   */
+  const calls: AwsCallRecord[] = [];
+  let callsDropped = 0;
+  const onCall = (c: AwsCallRecord) => {
+    if (calls.length < MAX_PROVIDER_REQUESTS_PER_BATCH) calls.push(c);
+    else callsDropped += 1;
+  };
+
+  /**
+   * The batch is opened BEFORE the scanner runs, so a crash mid-step leaves a
+   * visible RUNNING batch rather than no evidence that ingestion was ever
+   * attempted. "No batch" and "a batch that failed" must not look the same.
+   */
+  const batch = await openBatch(db, {
+    orgId,
+    connectionId: connection.id,
+    accountNativeId: connection.aws_account_id ?? null,
+    collectionRunId: null,
+    collectionStepId: stepId,
+  });
+
   let scanned: ScannedResource[];
   try {
-    scanned = await scanner({ creds: { ...resolved.creds, onCallFailure }, region });
+    scanned = await scanner({ creds: { ...resolved.creds, onCallFailure, onCall }, region });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Scan failed';
+    await recordProviderRequests(db, batch, calls).catch(() => {});
+    await closeBatch(db, batch.id, {
+      observed: 0, accepted: 0, quarantined: 0, rejected: 0,
+      errorCount: 1, errorSummary: classifyError(message) === 'error' ? 'Scanner threw' : message, failed: true,
+    }).catch(() => {});
     return { stepId, resourceCount: 0, created: 0, error: message, errorSeverity: classifyError(message) };
   }
   const degradedResourceTypes = degraded.size > 0 ? [...degraded] : undefined;
   // Returned even on the zero-resource path: an empty result caused by a
   // failed call is exactly the case finalize must not read as deletion.
-  if (scanned.length === 0) return { stepId, resourceCount: 0, created: 0, degradedResourceTypes };
+  if (scanned.length === 0) {
+    await recordProviderRequests(db, batch, calls).catch(() => {});
+    await closeBatch(db, batch.id, {
+      observed: 0, accepted: 0, quarantined: 0, rejected: 0,
+      errorCount: degraded.size,
+      errorSummary: callsDropped > 0 ? `${callsDropped} provider request(s) not recorded (per-batch cap)` : null,
+    }).catch(() => {});
+    return { stepId, resourceCount: 0, created: 0, degradedResourceTypes };
+  }
 
   const typeKeys = [...new Set(scanned.map((r) => r.resourceTypeKey))];
   const [catalogRows, existing] = await Promise.all([
@@ -712,9 +746,36 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
   const catalogByKey = new Map(catalogRows.map((r) => [r.key, r]));
   const existingByKey = new Map(existing.map((r) => [`${r.resource_type_key}:${r.resource_id}`, r]));
 
+  /**
+   * Phase 2 admission. Before this, `scanned` went straight into the upsert:
+   * an unrecognised resourceTypeKey became a real inventory row in the
+   * 'Others' category, an empty resourceId upserted against a conflict key
+   * containing an empty string, and a resource belonging to a different AWS
+   * account was written under this connection's account id regardless.
+   *
+   * Every record now ends as exactly ACCEPTED or QUARANTINED, and the batch's
+   * accounting constraint makes a record that fell out of the pipeline
+   * entirely unrepresentable rather than merely unlikely.
+   *
+   * The catalog for the WHOLE scan is the authority on known types, not just
+   * the types this step happened to return -- otherwise every type would look
+   * unknown on a step that returned only unknown types.
+   */
+  const knownTypes = new Set(catalogRows.map((c) => c.key));
+  const admission = await admitObservations(scanned, {
+    orgId,
+    connectionId: connection.id,
+    accountNativeId: connection.aws_account_id ?? null,
+    knownResourceTypes: knownTypes,
+  });
+
   const now = new Date().toISOString();
   const createdEvents: Record<string, unknown>[] = [];
-  const rows = scanned.map((r) => {
+  // Only ACCEPTED records reach canonical state. This single substitution is
+  // the canonical-admission rule (§7): validated observation -> canonical
+  // resource, never raw provider response -> canonical resource.
+  const acceptedByIdentity = new Map(admission.accepted.map((a) => [`${a.resource.resourceTypeKey}${a.resource.resourceId}`, a]));
+  const rows = admission.accepted.map(({ resource: r }) => {
     const catalog = catalogByKey.get(r.resourceTypeKey);
     const key = `${r.resourceTypeKey}:${r.resourceId}`;
     const prior = existingByKey.get(key);
@@ -728,6 +789,21 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
       state: r.state ?? null, status: r.state === 'terminated' ? 'terminated' : r.state === 'stopped' ? 'stopped' : 'active',
       is_default: r.isDefault ?? false, tags: r.tags ?? {}, metadata: r.metadata ?? {}, relationships: r.relationships ?? {},
       last_seen_at: now, deleted_at: null,
+      // Lineage. `lineage_state: 'traced'` is only ever set here, on a row
+      // that actually went through admission -- rows that predate this keep
+      // 'legacy_unknown', which is the truth about them.
+      ingestion_batch_id: batch.id,
+      partition: acceptedByIdentity.get(`${r.resourceTypeKey}${r.resourceId}`)?.partition ?? null,
+      provider_resource_arn: acceptedByIdentity.get(`${r.resourceTypeKey}${r.resourceId}`)?.arn ?? null,
+      source_type: 'aws_api',
+      collector_observed_at: now,
+      ingested_at: now,
+      normalized_at: now,
+      source_schema_version: SOURCE_SCHEMA_VERSION,
+      normalization_version: NORMALIZATION_VERSION,
+      record_fingerprint: acceptedByIdentity.get(`${r.resourceTypeKey}${r.resourceId}`)?.recordFingerprint ?? null,
+      configuration_hash: acceptedByIdentity.get(`${r.resourceTypeKey}${r.resourceId}`)?.configurationHash ?? null,
+      lineage_state: 'traced',
     };
   });
 
@@ -735,10 +811,61 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
   // resource_id) — upsert via on_conflict rather than delete+insert, so a
   // resource's first_seen_at/created_at (and its row id, which lifecycle
   // events elsewhere may reference) survive a re-scan.
-  await db.insert('cloud_resources?on_conflict=connection_id,resource_type_key,resource_id', rows, 'resolution=merge-duplicates,return=minimal');
+  // `return=representation` (not minimal) because the canonical row ids are
+  // what link each observation back to the resource it was admitted into --
+  // without them, "show me the lineage for this resource" has nothing to
+  // join on.
+  const upserted = await db.insert<{ id: string; resource_type_key: string; resource_id: string }[]>(
+    'cloud_resources?on_conflict=connection_id,resource_type_key,resource_id',
+    rows,
+    'resolution=merge-duplicates,return=representation',
+  );
   if (createdEvents.length > 0) {
     await db.insert('resource_lifecycle_events', createdEvents, 'return=minimal');
   }
+
+  /**
+   * Evidence, written after canonical state so observations can point at real
+   * row ids.
+   *
+   * Wrapped so a lineage write cannot fail a scan that already succeeded: a
+   * missing lineage row is a visible gap, whereas a step that died recording
+   * one loses the inventory too. The failure is counted on the batch rather
+   * than swallowed silently.
+   */
+  const canonicalIdByIdentity = new Map((upserted ?? []).map((u) => [`${u.resource_type_key}${u.resource_id}`, u.id]));
+  let lineageErrors = 0;
+  await Promise.all([
+    recordProviderRequests(db, batch, calls).catch(() => { lineageErrors += 1; }),
+    recordObservations(db, {
+      batch,
+      accepted: admission.accepted,
+      canonicalIdByIdentity,
+      providerService: scannerName,
+      providerOperation: null,
+      collectorObservedAt: now,
+    }).catch(() => { lineageErrors += 1; }),
+    recordQuarantine(db, {
+      batch,
+      quarantined: admission.quarantined,
+      providerService: scannerName,
+      providerOperation: null,
+      collectorObservedAt: now,
+    }).catch(() => { lineageErrors += 1; }),
+  ]);
+
+  await closeBatch(db, batch.id, {
+    observed: admission.counts.observed,
+    accepted: admission.counts.accepted,
+    quarantined: admission.counts.quarantined,
+    rejected: admission.counts.rejected,
+    errorCount: degraded.size + lineageErrors,
+    // expected_count stays null: AWS list operations do not report how many
+    // results exist before paging them, so `expected = observed` would be a
+    // reconciliation that always passes and means nothing.
+    expectedCount: null,
+    errorSummary: callsDropped > 0 ? `${callsDropped} provider request(s) not recorded (per-batch cap)` : null,
+  }).catch(() => {});
 
   // monitoring_alarms sync -- piggybacks on the cloudwatch step's own
   // DescribeAlarms results (no second API call) so cloudops-observability's

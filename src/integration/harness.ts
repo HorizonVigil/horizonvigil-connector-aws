@@ -93,9 +93,16 @@ export const FIXTURES = {
       // leaked id inside a nested field is caught -- which only works if
       // every marker is unique to Tenant B.
       'TENANT-B-ONLY-CONNECTION',
+      'TENANT-B-ONLY-ALERT',
       '999999999999',
       'B SECRET idle',
       'B-SECRET-AUDIT',
+      // Phase 2 lineage evidence. A provider request id is not an
+      // authorization credential, but it IS Tenant B's operational data and
+      // must never appear in Tenant A's response (§20).
+      'REQ-TENANT-B-ONLY-REQUESTID',
+      'i-TENANT-B-SECRET-OBS',
+      'i-TENANT-B-QUARANTINE-SECRET',
     ],
   },
   scopedUser: {

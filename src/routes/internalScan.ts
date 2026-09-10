@@ -59,7 +59,7 @@ const MAX_STEPS_PER_CONNECTION = 1500;
 // (syncContext.tsx) -- if that tab closes, crashes, sleeps, or loses its
 // connection mid-scan, nothing client-side can ever resume it; the server
 // has no idea the scan stopped short of finishing. cloud_connections.
-// scan_started_at (set at the first call of that loop, cleared by
+// scan_started_at (now written by nothing -- see the note below; cleared by
 // runFinalize on real completion) is this job's only signal that a scan
 // began and never reached a conclusion. 30 minutes is deliberately
 // generous -- a real interactive full sweep can legitimately take longer
@@ -180,10 +180,21 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
  *    Resources" and then closed the tab, lost network, or put the laptop
  *    to sleep before the scan finished — status stays whatever it was
  *    (usually 'connected', from the *previous* successful scan), so this
- *    case is invisible to a status='pending' check alone. Caught instead
- *    via scan_started_at, set by GET /discovery/steps (the loop's first
- *    call) and cleared by runFinalize on real completion — see
- *    ABANDONED_SCAN_THRESHOLD_MINUTES above.
+ *    case is invisible to a status='pending' check alone.
+ *
+ *    NOTE (2026-09-10): case 3 no longer fires. It was caught via
+ *    scan_started_at, which was written ONLY by GET /discovery/steps -- the
+ *    browser step-loop's first call. Phase 1 removed the browser's calls,
+ *    Phase 3 replaced the loop with durable server-owned runs, and that
+ *    route has now been deleted, so nothing writes the column and the
+ *    scan_started_at branch of the filter below can never match.
+ *
+ *    This is not a regression: an interrupted scan is exactly what
+ *    collection_runs' lease expiry already recovers, without needing a
+ *    column to infer abandonment from. The branch is left in place because
+ *    it is harmless and correctly matches nothing, and removing the column
+ *    is a schema change beyond this cleanup -- but it is documented as inert
+ *    rather than left implying a check that still runs.
  *
  * All three are otherwise invisible to run-due-scans above forever — that
  * query only looks at next_scheduled_scan_at, which nothing here has
