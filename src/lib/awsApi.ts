@@ -19,10 +19,70 @@ export interface AwsCallFailure {
   attempts: number;
 }
 
+/**
+ * One completed AWS call — success or failure — reported to `AwsCreds.onCall`
+ * for Phase 2 provider-request lineage.
+ *
+ * Distinct from AwsCallFailure above, which exists to protect resource types
+ * from deletion and therefore fires only on terminal failures. Lineage needs
+ * the SUCCESSFUL calls too: "which AWS request produced this row" is
+ * unanswerable if only the failures are recorded.
+ *
+ * Deliberately carries no headers, no request body and no response body.
+ * There is nowhere here to put a credential.
+ */
+export interface AwsCallRecord {
+  service: string;
+  action: string;
+  region: string;
+  /**
+   * AWS's own request id, when the response carried one. NULL is a real
+   * answer -- not every response has one -- and the caller records that
+   * fact rather than inventing an id.
+   */
+  requestId: string | null;
+  status: number;
+  outcome: 'succeeded' | 'failed' | 'throttled' | 'timed_out';
+  normalizedCode?: NormalizedErrorCode;
+  attempts: number;
+  startedAt: number;
+  completedAt: number;
+}
+
+/** Reads AWS's request id from wherever the protocol in use puts it. */
+export function extractRequestId(headers: Headers | null, body?: unknown): string | null {
+  const fromHeader =
+    headers?.get('x-amzn-requestid') ??
+    headers?.get('x-amzn-request-id') ??
+    headers?.get('x-amz-request-id') ??
+    null;
+  if (fromHeader) return fromHeader;
+  // Query-protocol responses carry it in the XML envelope instead.
+  if (typeof body === 'string') return extractXmlField(body, 'RequestId');
+  return null;
+}
+
+function outcomeFor(result: AwsCallResult): AwsCallRecord['outcome'] {
+  if (result.ok) return 'succeeded';
+  if (result.normalizedCode === 'THROTTLED') return 'throttled';
+  if (result.normalizedCode === 'TIMEOUT') return 'timed_out';
+  return 'failed';
+}
+
 export interface AwsCreds {
   accessKeyId: string;
   secretAccessKey: string;
   sessionToken?: string;
+  /**
+   * Per-batch sink for EVERY completed call, used to build provider-request
+   * lineage. Hangs off the credentials for the same reason onCallFailure
+   * does: creds are the one object all 111 scanners thread into every call,
+   * so no scanner needs editing and one written tomorrow is covered on day
+   * one.
+   *
+   * Optional, so every existing caller and test keeps working unchanged.
+   */
+  onCall?: (record: AwsCallRecord) => void;
   /**
    * Per-run sink for calls that failed after retrying.
    *
@@ -73,19 +133,42 @@ const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(reso
  * load to an account that may already be throttling.
  */
 async function withRetry(
-  attempt: (signal: AbortSignal) => Promise<{ result: AwsCallResult; retryAfter: string | null }>,
+  attempt: (signal: AbortSignal) => Promise<{ result: AwsCallResult; retryAfter: string | null; requestId?: string | null }>,
   opts: AwsCallOptions,
   report?: { creds: AwsCreds; service: string; region: string; action: string },
 ): Promise<AwsCallResult> {
   const policy = opts.retry ?? DEFAULT_RETRY_POLICY;
   const sleep = opts.sleep ?? realSleep;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const startedAt = Date.now();
   let last: AwsCallResult | null = null;
+
+  /** Reports one completed call to the lineage sink. Never throws into the caller. */
+  const reportCall = (result: AwsCallResult, requestId: string | null | undefined, attempts: number) => {
+    if (!report?.creds.onCall) return;
+    try {
+      report.creds.onCall({
+        service: report.service,
+        action: report.action,
+        region: report.region,
+        requestId: requestId ?? null,
+        status: result.status,
+        outcome: outcomeFor(result),
+        normalizedCode: result.normalizedCode,
+        attempts,
+        startedAt,
+        completedAt: Date.now(),
+      });
+    } catch {
+      // Lineage recording must never break a scan. A missing lineage row is
+      // visible as a gap; a scan that died writing one is not.
+    }
+  };
 
   for (let tries = 0; tries < Math.max(1, policy.maxAttempts); tries++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let outcome: { result: AwsCallResult; retryAfter: string | null };
+    let outcome: { result: AwsCallResult; retryAfter: string | null; requestId?: string | null };
     try {
       outcome = await attempt(controller.signal);
     } finally {
@@ -93,7 +176,10 @@ async function withRetry(
     }
 
     const result = { ...outcome.result, attempts: tries + 1 };
-    if (result.ok) return result;
+    if (result.ok) {
+      reportCall(result, outcome.requestId, tries + 1);
+      return result;
+    }
 
     result.normalizedCode = classifyAwsError({ status: result.status, errorCode: result.errorCode, errorMessage: result.errorMessage });
     last = result;
@@ -116,6 +202,11 @@ async function withRetry(
           attempts: result.attempts ?? tries + 1,
         });
       }
+      // Lineage records the failure too, and UNSUPPORTED_CAPABILITY is NOT
+      // excluded here as it is above: "we asked and this account has not
+      // enabled the service" is a real, useful provider interaction to have
+      // a record of, even though it is not degraded coverage.
+      reportCall(result, outcome.requestId, result.attempts ?? tries + 1);
       return result;
     }
 
@@ -162,6 +253,7 @@ export async function callQueryApi(
       return { result: { ok: false, status: 0, body: '', errorCode: 'FETCH_FAILED', errorMessage: signal.aborted ? 'Request timed out' : message }, retryAfter: null };
     }
     const text = await res.text();
+    const requestId = extractRequestId(res.headers, text);
     if (!res.ok) {
       return {
         result: {
@@ -172,9 +264,10 @@ export async function callQueryApi(
           errorMessage: extractXmlField(text, 'Message') ?? undefined,
         },
         retryAfter: res.headers.get('retry-after'),
+        requestId,
       };
     }
-    return { result: { ok: true, status: res.status, body: text }, retryAfter: null };
+    return { result: { ok: true, status: res.status, body: text }, retryAfter: null, requestId };
   }, callOpts, { creds, service: opts.service, region: opts.region, action: opts.action });
 }
 
@@ -210,6 +303,7 @@ export async function callJsonApi(
   }
   const text = await res.text();
   const parsed = text ? safeJsonParse(text) : {};
+  const requestId = extractRequestId(res.headers);
   if (!res.ok) {
     const errObj = safeJsonParse(text) as { __type?: string; message?: string; Message?: string } | null;
     return {
@@ -221,9 +315,10 @@ export async function callJsonApi(
         errorMessage: errObj?.message ?? errObj?.Message,
       },
       retryAfter: res.headers.get('retry-after'),
+      requestId,
     };
   }
-  return { result: { ok: true, status: res.status, body: parsed }, retryAfter: null };
+  return { result: { ok: true, status: res.status, body: parsed }, retryAfter: null, requestId };
   }, callOpts, { creds, service: opts.service, region: opts.region, action: opts.target.split('.').pop() ?? opts.target });
 }
 
@@ -301,6 +396,29 @@ export async function safeFetch(
    */
   let last: Response | null = null;
   const attempts = bufferBody ? Math.max(1, policy.maxAttempts) : 1;
+  const startedAt = Date.now();
+
+  /** Lineage sink for the raw-client path -- see withRetry's equivalent. */
+  const reportCall = (res: Response, outcome: AwsCallRecord['outcome'], code: NormalizedErrorCode | undefined, tries: number) => {
+    const rep = client.__hvReport;
+    if (!rep?.creds.onCall) return;
+    try {
+      rep.creds.onCall({
+        service: rep.service,
+        action: safePathOf(url),
+        region: rep.region,
+        requestId: extractRequestId(res.headers),
+        status: res.status,
+        outcome,
+        normalizedCode: code,
+        attempts: tries,
+        startedAt,
+        completedAt: Date.now(),
+      });
+    } catch {
+      // Never let lineage recording break a scan.
+    }
+  };
 
   for (let tries = 0; tries < attempts; tries++) {
     const controller = new AbortController();
@@ -310,7 +428,10 @@ export async function safeFetch(
       if (!bufferBody) return res;
       const buf = await res.arrayBuffer();
       const buffered = new Response(buf, { status: res.status, statusText: res.statusText, headers: res.headers });
-      if (res.ok) return buffered;
+      if (res.ok) {
+        reportCall(buffered, 'succeeded', undefined, tries + 1);
+        return buffered;
+      }
       last = buffered;
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Network request failed';
@@ -334,6 +455,7 @@ export async function safeFetch(
           attempts: tries + 1,
         });
       }
+      reportCall(last, code === 'THROTTLED' ? 'throttled' : code === 'TIMEOUT' ? 'timed_out' : 'failed', code, tries + 1);
       return last;
     }
     await sleep(retryAfterMs(last.headers.get('retry-after')) ?? backoffDelayMs(tries, policy, opts.random));

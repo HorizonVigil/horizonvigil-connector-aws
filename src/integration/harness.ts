@@ -97,6 +97,12 @@ export const FIXTURES = {
       '999999999999',
       'B SECRET idle',
       'B-SECRET-AUDIT',
+      // Phase 2 lineage evidence. A provider request id is not an
+      // authorization credential, but it IS Tenant B's operational data and
+      // must never appear in Tenant A's response (§20).
+      'REQ-TENANT-B-ONLY-REQUESTID',
+      'i-TENANT-B-SECRET-OBS',
+      'i-TENANT-B-QUARANTINE-SECRET',
     ],
   },
   scopedUser: {
