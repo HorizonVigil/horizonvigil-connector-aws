@@ -22,18 +22,26 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 22
 
-      # The shared-lib git dependency is a PRIVATE repo, so npm's git fetch
-      # must be authenticated. npm does not read a GH_PAT env var -- it needs
-      # credentials in ~/.netrc. Setting the env var alone (as this workflow
-      # originally did) fails at install with "Permission denied (publickey)"
-      # before any test runs, which reads as "integration tests are broken"
-      # rather than "CI cannot fetch a dependency".
+      # The shared-lib dependency is a PRIVATE repo, and npm resolves it to
+      # an ssh:// URL. Three things are needed, and I originally did only the
+      # last one -- which is why this kept failing at install with
+      # "Permission denied (publickey)" before any test ran:
       #
-      # Byte-for-byte the pattern deploy.yml already uses successfully.
-      - name: Authenticate npm for the private shared-lib dependency
+      #   1. drop the checkout action's injected auth header, which otherwise
+      #      conflicts with the credentials below;
+      #   2. rewrite ssh:// to https:// -- WITHOUT this the netrc never
+      #      applies, because netrc only covers HTTPS;
+      #   3. supply the token via ~/.netrc, which is what npm's git actually
+      #      reads (it ignores a GH_PAT env var entirely).
+      #
+      # Byte-for-byte the pattern deploy.yml's build-and-test job already
+      # uses successfully.
+      - name: Configure git for private shared-lib dependency
         run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           printf "machine github.com\nlogin x-access-token\npassword %s\n" "${{ secrets.GH_PAT }}" > ~/.netrc
           chmod 600 ~/.netrc
 
