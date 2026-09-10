@@ -48,15 +48,37 @@ jobs:
       - name: Install
         run: npm install
 
-      # Guard rail: without this a missing secret would surface as an
-      # obscure sign-in error deep in the run rather than a clear failure.
-      - name: Verify integration credentials are present
+      # Guard rail: without this a missing secret surfaces as an obscure
+      # sign-in error deep in the run rather than a clear failure.
+      #
+      # It checks for PLACEHOLDER values as well as empty ones, because an
+      # empty check alone is not enough. A secret set to the literal text of
+      # a setup instruction -- "<connection string>", "<the anon key ...>" --
+      # is non-empty, sails past an -z test, and then fails at sign-in with a
+      # message about the database rather than about the secret. That
+      # happened on the first attempt to configure these, which is why the
+      # check is here rather than in a comment.
+      - name: Verify integration credentials are present and real
         run: |
-          if [ -z "${INTEGRATION_SUPABASE_URL}" ] || [ -z "${INTEGRATION_SUPABASE_ANON_KEY}" ]; then
-            echo "::error::INTEGRATION_SUPABASE_URL / INTEGRATION_SUPABASE_ANON_KEY are not set."
-            echo "::error::The integration suite must FAIL rather than skip when it cannot reach a database."
-            exit 1
-          fi
+          fail() { echo "::error::$1"; echo "::error::The integration suite must FAIL rather than skip when it cannot reach a database."; exit 1; }
+
+          [ -n "${INTEGRATION_SUPABASE_URL}" ]      || fail "INTEGRATION_SUPABASE_URL is not set."
+          [ -n "${INTEGRATION_SUPABASE_ANON_KEY}" ] || fail "INTEGRATION_SUPABASE_ANON_KEY is not set."
+
+          case "${INTEGRATION_SUPABASE_URL}" in
+            *"<"*|*">"*) fail "INTEGRATION_SUPABASE_URL still contains placeholder text. Set it to the real project URL." ;;
+            https://*.supabase.co) : ;;
+            *) fail "INTEGRATION_SUPABASE_URL does not look like a Supabase project URL." ;;
+          esac
+
+          case "${INTEGRATION_SUPABASE_ANON_KEY}" in
+            *"<"*|*">"*) fail "INTEGRATION_SUPABASE_ANON_KEY still contains placeholder text. Set it to the real anon key." ;;
+          esac
+          # A Supabase anon key is a JWT: three dot-separated segments.
+          case "${INTEGRATION_SUPABASE_ANON_KEY}" in
+            *.*.*) : ;;
+            *) fail "INTEGRATION_SUPABASE_ANON_KEY does not look like a JWT." ;;
+          esac
         env:
           INTEGRATION_SUPABASE_URL: ${{ secrets.INTEGRATION_SUPABASE_URL }}
           INTEGRATION_SUPABASE_ANON_KEY: ${{ secrets.INTEGRATION_SUPABASE_ANON_KEY }}
