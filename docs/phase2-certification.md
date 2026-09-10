@@ -187,8 +187,21 @@ retained IAM payloads show `accessKeys`, `passwordEnabled`,
 `privilegeLevel` survive intact. The redaction fired against genuine AWS IAM
 output.
 
+**The A/B.** The same step was re-run immediately after the account id was
+restored — same scanner, same account, same code, same deployed revision. The
+only variable was the connection's account id:
+
+| | observed | accepted | quarantined |
+|---|---|---|---|
+| decoy account id | 11 | 1 | **10** |
+| real account id | 10 | **10** | 0 |
+
+That is the rule doing exactly one thing and nothing else.
+
 **No contamination.** Zero canonical rows were created or updated from the
-ten refused records.
+ten refused records. Final production state: 0 rows carrying the decoy id,
+0 open quarantine records, 22 traced resources, connection restored to
+`604179600483`.
 
 **One real side effect, found and corrected.** `iam_credential_report`
 carries no ARN, so `account.matches_connection` had no evidence to check and
