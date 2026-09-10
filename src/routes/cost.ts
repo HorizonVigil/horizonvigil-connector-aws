@@ -35,13 +35,68 @@ export interface SyncTarget { id: string; aws_account_id: string }
  * Keys[0]/'Unknown' and Unit/'USD' fallbacks) is unit-testable against a
  * hand-built fixture without needing a live AWS call or a real Db.
  */
-export function buildCostSnapshotRows(body: { ResultsByTime?: CostExplorerResult[] }, connection: SyncTarget): Record<string, unknown>[] {
-  const snapshotRows: Record<string, unknown>[] = [];
+/** A decimal amount exactly as AWS wrote it: digits, optional sign, optional fraction. */
+const DECIMAL_AMOUNT = /^-?\d+(\.\d+)?$/;
+
+export interface CostSnapshotBuild {
+  rows: Record<string, unknown>[];
+  /**
+   * Rows AWS returned that were deliberately not stored because they are
+   * exactly zero. Counted rather than silently dropped -- see the note in
+   * buildCostSnapshotRows.
+   */
+  zeroCostRowsSkipped: number;
+  /**
+   * Rows whose amount was absent or not a valid decimal. NEVER treated as
+   * zero: an amount we could not read is not an amount of nothing.
+   */
+  unreadableRows: number;
+}
+
+export function buildCostSnapshotRows(body: { ResultsByTime?: CostExplorerResult[] }, connection: SyncTarget): CostSnapshotBuild {
+  const rows: Record<string, unknown>[] = [];
+  let zeroCostRowsSkipped = 0;
+  let unreadableRows = 0;
+
   for (const period of body.ResultsByTime ?? []) {
     for (const group of period.Groups ?? []) {
-      const amount = Number(group.Metrics?.UnblendedCost?.Amount ?? 0);
-      if (amount === 0) continue;
-      snapshotRows.push({
+      const raw = group.Metrics?.UnblendedCost?.Amount;
+
+      /**
+       * Kept as the exact decimal STRING AWS sent.
+       *
+       * This previously read `Number(... ?? 0)`, which lost precision before
+       * the value ever reached the database -- `cost_snapshots.unblended_cost`
+       * is Postgres `numeric` (exact) and was being handed an already-lossy
+       * double. Passing the string through lets Postgres parse it exactly.
+       */
+      if (typeof raw !== 'string' || !DECIMAL_AMOUNT.test(raw.trim())) {
+        // `?? 0` used to turn a missing amount into a zero-cost row, which
+        // was then dropped by the filter below -- so an unreadable amount
+        // vanished entirely. Absence is not zero, and it is not nothing.
+        unreadableRows += 1;
+        continue;
+      }
+      const amount = raw.trim();
+
+      /**
+       * Exactly-zero rows are still skipped, and that is a deliberate
+       * storage trade-off with a real cost: Cost Explorer returns a row per
+       * service per day including every service billing nothing, so storing
+       * them would multiply this table by an order of magnitude.
+       *
+       * The consequence, stated rather than hidden: `cost_snapshots` row
+       * count is NOT the number of rows AWS returned, so it cannot on its own
+       * establish a proven zero or satisfy an observed-vs-expected
+       * reconciliation. `zeroCostRowsSkipped` is returned so the caller can
+       * account for the difference instead of discovering the gap later.
+       */
+      if (/^-?0(\.0+)?$/.test(amount)) {
+        zeroCostRowsSkipped += 1;
+        continue;
+      }
+
+      rows.push({
         connection_id: connection.id,
         account_id: connection.aws_account_id,
         usage_date: period.TimePeriod.Start,
@@ -51,7 +106,7 @@ export function buildCostSnapshotRows(body: { ResultsByTime?: CostExplorerResult
       });
     }
   }
-  return snapshotRows;
+  return { rows, zeroCostRowsSkipped, unreadableRows };
 }
 
 /**
@@ -63,7 +118,7 @@ export function buildCostSnapshotRows(body: { ResultsByTime?: CostExplorerResult
  * the connection rather than appending, so re-running it is safe and
  * idempotent.
  */
-async function syncConnectionCost(db: Db, creds: AwsCreds, connection: SyncTarget): Promise<{ ok: true; synced: number; start: string; end: string } | { ok: false; status: number; message: string }> {
+async function syncConnectionCost(db: Db, creds: AwsCreds, connection: SyncTarget): Promise<{ ok: true; synced: number; start: string; end: string; zeroCostRowsSkipped: number; unreadableRows: number } | { ok: false; status: number; message: string }> {
   const start = monthStartIso();
   const end = todayIso();
 
@@ -85,7 +140,8 @@ async function syncConnectionCost(db: Db, creds: AwsCreds, connection: SyncTarge
     return { ok: false, status: result.status === 403 ? 403 : 502, message };
   }
 
-  const snapshotRows = buildCostSnapshotRows(result.body as { ResultsByTime?: CostExplorerResult[] }, connection);
+  const built = buildCostSnapshotRows(result.body as { ResultsByTime?: CostExplorerResult[] }, connection);
+  const snapshotRows = built.rows;
 
   // Replace this month's snapshots for this connection rather than
   // appending — makes a re-sync idempotent instead of duplicating rows
@@ -96,7 +152,16 @@ async function syncConnectionCost(db: Db, creds: AwsCreds, connection: SyncTarge
     await db.insert('cost_snapshots', snapshotRows, 'return=minimal');
   }
 
-  return { ok: true, synced: snapshotRows.length, start, end };
+  return {
+    ok: true,
+    synced: snapshotRows.length,
+    start,
+    end,
+    // Reported so a caller can reconcile stored rows against what AWS
+    // actually returned, rather than assuming they are the same number.
+    zeroCostRowsSkipped: built.zeroCostRowsSkipped,
+    unreadableRows: built.unreadableRows,
+  };
 }
 
 /**
