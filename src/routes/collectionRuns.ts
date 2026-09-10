@@ -7,7 +7,7 @@ import type { Env } from '../env';
 import { loadConnection, regionsFor, runResourceStep, runFindingStep, runMetricStep, runFinalize, REGIONAL_SCANNERS, GLOBAL_SCANNERS, FINDING_SCANNERS, METRIC_STEP_NAME, SCANNER_RESOURCE_TYPES } from './discovery';
 import {
   createOrGetActiveRun, claimRun, checkpoint, finalizeRun, toRunResponse, isLeaseExpired,
-  STEPS_PER_SLICE, type CollectionRunRow,
+  queueRetryRun, STEPS_PER_SLICE, type CollectionRunRow,
 } from '../lib/collectionRuns';
 import { fetchCurManifest, parseCurBatch } from '../lib/curIngest';
 import { resolveCredentials } from './permissions';
@@ -288,9 +288,20 @@ collectionRunRoutes.post('/internal/advance-collection-runs', (c) =>
     const leaseOwner = `worker:${crypto.randomUUID()}`;
     const now = Date.now();
 
+    /**
+     * `next_attempt_at` is honoured here, not just written.
+     *
+     * Without this clause the backoff would be decorative -- a WAITING_RETRY
+     * run would be claimed on the very next tick, one minute of scheduled
+     * delay becoming zero. `is.null` is required because every non-retry run
+     * has a null here and must stay claimable.
+     */
     const candidates = await db.select<CollectionRunRow[]>('collection_runs', {
       select: '*',
-      filters: { status: 'in.(QUEUED,RUNNING,WAITING_RETRY,CANCEL_REQUESTED)' },
+      filters: {
+        status: 'in.(QUEUED,RUNNING,WAITING_RETRY,CANCEL_REQUESTED)',
+        or: `(next_attempt_at.is.null,next_attempt_at.lte.${new Date(now).toISOString()})`,
+      },
       order: 'queued_at.asc',
       limit: 20,
     });
@@ -341,6 +352,20 @@ collectionRunRoutes.post('/internal/advance-collection-runs', (c) =>
         // Every planned step is done: close the run from its committed step
         // rows, then run the existing finalize so inventory reconciliation
         // and vanished-resource handling behave exactly as before.
+        /**
+         * Read once, used twice: vanished-resource eligibility below and the
+         * retry decision after finalize. Both must agree on which steps
+         * failed, and both must read the COMMITTED step rows rather than
+         * in-memory counters -- a run spans several worker ticks and no
+         * single tick sees them all.
+         */
+        const committedSteps = await db.select<{ step_id: string; status: string }[]>('collection_run_steps', {
+          select: 'step_id,status',
+          filters: { run_id: `eq.${run.id}` },
+          limit: 5000,
+        });
+        const failedStepIds = new Set(committedSteps.filter((s) => s.status === 'failed').map((s) => s.step_id));
+
         const connection = await loadConnection(db, run.org_id, null, run.connection_id);
         if (connection) {
           /**
@@ -354,12 +379,6 @@ collectionRunRoutes.post('/internal/advance-collection-runs', (c) =>
            * because a run spans several worker ticks and no single tick sees
            * them all.
            */
-          const allSteps = await db.select<{ step_id: string; status: string }[]>('collection_run_steps', {
-            select: 'step_id,status',
-            filters: { run_id: `eq.${run.id}` },
-            limit: 5000,
-          });
-          const failedStepIds = new Set(allSteps.filter((s) => s.status === 'failed').map((s) => s.step_id));
           const stepSet = new Set(steps);
           const regions = regionsFor(connection);
           const coveredResourceTypes = [
@@ -378,7 +397,18 @@ collectionRunRoutes.post('/internal/advance-collection-runs', (c) =>
           );
         }
         const status = await finalizeRun(db, { ...run, completed_steps: completed, failed_steps: failed });
-        results.push({ runId: run.id, status, steps: steps.length });
+
+        /**
+         * Retry the steps that actually failed, as a NEW run linked by
+         * `rerun_of` -- the shape the schema already models.
+         *
+         * Queued AFTER finalizing, because the partial unique index permits
+         * only one active run per connection and the original is only just
+         * terminal. `info` steps are deliberately not retried: "this account
+         * has not enabled Macie" is a settled answer, not a transient one.
+         */
+        const retryRunId = await queueRetryRun(db, { ...run, completed_steps: completed, failed_steps: failed }, [...failedStepIds]);
+        results.push({ runId: run.id, status, steps: steps.length, ...(retryRunId ? { retryRunId } : {}) });
       } else {
         results.push({ runId: run.id, status: 'RUNNING', progress: `${end}/${steps.length}` });
       }

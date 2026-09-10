@@ -473,41 +473,19 @@ export function regionsFor(connection: ConnectionForDiscovery): string[] {
 }
 
 /**
- * GET /api/aws-accounts/accounts/:id/discovery/steps — the ordered step
- * list this account's scan regions require, for the frontend's step-loop.
- * Also stamps scan_started_at, even though this is nominally a GET — this
- * is genuinely the first call of every interactive scan (see
- * syncContext.tsx's startDiscovery), so it's the one reliable place to
- * record "a scan began here" for the abandoned-scan sweep in
- * internalScan.ts to detect a tab that closed before finishing. Bumped to
- * requiring 'write' rather than 'read' to match that real side effect.
+ * GET /accounts/:id/discovery/steps was REMOVED (Phase B cleanup, 2026-09-10).
+ *
+ * It served the browser's step-loop, which Phase 1 removed and Phase 3
+ * replaced with durable, server-owned collection runs. `planSteps` in
+ * routes/collectionRuns.ts now builds the same plan server-side, so this was
+ * a second, unauthenticated-by-the-worker way to enumerate a scan.
+ *
+ * It also stamped `scan_started_at` as a side effect of a GET. Nothing else
+ * writes that column, so the abandoned-scan branch in internalStep.ts that
+ * reads it has been inert since the browser stopped calling this -- see the
+ * note there, which is now corrected rather than left implying a check that
+ * cannot fire.
  */
-discoveryRoutes.get('/accounts/:id/discovery/steps', (c) =>
-  guarded(async () => {
-    const auth = getAuthContext(c.req.raw);
-    const orgId = requireOrgId(c.req.raw);
-    const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
-
-    const connection = await loadConnection(db, orgId, auth.userId, c.req.param('id'));
-    if (!connection) return errJson(404, 'Account not found');
-
-    const regionalNames = Object.keys(REGIONAL_SCANNERS);
-    const globalNames = Object.keys(GLOBAL_SCANNERS);
-    const findingNames = Object.keys(FINDING_SCANNERS);
-    const regions = regionsFor(connection);
-    const steps = [
-      ...regions.flatMap((region) => regionalNames.map((name) => `regional:${name}:${region}`)),
-      ...globalNames.map((name) => `global:${name}`),
-      ...regions.flatMap((region) => findingNames.map((name) => `finding:${name}:${region}`)),
-      ...regions.map((region) => `metric:${METRIC_STEP_NAME}:${region}`),
-    ];
-
-    await db.update('cloud_connections', { id: `eq.${connection.id}` }, { scan_started_at: new Date().toISOString() }, 'return=minimal');
-
-    return okJson({ steps, regions, scannerCount: regionalNames.length + globalNames.length + findingNames.length + 1 });
-  }),
-);
 
 export interface StepResult {
   stepId: string;

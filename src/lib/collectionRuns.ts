@@ -221,6 +221,105 @@ export async function finalizeRun(db: Db, run: CollectionRunRow, opts: { cancele
   return status;
 }
 
+
+/**
+ * How many times a run's failed steps may be retried.
+ *
+ * Two total attempts, not more. A step that failed after the AWS helper had
+ * already exhausted its own per-call retries is usually failing for a
+ * persistent reason -- a missing permission, a service the account has not
+ * enabled -- and hammering it again adds load to an account that may already
+ * be throttling. One retry after a real backoff catches the transient cases
+ * without pretending a permission error is transient.
+ */
+export const MAX_RUN_ATTEMPTS = 2;
+
+/** Base delay before the first retry. */
+const RETRY_BASE_MS = 60_000;
+/** Ceiling, so a long chain cannot push a retry beyond a useful horizon. */
+const RETRY_MAX_MS = 15 * 60_000;
+
+/**
+ * Exponential backoff with full jitter, matching awsErrors.ts's policy shape.
+ *
+ * Jitter matters here for the same reason it does per-call: without it, a
+ * regional AWS outage that fails every connection's scan at once would
+ * schedule every retry for the same instant and reproduce the thundering
+ * herd the backoff exists to prevent.
+ */
+export function retryDelayMs(attempt: number, random: () => number = Math.random): number {
+  const ceiling = Math.min(RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1), RETRY_MAX_MS);
+  return Math.floor(random() * ceiling);
+}
+
+/**
+ * Whether a finished run should have its failed steps retried.
+ *
+ * `attempt` is incremented by claimRun, so a run claimed once has attempt 1.
+ * Retrying while attempt < MAX_RUN_ATTEMPTS therefore permits exactly one
+ * follow-up run.
+ */
+export function shouldRetryRun(run: Pick<CollectionRunRow, 'attempt'>, failedStepIds: readonly string[]): boolean {
+  return failedStepIds.length > 0 && run.attempt < MAX_RUN_ATTEMPTS;
+}
+
+/**
+ * Queues a retry as a NEW run linked by `rerun_of`, rather than rewinding the
+ * original.
+ *
+ * The schema already models it this way, and it is the honest shape: the
+ * original run keeps its real outcome and its real step evidence instead of
+ * having its progress counters rewound, and the retry carries only the steps
+ * that actually failed. Rewinding `step_cursor` in place would make a run's
+ * own history unreadable -- progress would move backwards and the committed
+ * step rows would no longer correspond to the plan.
+ *
+ * Returns the new run id, or null when a retry was not queued (nothing
+ * failed, attempts exhausted, or another run is already active on this
+ * connection -- the partial unique index enforces that last one, and losing
+ * the race is a normal outcome, not an error).
+ */
+export async function queueRetryRun(
+  db: Db,
+  run: CollectionRunRow,
+  failedStepIds: readonly string[],
+  now: number = Date.now(),
+  random: () => number = Math.random,
+): Promise<string | null> {
+  if (!shouldRetryRun(run, failedStepIds)) return null;
+
+  const nextAttemptAt = new Date(now + retryDelayMs(run.attempt, random)).toISOString();
+  try {
+    const [row] = await db.insert<{ id: string }[]>('collection_runs', {
+      org_id: run.org_id,
+      connection_id: run.connection_id,
+      capability: run.capability,
+      // WAITING_RETRY, not QUEUED: the worker must honour next_attempt_at
+      // before claiming it, and the status is what makes the wait visible
+      // rather than looking like a run that is merely slow to start.
+      status: 'WAITING_RETRY',
+      trigger: 'retry',
+      requested_by: run.requested_by,
+      idempotency_key: `${run.idempotency_key}:retry:${run.attempt}`,
+      planned_steps: [...failedStepIds],
+      total_steps: failedStepIds.length,
+      // Carried so the chain terminates: claimRun increments it, so the
+      // retry's own claim takes it to MAX_RUN_ATTEMPTS and shouldRetryRun
+      // then refuses a third.
+      attempt: run.attempt,
+      next_attempt_at: nextAttemptAt,
+      rerun_of: run.id,
+      correlation_id: run.correlation_id,
+    });
+    return row?.id ?? null;
+  } catch {
+    // Another run is already active on this connection (the partial unique
+    // index). That run will cover the same steps, so dropping this retry is
+    // correct rather than an error worth surfacing.
+    return null;
+  }
+}
+
 /** Public projection of a run. Never exposes lease internals or raw provider text. */
 export function toRunResponse(run: CollectionRunRow) {
   return {
