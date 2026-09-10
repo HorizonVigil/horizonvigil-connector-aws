@@ -24,11 +24,21 @@ jobs:
         with:
           node-version: '20'
 
+      # The shared-lib git dependency is a PRIVATE repo, so npm's git fetch
+      # must be authenticated. npm does not read a GH_PAT env var -- it needs
+      # credentials in ~/.netrc. Setting the env var alone (as this workflow
+      # originally did) fails at install with "Permission denied (publickey)"
+      # before any test runs, which reads as "integration tests are broken"
+      # rather than "CI cannot fetch a dependency".
+      #
+      # Byte-for-byte the pattern deploy.yml already uses successfully.
+      - name: Authenticate npm for the private shared-lib dependency
+        run: |
+          printf "machine github.com\nlogin x-access-token\npassword %s\n" "${{ secrets.GH_PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc
+
       - name: Install
         run: npm install
-        env:
-          # The shared-lib git dependency needs an authenticated fetch.
-          GH_PAT: ${{ secrets.GH_PAT }}
 
       # Guard rail: without this a missing secret would surface as an
       # obscure sign-in error deep in the run rather than a clear failure.
