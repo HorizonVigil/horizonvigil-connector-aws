@@ -93,6 +93,7 @@ export const FIXTURES = {
       // leaked id inside a nested field is caught -- which only works if
       // every marker is unique to Tenant B.
       'TENANT-B-ONLY-CONNECTION',
+      'TENANT-B-ONLY-ALERT',
       '999999999999',
       'B SECRET idle',
       'B-SECRET-AUDIT',
