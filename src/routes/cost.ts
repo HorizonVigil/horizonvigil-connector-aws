@@ -3,6 +3,8 @@ import type { Env } from '../env';
 import { callJsonApi, type AwsCreds } from '../lib/awsApi';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
 import { triggerAnomalyDetection } from '../lib/postScanHooks';
+import { ensureBillingPeriod, writeCostFacts } from '../lib/costFacts';
+import { recordCostSourceState, stateForFailure, stateForSuccess } from '../lib/costSourceState';
 
 const MAX_CONNECTIONS_PER_COST_SYNC_RUN = 5;
 
@@ -26,7 +28,19 @@ interface CostExplorerResult {
   Groups: CostExplorerGroup[];
 }
 
-export interface SyncTarget { id: string; aws_account_id: string }
+export interface SyncTarget {
+  id: string;
+  aws_account_id: string;
+  /**
+   * Optional so every existing caller and test keeps working unchanged.
+   *
+   * cost_facts and cost_source_status are org-scoped, so without it the
+   * Phase 3c writes are skipped rather than attributed to the wrong tenant.
+   * Skipping is the right failure here: a cost fact with no tenant is worse
+   * than a missing one.
+   */
+  org_id?: string;
+}
 
 /**
  * Pure transform: a raw GetCostAndUsage response body -> the exact
@@ -118,7 +132,7 @@ export function buildCostSnapshotRows(body: { ResultsByTime?: CostExplorerResult
  * the connection rather than appending, so re-running it is safe and
  * idempotent.
  */
-async function syncConnectionCost(db: Db, creds: AwsCreds, connection: SyncTarget): Promise<{ ok: true; synced: number; start: string; end: string; zeroCostRowsSkipped: number; unreadableRows: number } | { ok: false; status: number; message: string }> {
+async function syncConnectionCost(db: Db, creds: AwsCreds, connection: SyncTarget): Promise<{ ok: true; synced: number; start: string; end: string; zeroCostRowsSkipped: number; unreadableRows: number; costFacts: { inserted: number; unchanged: number; restated: number; restatedFingerprints: string[] } } | { ok: false; status: number; message: string }> {
   const start = monthStartIso();
   const end = todayIso();
 
@@ -137,6 +151,22 @@ async function syncConnectionCost(db: Db, creds: AwsCreds, connection: SyncTarge
 
   if (!result.ok) {
     const message = result.errorMessage ?? result.errorCode ?? `Cost Explorer request failed (HTTP ${result.status})`;
+    /**
+     * Phase 3c: a failed sync now records WHICH kind of failure.
+     *
+     * "Cost Explorer is not enabled" is an opt-in state the customer fixes in
+     * one click; a 403 on a configured source is a policy problem; a 500 is
+     * ours or AWS's. Collapsing them is how someone gets sent to fix an IAM
+     * policy that was already correct -- and how all three end up rendering
+     * as $0.
+     */
+    if (connection.org_id) {
+      await recordCostSourceState(
+        db,
+        { orgId: connection.org_id, connectionId: connection.id, sourceType: 'COST_EXPLORER', payerAccountId: connection.aws_account_id ?? null },
+        stateForFailure(result.status, message),
+      );
+    }
     return { ok: false, status: result.status === 403 ? 403 : 502, message };
   }
 
@@ -152,6 +182,67 @@ async function syncConnectionCost(db: Db, creds: AwsCreds, connection: SyncTarge
     await db.insert('cost_snapshots', snapshotRows, 'return=minimal');
   }
 
+  /**
+   * Phase 3c: dual-write into cost_facts alongside cost_snapshots.
+   *
+   * EXPAND, not cutover (§34). cost_snapshots keeps serving every current
+   * read path untouched; cost_facts accumulates the authoritative model in
+   * parallel so it can be validated against the old one before anything
+   * depends on it.
+   *
+   * Unlike the snapshot path above, this is NOT delete-and-replace. Replacing
+   * would make a restatement indistinguishable from an ordinary re-sync and
+   * would destroy the previous amount, which §15/§17 require to stay
+   * auditable.
+   */
+  let factResult = { inserted: 0, unchanged: 0, restated: 0, restatedFingerprints: [] as string[] };
+  if (connection.org_id) {
+    const factCtx = {
+      orgId: connection.org_id,
+      connectionId: connection.id,
+      payerAccountId: connection.aws_account_id ?? null,
+      sourceType: 'COST_EXPLORER' as const,
+    };
+    const factInputs = snapshotRows.map((r) => ({
+      usageDate: String(r.usage_date),
+      service: String(r.service),
+      region: (r.region as string | null) ?? null,
+      linkedAccountId: (r.account_id as string | null) ?? null,
+      amount: String(r.unblended_cost),
+      currency: String(r.currency),
+    }));
+
+    try {
+      if (factInputs.length > 0) await ensureBillingPeriod(db, factCtx, factInputs[0].usageDate);
+      factResult = await writeCostFacts(db, factCtx, factInputs);
+    } catch {
+      // The dual-write must not fail a sync that already stored its
+      // snapshots. A gap in cost_facts is visible; a lost sync is not.
+    }
+
+    /**
+     * State is judged on coverage, not on the request having returned 200.
+     * A sync covering some requested accounts is PARTIAL, and a total built
+     * from it must not be presented as the organisation's spend -- nor as $0
+     * if the uncovered accounts held the cost.
+     */
+    const covered = [...new Set(snapshotRows.map((r) => String(r.account_id)))];
+    const requested = connection.aws_account_id ? [connection.aws_account_id] : [];
+    await recordCostSourceState(
+      db,
+      { orgId: connection.org_id, connectionId: connection.id, sourceType: 'COST_EXPLORER', payerAccountId: connection.aws_account_id ?? null },
+      {
+        ...stateForSuccess({ requestedAccountIds: requested, coveredAccountIds: covered, sourceObservedAt: null }),
+        recordCount: snapshotRows.length,
+        currency: snapshotRows.length > 0 ? String(snapshotRows[0].currency) : null,
+        coveredPeriodStart: start,
+        coveredPeriodEnd: end,
+      },
+      requested,
+      covered,
+    );
+  }
+
   return {
     ok: true,
     synced: snapshotRows.length,
@@ -161,6 +252,7 @@ async function syncConnectionCost(db: Db, creds: AwsCreds, connection: SyncTarge
     // actually returned, rather than assuming they are the same number.
     zeroCostRowsSkipped: built.zeroCostRowsSkipped,
     unreadableRows: built.unreadableRows,
+    costFacts: factResult,
   };
 }
 
@@ -185,7 +277,7 @@ costRoutes.post('/accounts/:id/cost/sync', (c) =>
     // permitted the connection (resource grants / active scope).
     await requirePermittedConnection(db, orgId, auth.userId, c.req.param('id'), getActiveScope(c.req.raw, orgId));
     const rows = await db.select<(ResolvableConnection & { aws_account_id: string })[]>('cloud_connections', {
-      select: 'id,aws_account_id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
+      select: 'id,org_id,aws_account_id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
       filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     const connection = rows[0];
@@ -313,7 +405,7 @@ costRoutes.post('/internal/run-due-cost-syncs', (c) =>
     const results: { connectionId: string; synced?: number; error?: string }[] = [];
     for (const row of due) {
       const connectionRows = await db.select<(ResolvableConnection & { aws_account_id: string })[]>('cloud_connections', {
-        select: 'id,aws_account_id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
+        select: 'id,org_id,aws_account_id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
         filters: { id: `eq.${row.id}` },
       });
       const connection = connectionRows[0];
