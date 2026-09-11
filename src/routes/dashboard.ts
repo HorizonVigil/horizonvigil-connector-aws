@@ -55,8 +55,31 @@ dashboardRoutes.get('/dashboard', (c) =>
     });
     const connectionIds = connections.map((conn) => conn.id);
 
-    const [resourceRows, recentRuns, costRows, recommendationRows, activityRows, alertRows] = await Promise.all([
-      db.select<{ region: string | null }[]>('cloud_resources', { select: 'region', filters: { connection_id: inFilter(connectionIds), deleted_at: 'is.null' }, limit: 5000 }),
+    const [resourceBreakdown, recentRuns, costRows, recommendationRows, activityRows, alertRows] = await Promise.all([
+      /**
+       * Phase 4 §24/§32. This was `db.select('cloud_resources', … limit 5000)`
+       * followed by `resourceRows.length`, which was wrong twice over.
+       *
+       * 1. LATENT, not yet biting: PostgREST caps the returned row body
+       *    around 1,000 regardless of the app-level limit. These connections
+       *    hold 922 live rows, so the count was still accurate today and
+       *    would have started silently truncating a little above that -- the
+       *    same class of bug that made 1,805 resources render as 1,000, and
+       *    one that fails by understating a GROWING estate, which is the
+       *    hardest moment to notice it.
+       * 2. ACTIVE: it counted every row, and 376 of those 922 are ALIASES
+       *    (KMS aliases, Route 53 records), plus 94 observations and 34
+       *    control-status records. Only 418 are assets. An alias is a second
+       *    name for a thing already counted, so the headline overstated the
+       *    estate by 41%. Hard NO-GO condition 2.
+       *
+       * The RPC does the GROUP BY in Postgres -- one round trip, no row cap,
+       * and it returns entity_class so assets can be counted as assets.
+       */
+      db.rpc<{ entity_class: string | null; count: number }[]>('cloud_resources_breakdown', {
+        p_connection_ids: connectionIds,
+        p_region: null,
+      }),
       db.select<{ connection_id: string; status: string; started_at: string }[]>('connection_validation_runs', {
         select: 'connection_id,status,started_at',
         filters: { connection_id: inFilter(connectionIds) },
@@ -138,6 +161,22 @@ dashboardRoutes.get('/dashboard', (c) =>
       .sort((a, b) => b.totalResources - a.totalResources)
       .slice(0, 5);
 
+    /**
+     * An uncatalogued type counts as an asset (`?? 'asset'`), deliberately:
+     * under-reporting someone's estate is worse than over-reporting it, and
+     * a type missing from the catalog is our gap, not their missing resource.
+     */
+    const byEntityClass: Record<string, number> = {};
+    let assetCount = 0;
+    let allRecordCount = 0;
+    for (const row of resourceBreakdown ?? []) {
+      const count = Number(row.count ?? 0);
+      const entityClass = row.entity_class ?? 'asset';
+      byEntityClass[entityClass] = (byEntityClass[entityClass] ?? 0) + count;
+      allRecordCount += count;
+      if (entityClass === 'asset') assetCount += count;
+    }
+
     return okJson({
       totalAccounts: connections.length,
       healthyAccounts: healthy,
@@ -145,7 +184,12 @@ dashboardRoutes.get('/dashboard', (c) =>
       disconnectedAccounts: disconnected,
       accountsNeedingAttention: needingAttention,
       accountsNeedingAttentionList: needingAttentionList,
-      resourcesDiscovered: resourceRows.length,
+      // Assets only. `allRecords` and the per-class split travel with it so
+      // a headline moving from 922 to 418 reads as "aliases are not assets"
+      // rather than as data loss.
+      resourcesDiscovered: assetCount,
+      resourceRecordsAllClasses: allRecordCount,
+      resourcesByEntityClass: byEntityClass,
       regionsCovered,
       lastDiscovery,
       nextScheduledDiscovery: null,
