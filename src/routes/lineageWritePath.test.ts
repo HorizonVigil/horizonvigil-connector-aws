@@ -96,6 +96,30 @@ describe('lineage write path runs under the service role', () => {
     expect(body).toContain('const rows = admission.accepted.map(');
     expect(body).not.toMatch(/const rows = scanned\.map\(/);
     // And the upsert it feeds is the canonical resource table.
-    expect(body).toContain("'cloud_resources?on_conflict=connection_id,resource_type_key,resource_id'");
+    expect(body).toContain("'cloud_resources?on_conflict=connection_id,resource_type_key,resource_id,generation'");
+  });
+
+  /**
+   * Phase 4 §2. The conflict target MUST include `generation`.
+   *
+   * Without it, an AWS-native id that was released and reissued upserts into
+   * the deleted resource's row and silently inherits its history -- hard
+   * NO-GO conditions 4 and 12. The negative assertion is the load-bearing
+   * half: it pins the exact three-column string this used to be, so a revert
+   * or a careless edit fails here rather than in production six weeks later
+   * when an instance id happens to get reused.
+   */
+  it('the canonical upsert conflicts on generation, not on the native id alone', () => {
+    const body = runResourceStepBody();
+    expect(body).toContain("resource_id,generation'");
+    expect(body).not.toContain("'cloud_resources?on_conflict=connection_id,resource_type_key,resource_id'");
+  });
+
+  it('generation is resolved from prior generations, never assumed', () => {
+    const body = runResourceStepBody();
+    expect(body).toContain('resolveGeneration(');
+    // The row must carry the resolved generation rather than a literal.
+    expect(body).toMatch(/generation:\s*decision\.generation/);
+    expect(body).not.toMatch(/generation:\s*1\s*,/);
   });
 });

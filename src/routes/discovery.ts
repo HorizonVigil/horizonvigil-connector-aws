@@ -130,6 +130,7 @@ const MAX_PROVIDER_REQUESTS_PER_BATCH = 200;
 import type { ScannedFinding, FindingScannerFn } from '../lib/scanners/findingTypes';
 import type { ScannedMetric } from '../lib/scanners/metricTypes';
 import { computeFinalizeResult } from '../lib/discoveryFinalize';
+import { resolveGeneration, type ExistingGeneration, type LifecycleState } from '../lib/generations';
 import { triggerRecommendationGeneration, triggerAlertEvaluation } from '../lib/postScanHooks';
 
 export const discoveryRoutes = new Hono<{ Bindings: Env }>();
@@ -738,13 +739,39 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
   const typeKeys = [...new Set(scanned.map((r) => r.resourceTypeKey))];
   const [catalogRows, existing] = await Promise.all([
     db.select<CatalogRow[]>('resource_type_catalog', { select: 'key,category,service', filters: { key: inFilter(typeKeys) } }),
-    db.select<{ resource_type_key: string; resource_id: string; deleted_at: string | null }[]>('cloud_resources', {
-      select: 'resource_type_key,resource_id,deleted_at',
+    // Phase 4 §2: generation and lifecycle_state are selected because the
+    // upsert can no longer be decided from the native id alone -- a deleted
+    // id that reappears must open a new generation rather than land back in
+    // the dead row.
+    db.select<{ id: string; resource_type_key: string; resource_id: string; deleted_at: string | null; generation: number; lifecycle_state: LifecycleState }[]>('cloud_resources', {
+      select: 'id,resource_type_key,resource_id,deleted_at,generation,lifecycle_state',
       filters: { connection_id: `eq.${connection.id}`, resource_type_key: inFilter(typeKeys) },
     }),
   ]);
   const catalogByKey = new Map(catalogRows.map((r) => [r.key, r]));
   const existingByKey = new Map(existing.map((r) => [`${r.resource_type_key}:${r.resource_id}`, r]));
+
+  /**
+   * All generations held for each identity, so resolveGeneration sees the
+   * full history rather than whichever row happened to be last. Grouped once
+   * here because the row builder below runs per accepted record.
+   */
+  const generationsByKey = new Map<string, ExistingGeneration[]>();
+  for (const r of existing) {
+    const key = `${r.resource_type_key}:${r.resource_id}`;
+    const list = generationsByKey.get(key) ?? [];
+    list.push({
+      id: r.id,
+      generation: r.generation ?? 1,
+      lifecycle_state: r.lifecycle_state ?? (r.deleted_at ? 'DELETED' : 'ACTIVE'),
+      // No AWS scanner supplies a reuse-proof identifier today, so this is
+      // null for every type. Stated explicitly rather than left implicit:
+      // when a scanner starts providing one (RDS DbiResourceId is the
+      // obvious first), this is the single place that changes.
+      immutable_identity: null,
+    });
+    generationsByKey.set(key, list);
+  }
 
   /**
    * Phase 2 admission. Before this, `scanned` went straight into the upsert:
@@ -782,9 +809,19 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
     if (!prior || prior.deleted_at) {
       createdEvents.push({ connection_id: connection.id, resource_type_key: r.resourceTypeKey, aws_resource_id: r.resourceId, event_type: 'created' });
     }
+    const decision = resolveGeneration(generationsByKey.get(key) ?? [], null);
     return {
       connection_id: connection.id, account_id: connection.aws_account_id, resource_type_key: r.resourceTypeKey,
       resource_id: r.resourceId, resource_name: r.resourceName ?? null, region: r.region,
+      // Phase 4 §2/§8/§5.
+      generation: decision.generation,
+      lifecycle_state: decision.lifecycle_state,
+      org_id: orgId,
+      // §5: a region we hold is REGIONAL; absence of one is UNKNOWN, never a
+      // default region and never GLOBAL, which needs the type registry's
+      // globality flag to prove.
+      location_scope: r.region && r.region.trim() !== '' && r.region.toLowerCase() !== 'unknown' ? 'REGIONAL' : 'UNKNOWN',
+      updated_at: now,
       category: catalog?.category ?? 'Others', service: catalog?.service ?? r.resourceTypeKey.split('_')[0],
       state: r.state ?? null, status: r.state === 'terminated' ? 'terminated' : r.state === 'stopped' ? 'stopped' : 'active',
       is_default: r.isDefault ?? false, tags: r.tags ?? {}, metadata: r.metadata ?? {}, relationships: r.relationships ?? {},
@@ -807,16 +844,23 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
     };
   });
 
-  // cloud_resources has a unique constraint on (connection_id, resource_type_key,
-  // resource_id) — upsert via on_conflict rather than delete+insert, so a
-  // resource's first_seen_at/created_at (and its row id, which lifecycle
-  // events elsewhere may reference) survive a re-scan.
+  // Identity is (connection_id, resource_type_key, resource_id, GENERATION) —
+  // upsert via on_conflict rather than delete+insert, so a resource's
+  // first_seen_at/created_at (and its row id, which lifecycle events
+  // elsewhere may reference) survive a re-scan.
+  //
+  // Phase 4 §2 added `generation` to the conflict target. Without it, a
+  // native id that AWS released and reissued upserted straight into the
+  // deleted resource's row and inherited its entire history -- including
+  // cost facts and security findings that belonged to a different machine.
+  // The four-column unique index backing this was created ahead of the
+  // deploy; the older three-column constraint is dropped only afterwards.
   // `return=representation` (not minimal) because the canonical row ids are
   // what link each observation back to the resource it was admitted into --
   // without them, "show me the lineage for this resource" has nothing to
   // join on.
-  const upserted = await db.insert<{ id: string; resource_type_key: string; resource_id: string }[]>(
-    'cloud_resources?on_conflict=connection_id,resource_type_key,resource_id',
+  const upserted = await db.insert<{ id: string; resource_type_key: string; resource_id: string; generation: number }[]>(
+    'cloud_resources?on_conflict=connection_id,resource_type_key,resource_id,generation',
     rows,
     'resolution=merge-duplicates,return=representation',
   );
@@ -974,7 +1018,11 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   const { vanishedIds, activeCategoryCounts, activeCount } = computeFinalizeResult(existing, coveredResourceTypes, runStartedAt, degradedResourceTypes);
   const now = new Date().toISOString();
   if (vanishedIds.length > 0) {
-    await db.update('cloud_resources', { id: `in.(${vanishedIds.join(',')})` }, { deleted_at: now, status: 'deleted' }, 'return=minimal');
+    // lifecycle_state moves with deleted_at. If the two could drift, the
+    // generation logic -- which reads lifecycle_state -- would keep treating
+    // a tombstoned row as live and never open a new generation when the id
+    // came back, quietly restoring the bug §2 exists to remove.
+    await db.update('cloud_resources', { id: `in.(${vanishedIds.join(',')})` }, { deleted_at: now, status: 'deleted', lifecycle_state: 'DELETED', updated_at: now }, 'return=minimal');
   }
 
   // Same vanish reasoning as cloud_resources above, scoped to the finding
