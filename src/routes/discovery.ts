@@ -1144,8 +1144,30 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   // this is the one function every scan path (interactive, daily sweep,
   // abandoned-scan recovery) already funnels through, so triggering here
   // covers all of them instead of just the browser-driven one.
-  await triggerRecommendationGeneration(env, connection.id, orgId);
-  await triggerAlertEvaluation(env, connection.id, orgId);
+  /**
+   * Recorded, not just awaited. Both hooks return `not_configured` when this
+   * service carries no hook URL or secret — which is the case in production
+   * today — and a silently skipped hook is indistinguishable from one that
+   * ran and found nothing to do. Stale cost recommendations survived three
+   * weeks behind exactly that ambiguity.
+   *
+   * Written after the summary above rather than folded into it, because these
+   * calls must happen last: they notify downstream services about inventory
+   * that has to be committed first.
+   */
+  const hooks = {
+    recommendations: await triggerRecommendationGeneration(env, connection.id, orgId),
+    alerts: await triggerAlertEvaluation(env, connection.id, orgId),
+  };
+  if (hooks.recommendations.state !== 'called' || hooks.alerts.state !== 'called') {
+    console.warn(`Post-scan hooks did not all fire for connection ${connection.id}: ${JSON.stringify(hooks)}`);
+  }
+  await db.update(
+    'cloud_connections',
+    { id: `eq.${connection.id}` },
+    { resource_summary: { ...summary, hooks } },
+    'return=minimal',
+  );
 
   return { totalResources: activeCount, deleted: vanishedIds.length, findingsResolved: resolvedFindings.length, categoryCounts: activeCategoryCounts, errors: stepErrors };
 }
