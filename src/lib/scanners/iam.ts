@@ -1,4 +1,5 @@
 import { callQueryApi } from '../awsApi';
+import { incompleteSink, DEFAULT_MAX_PAGES, type PaginationTermination } from '../pagination';
 import { extractSection, extractListItems, field } from '../xmlList';
 import type { ScannedResource, ScannerContext } from './types';
 import { analyzePrincipalPolicies, parsePolicyDocument, ROLE_ANALYSIS_CAP, type PrincipalPolicyFetcher, type PrivilegeAnalysisResult } from '../iamPrivilegeAnalysis';
@@ -25,10 +26,23 @@ export const IAM_RESOURCE_TYPES = ['iam_user', 'iam_role', 'iam_policy', 'iam_gr
  */
 export interface IamScanOperation {
   action: string;
-  status: 'success' | 'failed';
+  /**
+   * `partial` and `not_supported` are distinct from `failed` on purpose.
+   *
+   * `partial` — the walk stopped before AWS ran out of pages (page cap, a
+   * marker that did not advance). The rows collected are real; the set is
+   * incomplete, and finalize must not read the missing ones as deletions.
+   *
+   * `not_supported` — AWS retires services and an account can simply not have
+   * enabled one. Recording that as a failure permanently marks a healthy scan
+   * as failing and teaches operators to ignore the signal. `awsApi.ts` already
+   * treats UNSUPPORTED_CAPABILITY this way centrally.
+   */
+  status: 'success' | 'partial' | 'failed' | 'not_supported';
   pages: number;
   resources: number;
   attempts: number;
+  termination?: PaginationTermination;
   error?: string;
 }
 
@@ -55,55 +69,67 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
   const startedAt = new Date().toISOString();
   const operations: IamScanOperation[] = [];
 
-  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  /**
+   * Routes an incomplete walk into the same degraded-coverage sink every AWS
+   * failure already uses, so finalize cannot read pages we never fetched as
+   * deletions. This is the whole reason stopping beats throwing.
+   */
+  const onIncomplete = incompleteSink(ctx.creds);
 
-  const isRetryable = (errorCode?: string, status?: number): boolean => {
-    if (typeof status === 'number' && (status === 429 || status >= 500)) return true;
-    return !!errorCode && new Set([
-      'Throttling',
-      'ThrottlingException',
-      'TooManyRequestsException',
-      'RequestLimitExceeded',
-      'ServiceUnavailable',
-      'InternalFailure',
-      'InternalError',
-      'RequestTimeout',
-      'RequestTimeoutException',
-    ]).has(errorCode);
-  };
+
 
   const call = async (
     action: string,
     params?: Record<string, string>,
-    options: { required?: boolean; maxAttempts?: number } = {},
+    options: { required?: boolean } = {},
   ): Promise<string> => {
-    const maxAttempts = Math.max(1, options.maxAttempts ?? 4);
-    let lastError = 'unknown IAM API error';
+    const result = await callQueryApi(ctx.creds, {
+      service: 'iam',
+      region: REGION,
+      host: ENDPOINT,
+      action,
+      version: VERSION,
+      params,
+    });
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const result = await callQueryApi(ctx.creds, {
-        service: 'iam',
-        region: REGION,
-        host: ENDPOINT,
-        action,
-        version: VERSION,
-        params,
-      });
+    if (result.ok) return result.body as string;
 
-      if (result.ok) return result.body as string;
+    const code = result.normalizedCode ?? result.errorCode ?? result.errorMessage ?? String(result.status);
 
-      lastError = result.errorMessage ?? result.errorCode ?? String(result.status);
-      if (!isRetryable(result.errorCode, result.status) || attempt === maxAttempts) break;
+    /**
+     * A retired or not-enabled capability is a settled answer, not a failure.
+     * `awsApi.ts` already treats UNSUPPORTED_CAPABILITY this way centrally --
+     * it is deliberately excluded from degraded coverage, because "this
+     * account has not enabled X" must not freeze cleanup for a service nobody
+     * uses.
+     */
+    const retired = code === 'UNSUPPORTED_CAPABILITY';
+    operations.push({
+      action,
+      status: retired ? 'not_supported' : 'failed',
+      pages: 0,
+      resources: 0,
+      attempts: result.attempts ?? 1,
+      error: code,
+    });
 
-      // Bounded exponential backoff with jitter. Keep IAM scans from creating
-      // retry storms when a large account is throttled.
-      const base = Math.min(2000, 250 * (2 ** (attempt - 1)));
-      const jitter = Math.floor(Math.random() * 150);
-      await sleep(base + jitter);
-    }
-
-    if (options.required !== false) {
-      throw new Error(`IAM ${action} failed after ${maxAttempts} attempt(s): ${lastError}`);
+    /**
+     * `required` is preserved, and it is load-bearing.
+     *
+     * If ListUsers is DENIED and this returned '', the scan would parse zero
+     * users and report success -- publishing "0 IAM users" for an account
+     * whose IAM we were simply not permitted to read. That is precisely what
+     * AWS-11 forbids. Throwing fails the step visibly instead.
+     *
+     * A retired capability never throws: there is nothing to have been denied.
+     *
+     * The hand-rolled retry loop that wrapped this is gone. `callQueryApi`
+     * already applies `withRetry` with the same backoff, jitter and retryable
+     * classification, so two layers meant up to 4 x 4 = 16 attempts against a
+     * throttled endpoint -- making throttling worse, not better.
+     */
+    if (options.required !== false && !retired) {
+      throw new Error(`IAM ${action} failed: ${code}`);
     }
 
     return '';
@@ -123,20 +149,57 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
     const pages: string[] = [];
     let marker: string | undefined;
     let attempts = 0;
+    let termination: PaginationTermination = 'complete';
+    let detail: string | undefined;
 
     do {
       const pageParams = marker ? { ...(params ?? {}), Marker: marker } : params;
       attempts++;
       const xml = await call(action, pageParams, options);
-      if (!xml) break;
+
+      // An empty body means `call` already recorded its own failed or
+      // not_supported operation. Terminating as `complete` here would claim
+      // the list was fully read when the first page never arrived.
+      if (!xml) {
+        if (pages.length > 0) { termination = 'failed'; detail = `IAM ${action} stopped after a failed page`; }
+        else return { pages, attempts };
+        break;
+      }
       pages.push(xml);
+
+      /**
+       * Page cap. An unbounded walk against a hostile or looping endpoint
+       * would spin forever inside one worker slice; terminating as
+       * `page_cap` keeps the rows we have and marks the set incomplete.
+       */
+      if (pages.length >= DEFAULT_MAX_PAGES) {
+        termination = 'page_cap';
+        detail = `IAM ${action} hit the ${DEFAULT_MAX_PAGES}-page cap`;
+        console.error(detail);
+        onIncomplete('PAGINATION_TRUNCATED', detail);
+        break;
+      }
 
       const isTruncated = field(xml, 'IsTruncated') === 'true';
       const nextMarker = field(xml, 'Marker') ?? field(xml, 'NextToken');
 
       if (!isTruncated) break;
+
+      /**
+       * AWS said there is more and then gave us no usable way to ask for it.
+       *
+       * Throwing here discarded every page already collected and took the
+       * whole IAM scan down with it. Stopping is right; losing the rows is
+       * not. It terminates as `malformed`, which flows into `partial` below
+       * and degrades the resource types, so finalize cannot read the pages we
+       * never got as deletions.
+       */
       if (!nextMarker || nextMarker === marker) {
-        throw new Error(`IAM ${action} reported IsTruncated=true without a usable continuation marker`);
+        termination = 'malformed';
+        detail = `IAM ${action} reported IsTruncated=true without a usable continuation marker`;
+        console.error(`${detail}; stopped after ${pages.length} page(s)`);
+        onIncomplete('PAGINATION_TRUNCATED', detail);
+        break;
       }
       marker = nextMarker;
     } while (true);
@@ -148,10 +211,12 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
 
     operations.push({
       action,
-      status: 'success',
+      status: termination === 'complete' ? 'success' : 'partial',
       pages: pages.length,
       resources,
       attempts,
+      termination,
+      ...(detail ? { error: detail } : {}),
     });
 
     return { pages, attempts };
