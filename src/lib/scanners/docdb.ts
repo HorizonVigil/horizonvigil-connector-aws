@@ -29,7 +29,7 @@ export async function scanDocDb(ctx: ScannerContext): Promise<ScannedResource[]>
   const out: ScannedResource[] = [];
   for (const cl of extractListItems(extractSection(xml, 'DBClusters'), 'DBCluster')) {
     out.push({
-      resourceTypeKey: 'docdb_cluster', resourceId: field(cl, 'DBClusterIdentifier')!, region: ctx.region,
+      resourceTypeKey: 'docdb_cluster', resourceId: field(cl, 'DBClusterIdentifier') ?? '', region: ctx.region,
       resourceName: field(cl, 'DBClusterIdentifier') ?? undefined, state: field(cl, 'Status') ?? undefined,
       metadata: {
         engineVersion: field(cl, 'EngineVersion'), endpoint: field(cl, 'Endpoint'),

@@ -51,7 +51,7 @@ export async function scanRds(ctx: ScannerContext): Promise<ScannedResource[]> {
     const endpointSection = extractSection(db, 'Endpoint');
     const subnetGroup = extractSection(db, 'DBSubnetGroup');
     out.push({
-      resourceTypeKey: 'rds_instance', resourceId: field(db, 'DBInstanceIdentifier')!, region: ctx.region,
+      resourceTypeKey: 'rds_instance', resourceId: field(db, 'DBInstanceIdentifier') ?? '', region: ctx.region,
       resourceName: tags['Name'] ?? field(db, 'DBInstanceIdentifier') ?? undefined,
       state: field(db, 'DBInstanceStatus') ?? undefined, tags,
       metadata: {
@@ -72,7 +72,7 @@ export async function scanRds(ctx: ScannerContext): Promise<ScannedResource[]> {
   for (const cl of extractListItems(extractSection(clusters, 'DBClusters'), 'DBCluster')) {
     const tags = rdsTags(cl);
     out.push({
-      resourceTypeKey: 'rds_cluster', resourceId: field(cl, 'DBClusterIdentifier')!, region: ctx.region,
+      resourceTypeKey: 'rds_cluster', resourceId: field(cl, 'DBClusterIdentifier') ?? '', region: ctx.region,
       resourceName: tags['Name'] ?? field(cl, 'DBClusterIdentifier') ?? undefined,
       state: field(cl, 'Status') ?? undefined, tags,
       metadata: {
@@ -88,7 +88,7 @@ export async function scanRds(ctx: ScannerContext): Promise<ScannedResource[]> {
   for (const sn of extractListItems(extractSection(snapshots, 'DBSnapshots'), 'DBSnapshot')) {
     const tags = rdsTags(sn);
     out.push({
-      resourceTypeKey: 'rds_snapshot', resourceId: field(sn, 'DBSnapshotIdentifier')!, region: ctx.region,
+      resourceTypeKey: 'rds_snapshot', resourceId: field(sn, 'DBSnapshotIdentifier') ?? '', region: ctx.region,
       resourceName: tags['Name'] ?? field(sn, 'DBSnapshotIdentifier') ?? undefined,
       state: field(sn, 'Status') ?? undefined, tags,
       metadata: {
