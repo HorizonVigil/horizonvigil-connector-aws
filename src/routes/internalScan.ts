@@ -1,10 +1,8 @@
 import { Hono, createDb, guarded, okJson, errJson, type Db } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
-import {
-  REGIONAL_SCANNERS, GLOBAL_SCANNERS, FINDING_SCANNERS, METRIC_STEP_NAME, SCANNER_RESOURCE_TYPES,
-  loadConnection, regionsFor, runResourceStep, runFindingStep, runMetricStep, runFinalize,
-  type StepErrorInput,
-} from './discovery';
+import { planSteps } from './collectionRuns';
+import { createOrGetActiveRun } from '../lib/collectionRuns';
+import { loadConnection } from './discovery';
 
 export const internalScanRoutes = new Hono<{ Bindings: Env }>();
 
@@ -71,16 +69,13 @@ const ABANDONED_SCAN_THRESHOLD_MINUTES = 30;
 
 interface ConnectionDue { id: string; org_id: string; scan_interval_hours: number }
 
-// null userId: this is the scheduled scan worker, which runs with the
-// service-role key across every org and has no requesting user to authorize
-// against. Its connection set comes from the due-scan query, not from a
-// caller-supplied id, so there is nothing for a permitted-set check to bound.
-async function runOneStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string) {
-  if (stepId.startsWith('finding:')) return runFindingStep(db, orgId, null, env, connectionId, stepId);
-  if (stepId.startsWith('metric:')) return runMetricStep(db, orgId, null, env, connectionId, stepId);
-  return runResourceStep(db, orgId, null, env, connectionId, stepId);
-}
-
+/**
+ * Both endpoints below ENQUEUE durable runs; neither executes steps. The
+ * inline step helper that used to live here was deleted along with the
+ * loops, so there is no dormant executor for a future change to wire back
+ * up -- which is how the scheduled path drifted off the durable machinery
+ * the first time.
+ */
 internalScanRoutes.post('/internal/run-due-scans', (c) =>
   guarded(async () => {
     const secret = c.req.header('x-internal-scan-secret');
@@ -101,67 +96,61 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
       limit: MAX_CONNECTIONS_PER_RUN,
     });
 
+    /**
+     * AWS-06. This endpoint used to EXECUTE the scan: it looped over due
+     * connections calling runResourceStep/runFindingStep/runMetricStep
+     * directly, then called runFinalize itself. It never created a
+     * collection_runs row.
+     *
+     * So the path that actually ran in production -- this one, on a
+     * schedule, unattended -- had no lease, no checkpoint, no run status and
+     * no protection against two overlapping invocations. Cross-check on
+     * 2026-09-15 found 4 run rows in total, newest 2026-09-10, while
+     * ingestion_batches had grown from 7,960 to 15,422 over the same four
+     * days: roughly 7,500 batches written by scans that no run row describes.
+     *
+     * It now ENQUEUES a durable run per due connection and returns. The
+     * worker tick (advance-collection-runs, already on its own schedule)
+     * claims a lease, advances a bounded slice, checkpoints, and finalizes.
+     *
+     * That move also makes vanished-resource safety strictly better rather
+     * than merely equivalent: the durable finalize decides eligibility from
+     * the COMMITTED collection_run_steps rows, whereas this loop decided it
+     * from in-memory counters that only ever saw one invocation.
+     *
+     * createOrGetActiveRun is idempotent against the partial unique index on
+     * active runs, so a connection already collecting is not enqueued twice
+     * -- the case this endpoint previously had no defence against at all.
+     */
     const results = [];
     for (const row of due) {
       const connection = await loadConnection(db, row.org_id, null, row.id);
       if (!connection) continue;
 
-      const runStartedAt = new Date().toISOString();
-      const regions = regionsFor(connection);
-      const steps = [
-        ...regions.flatMap((region) => Object.keys(REGIONAL_SCANNERS).map((name) => `regional:${name}:${region}`)),
-        ...Object.keys(GLOBAL_SCANNERS).map((name) => `global:${name}`),
-        ...regions.flatMap((region) => Object.keys(FINDING_SCANNERS).map((name) => `finding:${name}:${region}`)),
-        ...regions.map((region) => `metric:${METRIC_STEP_NAME}:${region}`),
-      ].slice(0, MAX_STEPS_PER_CONNECTION);
+      const plannedSteps = planSteps(connection as never);
+      const { run, created } = await createOrGetActiveRun(db, {
+        orgId: row.org_id,
+        connectionId: row.id,
+        requestedBy: null,
+        trigger: 'scheduled',
+        plannedSteps,
+        // Deterministic per connection per due-window, so a scheduler retry
+        // within the same window cannot mint a second run.
+        idempotencyKey: `scheduled:${row.id}:${now.slice(0, 13)}`,
+      });
 
-      const stepErrors: StepErrorInput[] = [];
-      // Resource types whose coverage was incomplete this run. Passed to
-      // finalize so a throttled or denied Describe* cannot be read as "these
-      // resources were deleted" -- the scheduled scan is where that would do
-      // the most damage, because nothing is watching it run.
-      const degradedResourceTypes = new Set<string>();
-      const failedStepIds = new Set<string>();
-      for (const stepId of steps) {
-        const result = await runOneStep(db, row.org_id, c.env, row.id, stepId);
-        for (const t of result.degradedResourceTypes ?? []) degradedResourceTypes.add(t);
-        if (result.error) {
-          stepErrors.push({ message: `${stepId}: ${result.error}`, severity: result.errorSeverity ?? 'error' });
-          // 'info' (e.g. "service not enabled in this region") is a genuine,
-          // successful zero-resources answer, not a failure — only a real
-          // error means this step's scanner didn't actually get to check.
-          if ((result.errorSeverity ?? 'error') !== 'info') failedStepIds.add(stepId);
-        }
-      }
-
-      // A scanner's resource types are only safe to vanish-check if EVERY
-      // one of the connection's regions for that scanner actually ran this
-      // invocation AND SUCCEEDED — two real bugs found the same day
-      // (2026-08-12) this endpoint was first exercised with real data: (1)
-      // MAX_STEPS_PER_CONNECTION means a typical multi-region connection
-      // only completes a fraction of its regional scanners per cycle, so
-      // treating "step 1 ran" as "fully checked" mass-deleted resources in
-      // regions not yet reached; (2) a step that ran but errored (e.g. a
-      // connection with broken/rotated credentials failing every single
-      // call) still counted as "checked," wiping out an entire broken
-      // connection's resources on the very next scan after the credentials
-      // stopped working, instead of leaving them alone until reconnected.
-      // Global scanners always fully cover themselves in one step when it
-      // runs and succeeds.
-      const stepSet = new Set(steps);
-      const coveredResourceTypes = [
-        ...Object.keys(GLOBAL_SCANNERS).filter((name) => stepSet.has(`global:${name}`) && !failedStepIds.has(`global:${name}`)).flatMap((name) => SCANNER_RESOURCE_TYPES[name] ?? []),
-        ...Object.keys(REGIONAL_SCANNERS).filter((name) => regions.every((r) => stepSet.has(`regional:${name}:${r}`) && !failedStepIds.has(`regional:${name}:${r}`))).flatMap((name) => SCANNER_RESOURCE_TYPES[name] ?? []),
-      ];
-
-      const outcome = await runFinalize(db, row.org_id, null, connection, runStartedAt, stepErrors, c.env, coveredResourceTypes, steps.length, [...degradedResourceTypes]);
+      /**
+       * Advanced whether or not a run was created. If one was already active
+       * the connection is collecting right now, and leaving next_scheduled_
+       * scan_at in the past would re-enqueue it on every tick forever.
+       */
       const nextScan = new Date(Date.now() + row.scan_interval_hours * 60 * 60 * 1000).toISOString();
       await db.update('cloud_connections', { id: `eq.${row.id}` }, { next_scheduled_scan_at: nextScan }, 'return=minimal');
 
-      results.push({ connectionId: row.id, ...outcome });
+      results.push({ connectionId: row.id, runId: run.id, status: run.status, created, plannedSteps: plannedSteps.length });
     }
 
-    return okJson({ connectionsScanned: results.length, results });
+    return okJson({ connectionsEnqueued: results.length, results });
   }),
 );
 
@@ -229,47 +218,30 @@ internalScanRoutes.post('/internal/run-first-scans', (c) =>
       const connection = await loadConnection(db, row.org_id, null, row.id);
       if (!connection) continue;
 
-      const runStartedAt = new Date().toISOString();
-      const regions = regionsFor(connection);
-      const steps = [
-        ...regions.flatMap((region) => Object.keys(REGIONAL_SCANNERS).map((name) => `regional:${name}:${region}`)),
-        ...Object.keys(GLOBAL_SCANNERS).map((name) => `global:${name}`),
-        ...regions.flatMap((region) => Object.keys(FINDING_SCANNERS).map((name) => `finding:${name}:${region}`)),
-        ...regions.map((region) => `metric:${METRIC_STEP_NAME}:${region}`),
-      ].slice(0, MAX_STEPS_PER_CONNECTION);
+      /**
+       * AWS-06, same change as run-due-scans above. This loop also executed
+       * steps inline and finalized them itself, with no run row, no lease and
+       * no checkpoint -- and this is the FIRST scan of a brand-new
+       * connection, so an interruption left a half-populated inventory with
+       * nothing recording where it stopped.
+       */
+      const plannedSteps = planSteps(connection as never);
+      const { run, created } = await createOrGetActiveRun(db, {
+        orgId: row.org_id,
+        connectionId: row.id,
+        requestedBy: null,
+        trigger: 'first_scan',
+        plannedSteps,
+        idempotencyKey: `first-scan:${row.id}`,
+      });
 
-      const stepErrors: StepErrorInput[] = [];
-      // Resource types whose coverage was incomplete this run. Passed to
-      // finalize so a throttled or denied Describe* cannot be read as "these
-      // resources were deleted" -- the scheduled scan is where that would do
-      // the most damage, because nothing is watching it run.
-      const degradedResourceTypes = new Set<string>();
-      const failedStepIds = new Set<string>();
-      for (const stepId of steps) {
-        const result = await runOneStep(db, row.org_id, c.env, row.id, stepId);
-        for (const t of result.degradedResourceTypes ?? []) degradedResourceTypes.add(t);
-        if (result.error) {
-          stepErrors.push({ message: `${stepId}: ${result.error}`, severity: result.errorSeverity ?? 'error' });
-          if ((result.errorSeverity ?? 'error') !== 'info') failedStepIds.add(stepId);
-        }
-      }
-
-      const stepSet = new Set(steps);
-      const coveredResourceTypes = [
-        ...Object.keys(GLOBAL_SCANNERS).filter((name) => stepSet.has(`global:${name}`) && !failedStepIds.has(`global:${name}`)).flatMap((name) => SCANNER_RESOURCE_TYPES[name] ?? []),
-        ...Object.keys(REGIONAL_SCANNERS).filter((name) => regions.every((r) => stepSet.has(`regional:${name}:${r}`) && !failedStepIds.has(`regional:${name}:${r}`))).flatMap((name) => SCANNER_RESOURCE_TYPES[name] ?? []),
-      ];
-
-      const outcome = await runFinalize(db, row.org_id, null, connection, runStartedAt, stepErrors, c.env, coveredResourceTypes, steps.length, [...degradedResourceTypes]);
-      // Enters the normal daily cadence from here on — run-due-scans above
-      // now sees this connection, since runFinalize just moved its status
-      // off 'pending'. scan_interval_hours isn't loaded here (loadConnection
-      // doesn't select it, and a freshly bulk-created row has never had a
-      // custom interval set) — 24h matches that column's own default.
+      // Enters the normal daily cadence from here on. 24h matches the
+      // scan_interval_hours column default; loadConnection does not select
+      // it, and a freshly created row has never had a custom interval set.
       const nextScan = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
       await db.update('cloud_connections', { id: `eq.${row.id}` }, { next_scheduled_scan_at: nextScan }, 'return=minimal');
 
-      results.push({ connectionId: row.id, ...outcome });
+      results.push({ connectionId: row.id, runId: run.id, status: run.status, created, plannedSteps: plannedSteps.length });
     }
 
     return okJson({ connectionsScanned: results.length, results });
