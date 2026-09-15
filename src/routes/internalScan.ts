@@ -132,11 +132,11 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
         orgId: row.org_id,
         connectionId: row.id,
         requestedBy: null,
-        trigger: 'scheduled',
+        trigger: 'schedule',
         plannedSteps,
         // Deterministic per connection per due-window, so a scheduler retry
         // within the same window cannot mint a second run.
-        idempotencyKey: `scheduled:${row.id}:${now.slice(0, 13)}`,
+        idempotencyKey: `schedule:${row.id}:${now.slice(0, 13)}`,
       });
 
       /**
@@ -230,9 +230,9 @@ internalScanRoutes.post('/internal/run-first-scans', (c) =>
         orgId: row.org_id,
         connectionId: row.id,
         requestedBy: null,
-        trigger: 'first_scan',
+        trigger: 'initial_sync',
         plannedSteps,
-        idempotencyKey: `first-scan:${row.id}`,
+        idempotencyKey: `initial-sync:${row.id}`,
       });
 
       // Enters the normal daily cadence from here on. 24h matches the

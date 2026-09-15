@@ -28,8 +28,26 @@ describe('scheduled collection is durable', () => {
   it('both scheduled entry points create a collection run', () => {
     const creates = SOURCE.match(/createOrGetActiveRun\(/g) ?? [];
     expect(creates.length).toBe(2);
-    expect(SOURCE).toContain("trigger: 'scheduled'");
-    expect(SOURCE).toContain("trigger: 'first_scan'");
+    expect(SOURCE).toContain("trigger: 'schedule'");
+    expect(SOURCE).toContain("trigger: 'initial_sync'");
+  });
+
+  /**
+   * The trigger vocabulary is a CHECK constraint on collection_runs:
+   *
+   *   'user' | 'schedule' | 'initial_sync' | 'retry' | 'backfill'
+   *
+   * The first cut of this change invented 'scheduled' and 'first_scan'.
+   * Both built, both typechecked, both passed the suite -- and production
+   * returned 500 on the first real trigger with 23514 check_violation. A
+   * string that only the database validates is invisible to tsc, so it is
+   * pinned here instead.
+   */
+  it('uses only trigger values the database constraint permits', () => {
+    const ALLOWED = ['user', 'schedule', 'initial_sync', 'retry', 'backfill'];
+    const used = [...SOURCE.matchAll(/trigger: '([a-z_]+)'/g)].map((m) => m[1]);
+    expect(used.length).toBeGreaterThan(0);
+    for (const t of used) expect(ALLOWED, `trigger '${t}' violates collection_runs_trigger_check`).toContain(t);
   });
 
   /**
