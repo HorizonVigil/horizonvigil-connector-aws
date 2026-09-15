@@ -144,3 +144,48 @@ describe('buildScanHealth', () => {
     expect(buildScanHealth(null, []).countIsAuthoritative).toBe(false);
   });
 });
+
+/**
+ * The truncation defect this module exists to expose, reproduced inside it.
+ *
+ * The first version counted statuses from the step rows it was handed. But the
+ * route selected them with `limit: 5000`, and PostgREST caps a response at
+ * ~1000 rows server-side. Measured on a real 1,628-step run: the endpoint
+ * reported `succeededSteps: 1000`.
+ *
+ * The count being wrong was the harmless half. The dangerous half is that a
+ * failure sitting beyond row 1000 was invisible, so this would have answered
+ * COMPLETE with `countIsAuthoritative: true` over a scan that had failed.
+ */
+describe('counts never come from a capped page', () => {
+  const run = { status: 'SUCCEEDED', totalSteps: 1628, completedSteps: 1628, failedSteps: 0, degradedResourceTypes: [] };
+
+  it('uses the exact counts it is given, not the rows it can see', () => {
+    // What the route now passes: no success rows at all, just the number.
+    const h = buildScanHealth(run, [], { succeededSteps: 1628, failedSteps: 0 });
+    expect(h.succeededSteps).toBe(1628);
+    expect(h.completeness).toBe('COMPLETE');
+  });
+
+  /**
+   * The load-bearing case. Failures are fetched as their own filtered query,
+   * so a failure that would have fallen past row 1000 of a mixed page is still
+   * counted and still downgrades the verdict.
+   */
+  it('reports PARTIAL from an exact failed count even when no rows were paged in', () => {
+    const h = buildScanHealth(
+      { ...run, status: 'SUCCEEDED' },
+      [step('regional:ec2:us-east-1', 'failed')],
+      { succeededSteps: 1611, failedSteps: 17 },
+    );
+    expect(h.failedSteps).toBe(17);
+    expect(h.completeness).toBe('PARTIAL');
+    expect(h.countIsAuthoritative).toBe(false);
+  });
+
+  /** Without counts it still works, so existing callers are unaffected. */
+  it('falls back to counting rows when no exact counts are supplied', () => {
+    const h = buildScanHealth(run, [step('a:b:c', 'succeeded'), step('d:e:f', 'succeeded')]);
+    expect(h.succeededSteps).toBe(2);
+  });
+});

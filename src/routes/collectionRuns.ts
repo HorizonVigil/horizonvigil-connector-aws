@@ -220,21 +220,49 @@ collectionRunRoutes.get('/accounts/:id/scan-health', (c) =>
       return okJson({ ...buildScanHealth(null, []), runId: null, finishedAt: null });
     }
 
-    const steps = await db.select<StepRow[]>('collection_run_steps', {
+    /**
+     * FAILED rows only, plus exact counts.
+     *
+     * The first version of this selected every step row with `limit: 5000` and
+     * counted statuses in memory. PostgREST caps a response at ~1000 rows
+     * server-side regardless of the app limit, so a 1,628-step run reported
+     * `succeededSteps: 1000` -- and, far worse, any failure sitting beyond row
+     * 1000 was invisible. This endpoint would then have answered COMPLETE with
+     * `countIsAuthoritative: true` while a scanner had failed.
+     *
+     * That is precisely the truncation defect this endpoint exists to expose,
+     * reproduced inside the endpoint itself.
+     *
+     * Failures are the only rows needing detail (they group by scanner), and
+     * they are bounded in any healthy run. Successes need a number, not rows,
+     * so they come from an exact count instead of a page.
+     */
+    const [failedSteps, failedCount] = await db.selectWithCount<StepRow[]>('collection_run_steps', {
       select: 'step_id,status,normalized_code,error_message',
+      filters: { run_id: `eq.${run.id}`, status: 'eq.failed' },
+      limit: 1000,
+    });
+    const [, totalCount] = await db.selectWithCount<{ step_id: string }[]>('collection_run_steps', {
+      select: 'step_id',
       filters: { run_id: `eq.${run.id}` },
-      limit: 5000,
+      limit: 1,
+    });
+    const [, succeededCount] = await db.selectWithCount<{ step_id: string }[]>('collection_run_steps', {
+      select: 'step_id',
+      filters: { run_id: `eq.${run.id}`, status: 'eq.succeeded' },
+      limit: 1,
     });
 
     const health = buildScanHealth(
       {
         status: run.status,
-        totalSteps: run.total_steps ?? 0,
+        totalSteps: run.total_steps ?? totalCount,
         completedSteps: run.completed_steps ?? 0,
-        failedSteps: run.failed_steps ?? 0,
+        failedSteps: failedCount,
         degradedResourceTypes: run.degraded_resource_types ?? [],
       },
-      steps,
+      failedSteps,
+      { succeededSteps: succeededCount, failedSteps: failedCount },
     );
 
     return okJson({ ...health, runId: run.id, finishedAt: run.finished_at ?? null });

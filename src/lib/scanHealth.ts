@@ -118,11 +118,30 @@ export interface RunFacts {
   degradedResourceTypes: readonly string[];
 }
 
-export function buildScanHealth(run: RunFacts | null, steps: readonly StepRow[]): ScanHealth {
+/**
+ * Exact per-status counts, supplied by the caller.
+ *
+ * Counting from `steps` was wrong: PostgREST caps a response at ~1000 rows
+ * server-side, so a 1,628-step run reported 1000 successes and -- far worse --
+ * any failure beyond row 1000 was invisible, which would have produced
+ * COMPLETE with `countIsAuthoritative: true` over a failed scan. The caller
+ * now passes counts taken with `count=exact`, and `steps` carries only the
+ * failed rows that need grouping.
+ */
+export interface StepCounts {
+  succeededSteps: number;
+  failedSteps: number;
+}
+
+export function buildScanHealth(
+  run: RunFacts | null,
+  steps: readonly StepRow[],
+  counts?: StepCounts,
+): ScanHealth {
   const failures = groupFailures(steps);
   const degradedResourceTypes = [...(run?.degradedResourceTypes ?? [])].sort();
-  const succeeded = steps.filter((s) => s.status === 'succeeded').length;
-  const failed = steps.filter((s) => s.status === 'failed').length;
+  const succeeded = counts ? counts.succeededSteps : steps.filter((s) => s.status === 'succeeded').length;
+  const failed = counts ? counts.failedSteps : steps.filter((s) => s.status === 'failed').length;
 
   if (!run || run.status === null) {
     return {
