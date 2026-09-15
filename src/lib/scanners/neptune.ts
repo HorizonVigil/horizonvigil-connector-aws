@@ -23,7 +23,7 @@ export async function scanNeptune(ctx: ScannerContext): Promise<ScannedResource[
   const out: ScannedResource[] = [];
   for (const cl of extractListItems(extractSection(xml, 'DBClusters'), 'DBCluster')) {
     out.push({
-      resourceTypeKey: 'neptune_cluster', resourceId: field(cl, 'DBClusterIdentifier')!, region: ctx.region,
+      resourceTypeKey: 'neptune_cluster', resourceId: field(cl, 'DBClusterIdentifier') ?? '', region: ctx.region,
       resourceName: field(cl, 'DBClusterIdentifier') ?? undefined, state: field(cl, 'Status') ?? undefined,
       metadata: {
         engineVersion: field(cl, 'EngineVersion'), endpoint: field(cl, 'Endpoint'),
