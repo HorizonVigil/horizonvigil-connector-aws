@@ -20,12 +20,17 @@ describe('buildTopologyEdges — AWS-10', () => {
   it('derives the full topology from direct provider references', () => {
     const edges = buildTopologyEdges(CONN, all, NOW);
     const shape = edges.map((e) => `${e.source_resource_id} -${e.relationship_type}-> ${e.target_resource_id}`).sort();
+    // Every type below is in the database's CHECK vocabulary. The original
+    // set named CONTAINED_BY and used ATTACHED_TO for subnet placement;
+    // neither CONTAINED_BY nor PROTECTED_BY existed in the constraint, so
+    // this exact assertion passed while every production insert raised
+    // 23514. See edgeVocabulary.ts.
     expect(shape).toEqual([
-      'row-ec2 -ATTACHED_TO-> row-subnet',
-      'row-ec2 -CONTAINED_BY-> row-vpc',
+      'row-ec2 -BELONGS_TO-> row-vpc',
+      'row-ec2 -DEPLOYED_TO-> row-subnet',
       'row-ec2 -PROTECTED_BY-> row-sg',
-      'row-sg -CONTAINED_BY-> row-vpc',
-      'row-subnet -CONTAINED_BY-> row-vpc',
+      'row-sg -BELONGS_TO-> row-vpc',
+      'row-subnet -BELONGS_TO-> row-vpc',
       'row-vol -ATTACHED_TO-> row-ec2',
     ]);
   });

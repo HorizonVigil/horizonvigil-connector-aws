@@ -1040,6 +1040,45 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
     { status: 'resolved', resolved_at: now },
   );
 
+  /**
+   * Edge materialization runs once per full scan cycle, not per-step, since
+   * it joins resources and identities scanned by different, independently-
+   * ordered steps (lambda.ts, eks.ts, iam.ts) -- see edgeMaterialization.ts.
+   * It runs AFTER tombstoning above so an edge can only bind to the
+   * generation that is live now, and BEFORE the summary below so its outcome
+   * is recorded rather than only logged.
+   *
+   * Still best-effort -- a correlation failure must not fail a scan that
+   * collected real inventory. But "best-effort" previously meant a single
+   * shared try/catch and one console line, and that is how AWS-10 spent its
+   * whole life broken: every topology insert raised 23514 against a CHECK
+   * constraint, the catch swallowed it, and a 1,904-resource estate rendered
+   * as "no relationships" -- a total write failure presented as a fact about
+   * the customer's infrastructure.
+   *
+   * Two changes so that cannot recur silently:
+   *  - the two materializers get their own try/catch, so a failure in one no
+   *    longer skips the other (that shared catch is why the topology call was
+   *    never even reached whenever the identity edges failed first);
+   *  - the outcome goes into the stored summary, so an empty graph is
+   *    distinguishable from a graph that could not be built.
+   */
+  const graphOutcome: Record<string, unknown> = {};
+  try {
+    const { edgeCount } = await materializeResourceEdges(db, connection.id);
+    graphOutcome.identityEdges = { state: 'materialized', edges: edgeCount };
+  } catch (err) {
+    graphOutcome.identityEdges = { state: 'failed', reason: err instanceof Error ? err.message : String(err) };
+    console.error(`Identity edge materialization failed for connection ${connection.id} (continuing without it): ${err instanceof Error ? err.message : err}`);
+  }
+  try {
+    const { edgeCount } = await materializeNetworkTopology(db, connection.id);
+    graphOutcome.topologyEdges = { state: 'materialized', edges: edgeCount };
+  } catch (err) {
+    graphOutcome.topologyEdges = { state: 'failed', reason: err instanceof Error ? err.message : String(err) };
+    console.error(`Network topology materialization failed for connection ${connection.id} (continuing without it): ${err instanceof Error ? err.message : err}`);
+  }
+
   const realErrors = stepErrors.filter((e) => e.severity !== 'info');
   // A handful of transient failures (a couple of "fetch failed" network
   // blips late in a long multi-region run, say) shouldn't flip a connection
@@ -1056,6 +1095,10 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
     scannedAt: now, totalResources: activeCount, categoryCounts: activeCategoryCounts,
     servicesTotal: `${Object.keys(REGIONAL_SCANNERS).length + Object.keys(GLOBAL_SCANNERS).length} live / 245 catalogued`,
     regionsScanned: regionsFor(connection), errors: stepErrors.slice(0, 20),
+    // Present so a reader can tell "this estate has no relationships" from
+    // "the graph could not be built this run". Those render identically
+    // without it, and for AWS-10 the second was true for every run.
+    graph: graphOutcome,
   };
 
   await db.update(
@@ -1095,23 +1138,6 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
     },
     'return=minimal',
   );
-
-  // Edge materialization runs once per full scan cycle, not per-step, since
-  // it joins resources and identities scanned by different, independently-
-  // ordered steps (lambda.ts, eks.ts, iam.ts) -- see edgeMaterialization.ts.
-  // Best-effort: a resource that briefly can't be correlated into an edge
-  // (e.g. its role hasn't been scanned yet this run) is picked up cleanly
-  // on the next cycle, so a failure here must never fail the whole scan.
-  try {
-    await materializeResourceEdges(db, connection.id);
-    // AWS-10. Network topology from direct provider references. Runs here for
-    // the same reason as the edges above: the resources it joins are scanned
-    // by different steps, so deriving mid-scan could see an instance before
-    // its subnet exists.
-    await materializeNetworkTopology(db, connection.id);
-  } catch (err) {
-    console.error(`Edge materialization failed for connection ${connection.id} (continuing without it): ${err instanceof Error ? err.message : err}`);
-  }
 
   // Both best-effort, server-to-server — see postScanHooks.ts's doc comment
   // for why these live here rather than as a client-side post-scan step:
