@@ -1,4 +1,5 @@
 import type { Db } from '@horizonvigil/shared-lib';
+import type { EdgeRelationshipType } from './edgeVocabulary';
 
 interface ResourceRow { id: string; resource_type_key: string; relationships: Record<string, unknown> | null; metadata: Record<string, unknown> | null }
 interface IdentityRow { id: string; identity_type: string; native_label: string | null; display_name: string | null }
@@ -7,7 +8,9 @@ export interface EdgeRow {
   connection_id: string;
   source_resource_id: string | null; source_identity_id: string | null;
   target_resource_id: string | null; target_identity_id: string | null;
-  relationship_type: string; confidence: number; source_engine: string;
+  // Typed against the database's CHECK vocabulary — see edgeVocabulary.ts
+  // for why a bare `string` here cost AWS-10 its entire edge set.
+  relationship_type: EdgeRelationshipType; confidence: number; source_engine: string;
   metadata: Record<string, unknown>; last_seen_at: string; deleted_at: null;
 }
 

@@ -20,6 +20,7 @@
  * it costs no additional provider calls.
  */
 import type { Db } from '@horizonvigil/shared-lib';
+import type { EdgeRelationshipType } from './edgeVocabulary';
 
 export interface TopologyEdge {
   connection_id: string;
@@ -27,7 +28,13 @@ export interface TopologyEdge {
   source_identity_id: null;
   target_resource_id: string | null;
   target_identity_id: null;
-  relationship_type: string;
+  /**
+   * Typed, not `string`. The first cut of this file emitted CONTAINED_BY,
+   * ATTACHED_TO and PROTECTED_BY as bare strings; the database permitted
+   * none of them, so every insert raised 23514 and the best-effort caller
+   * turned a total write failure into an empty graph. See edgeVocabulary.ts.
+   */
+  relationship_type: EdgeRelationshipType;
   confidence: number;
   source_engine: string;
   metadata: Record<string, unknown>;
@@ -76,7 +83,7 @@ export function buildTopologyEdges(
     sourceId: string,
     targetType: string,
     targetNative: string | null,
-    relationship: string,
+    relationship: EdgeRelationshipType,
     engine: string,
   ) => {
     if (!targetNative) return;
@@ -103,15 +110,21 @@ export function buildTopologyEdges(
   for (const r of resources) {
     const rel = r.relationships ?? {};
     switch (r.resource_type_key) {
+      // BELONGS_TO, not CONTAINED_BY. The database's vocabulary already had
+      // the inverse of CONTAINS; adding a synonym would force every consumer
+      // to check two names for one relationship forever.
       case 'subnet':
-        push(r.id, 'vpc', asString(rel.vpcId), 'CONTAINED_BY', 'vpc');
+        push(r.id, 'vpc', asString(rel.vpcId), 'BELONGS_TO', 'vpc');
         break;
       case 'security_group':
-        push(r.id, 'vpc', asString(rel.vpcId), 'CONTAINED_BY', 'vpc');
+        push(r.id, 'vpc', asString(rel.vpcId), 'BELONGS_TO', 'vpc');
         break;
       case 'ec2_instance':
-        push(r.id, 'vpc', asString(rel.vpcId), 'CONTAINED_BY', 'ec2');
-        push(r.id, 'subnet', asString(rel.subnetId), 'ATTACHED_TO', 'ec2');
+        push(r.id, 'vpc', asString(rel.vpcId), 'BELONGS_TO', 'ec2');
+        // Placement, not attachment: an instance is launched into a subnet
+        // and cannot be moved between subnets while it exists, so this is a
+        // different relationship from the detachable volume binding below.
+        push(r.id, 'subnet', asString(rel.subnetId), 'DEPLOYED_TO', 'ec2');
         for (const sg of asStringArray(rel.securityGroupIds)) {
           push(r.id, 'security_group', sg, 'PROTECTED_BY', 'ec2');
         }
