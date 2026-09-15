@@ -16,7 +16,13 @@ import { ingestCurFile, advanceCheckpoint, allFilesComplete, finalizeCurRun, typ
 export const collectionRunRoutes = new Hono<{ Bindings: Env }>();
 
 /** Builds the full step plan server-side. The browser used to fetch this and drive it; it is now an internal detail of a job. */
-function planSteps(connection: { scan_regions: string[] | null; default_region: string }): string[] {
+/**
+ * The plan for an inventory run. Exported so the SCHEDULED entry point builds
+ * the identical plan rather than keeping a second copy -- the scheduled and
+ * interactive paths diverging is precisely how the scheduled path ended up
+ * bypassing the durable machinery in the first place.
+ */
+export function planSteps(connection: { scan_regions: string[] | null; default_region: string }): string[] {
   const regions = regionsFor(connection as never);
   return [
     ...regions.flatMap((r) => Object.keys(REGIONAL_SCANNERS).map((n) => `regional:${n}:${r}`)),

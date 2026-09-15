@@ -32,10 +32,25 @@ describe('lineage write path runs under the service role', () => {
     expect(src).toContain('executeStep(db, c.env, run, steps[i], i)');
   });
 
+  /**
+   * Updated for AWS-06. The second assertion used to pin
+   * `runResourceStep(...)` inside internalScan.ts, because the scheduled
+   * endpoints executed steps inline. They now ENQUEUE durable runs and the
+   * worker tick executes them, so the property is asserted where execution
+   * actually happens.
+   *
+   * The intent is unchanged and still load-bearing: unattended collection
+   * must run under the service role. A caller-JWT Db silently stops
+   * ingestion evidence being written, because RLS blocks the lineage tables.
+   */
   it('the scheduled scan builds its Db from SUPABASE_SERVICE_ROLE_KEY', () => {
-    const src = read('internalScan.ts');
+    expect(read('internalScan.ts')).toContain('createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY)');
+  });
+
+  it('the worker tick that executes steps also runs under the service role', () => {
+    const src = read('collectionRuns.ts');
     expect(src).toContain('createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY)');
-    expect(src).toContain('runResourceStep(db, orgId, null, env, connectionId, stepId)');
+    expect(src).toContain('runResourceStep(db, run.org_id, null, env, run.connection_id, stepId)');
   });
 
   it('no route hands runResourceStep a caller-JWT Db', () => {
