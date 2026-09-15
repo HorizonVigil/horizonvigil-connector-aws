@@ -31,6 +31,18 @@ function priorityFor(savings: number): 'high' | 'medium' | 'low' {
   return savings >= 50 ? 'high' : savings >= 10 ? 'medium' : 'low';
 }
 
+/** AWS sends monetary fields as strings. Never send NaN/Infinity to storage. */
+function finiteNumber(value: string | undefined, fallback = 0): number {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function optionalFiniteNumber(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 // ── GetReservationPurchaseRecommendation ────────────────────────────────
 
 /** Phase 1 scope -- extensible later to ElastiCache/Redshift/OpenSearch etc. */
@@ -81,13 +93,13 @@ function instanceDescriptor(detail: RIRecommendationDetail): string {
 
 /** Dollar figures are copied verbatim from AWS's own response -- never recomputed. Returns null rather than a zero-savings row. */
 export function mapReservationRecommendation(rec: RIRecommendation, detail: RIRecommendationDetail, service: string, connectionId: string): CostRecommendationInsert | null {
-  const savings = Number(detail.EstimatedMonthlySavingsAmount ?? 0);
+  const savings = finiteNumber(detail.EstimatedMonthlySavingsAmount);
   if (!(savings > 0)) return null;
   const count = detail.RecommendedNumberOfInstancesToPurchase ?? detail.RecommendedNormalizedUnitsToPurchase ?? '1';
   const term = rec.TermInYears ?? 'ONE_YEAR';
   const paymentOption = rec.PaymentOption ?? 'NO_UPFRONT';
   const descriptor = instanceDescriptor(detail);
-  const onDemand = Number(detail.EstimatedMonthlyOnDemandCost ?? 0);
+  const onDemand = finiteNumber(detail.EstimatedMonthlyOnDemandCost);
   return {
     connection_id: connectionId,
     resource_id: null, // RI recommendations are account/payer-scoped, not tied to one resource.
@@ -100,7 +112,7 @@ export function mapReservationRecommendation(rec: RIRecommendation, detail: RIRe
     source: 'aws_ce_reservation',
     commitment_term: term,
     payment_option: paymentOption,
-    estimated_upfront_cost: detail.UpfrontCost != null ? Number(detail.UpfrontCost) : null,
+    estimated_upfront_cost: optionalFiniteNumber(detail.UpfrontCost),
     account_scope: detail.AccountId ?? rec.AccountScope ?? null,
   };
 }
@@ -139,7 +151,7 @@ export function mapRightsizingRecommendation(rec: RightsizingRecommendation, con
   const region = rec.CurrentInstance?.Region ?? 'unknown region';
 
   if (rec.RightsizingType === 'Terminate') {
-    const savings = Number(rec.TerminateRecommendationDetail?.EstimatedMonthlySavings ?? 0);
+    const savings = finiteNumber(rec.TerminateRecommendationDetail?.EstimatedMonthlySavings);
     if (!(savings > 0)) return null;
     return {
       connection_id: connectionId, resource_id: resourceRowId, category: 'rightsizing',
@@ -152,7 +164,7 @@ export function mapRightsizingRecommendation(rec: RightsizingRecommendation, con
 
   const target = rec.ModifyRecommendationDetail?.TargetInstances?.[0];
   if (!target) return null;
-  const savings = Number(target.EstimatedMonthlySavings ?? 0);
+  const savings = finiteNumber(target.EstimatedMonthlySavings);
   if (!(savings > 0)) return null;
   const targetType = target.ResourceDetails?.EC2ResourceDetails?.InstanceType ?? 'a smaller type';
   return {
@@ -216,10 +228,10 @@ export async function fetchSavingsPlansRecommendation(creds: AwsCreds): Promise<
 }
 
 export function mapSavingsPlanRecommendation(detail: SPRecommendationDetail, planType: string, term: string, paymentOption: string, connectionId: string): CostRecommendationInsert | null {
-  const savings = Number(detail.EstimatedMonthlySavingsAmount ?? 0);
+  const savings = finiteNumber(detail.EstimatedMonthlySavingsAmount);
   if (!(savings > 0)) return null;
   const hourly = detail.HourlyCommitmentToPurchase ?? '0';
-  const pct = Number(detail.EstimatedSavingsPercentage ?? 0);
+  const pct = finiteNumber(detail.EstimatedSavingsPercentage);
   return {
     connection_id: connectionId, resource_id: null, category: 'savings_plan',
     issue: `AWS Cost Explorer recommends a ${planType} Savings Plan with a $${hourly}/hour commitment — estimated ${pct.toFixed(1)}% savings vs on-demand at current usage.`,
@@ -227,7 +239,7 @@ export function mapSavingsPlanRecommendation(detail: SPRecommendationDetail, pla
     potential_monthly_savings: Math.round(savings * 100) / 100, priority: priorityFor(savings),
     external_key: `sp:${planType}:${term}:${paymentOption}:${detail.AccountId ?? 'payer'}`,
     source: 'aws_ce_savings_plan', commitment_term: term, payment_option: paymentOption,
-    estimated_upfront_cost: detail.UpfrontCost != null ? Number(detail.UpfrontCost) : null,
+    estimated_upfront_cost: optionalFiniteNumber(detail.UpfrontCost),
     account_scope: detail.AccountId ?? null,
   };
 }

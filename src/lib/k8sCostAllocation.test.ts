@@ -31,6 +31,18 @@ describe('computeClusterAllocation', () => {
     expect(result.totalIdleCost).toBe(75);
   });
 
+  it('normalizes overcommitted requests so allocated cost cannot exceed node cost', () => {
+    const nodes = [node({ nodeName: 'node-1', allocatableCpuMillicores: 4000, monthlyCost: 100 })];
+    const pods = [
+      pod({ podName: 'p1', namespace: 'default', cpuRequestMillicores: 4000, hasResourceRequest: true }),
+      pod({ podName: 'p2', namespace: 'default', cpuRequestMillicores: 4000, hasResourceRequest: true }),
+    ];
+    const result = computeClusterAllocation(nodes, pods);
+    expect(result.totalAllocatedCost).toBe(100);
+    expect(result.totalIdleCost).toBe(0);
+    expect(result.pods.map((p) => p.monthlyCost)).toEqual([50, 50]);
+  });
+
   it('excludes a pod with no declared CPU request rather than assigning it a $0 share that looks like a real answer', () => {
     const nodes = [node({ nodeName: 'node-1' })];
     const pods = [pod({ podName: 'p1', namespace: 'default', hasResourceRequest: false, cpuRequestMillicores: 0 })];

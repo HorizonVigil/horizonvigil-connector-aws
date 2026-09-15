@@ -63,6 +63,11 @@ describe('post-scan hooks report whether they fired', () => {
     expect(out).toEqual({ state: 'failed', reason: 'connect ECONNREFUSED' });
   });
 
+  it('reports a non-successful HTTP response as failed', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 503 }));
+    await expect(triggerRecommendationGeneration(env(), 'c1', 'o1')).resolves.toEqual({ state: 'failed', reason: 'HTTP 503' });
+  });
+
   it('applies the same contract to every hook, including anomaly detection', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }));
     for (const outcome of [

@@ -1,4 +1,4 @@
-import { callQueryApi, callJsonApi, createAwsClient, extractXmlField, type AwsCreds } from './awsApi';
+import { callQueryApi, callJsonApi, createAwsClient, extractXmlField, safeFetch, type AwsCreds } from './awsApi';
 
 export type CheckStatus = 'granted' | 'denied' | 'error' | 'not_applicable';
 
@@ -164,7 +164,7 @@ export async function checkCostExplorer(creds: AwsCreds): Promise<PermissionChec
 export async function checkEks(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
   try {
     const client = createAwsClient(creds, 'eks', region);
-    const res = await client.fetch(`https://eks.${region}.amazonaws.com/clusters`, { method: 'GET' });
+    const res = await safeFetch(client, `https://eks.${region}.amazonaws.com/clusters`, { method: 'GET' });
     const text = await res.text();
     if (!res.ok) {
       let detail = text.slice(0, 300);
@@ -253,7 +253,7 @@ export async function checkSecurityHub(creds: AwsCreds, region: string): Promise
   const base = { service: 'securityhub', label: 'Security Hub', verified: false };
   try {
     const client = createAwsClient(creds, 'securityhub', region);
-    const res = await client.fetch(`https://securityhub.${region}.amazonaws.com/accounts`, { method: 'GET' });
+    const res = await safeFetch(client, `https://securityhub.${region}.amazonaws.com/accounts`, { method: 'GET' });
     if (res.status === 404 || res.status === 400) {
       // Security Hub answers "not subscribed" rather than "forbidden" when the
       // service was never enabled for the account.

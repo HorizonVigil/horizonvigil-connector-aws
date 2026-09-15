@@ -94,61 +94,21 @@ export async function activateCandidate(
     outgoingEncrypted: unknown;
   },
 ): Promise<string> {
-  const now = new Date().toISOString();
-
-  // Archive the outgoing credential BEFORE overwriting it. If this fails, the
-  // rotation stops here with the live connection untouched.
-  await db
-    .update(
-      'credential_versions',
-      { connection_id: `eq.${input.connectionId}`, status: 'eq.active' },
-      { status: 'retiring', retired_at: now, updated_at: now },
-      'return=minimal',
-    )
-    .catch(() => {
-      // No prior version row is normal for a connection that predates this
-      // table; the archive below still records the outgoing blob.
-    });
-
   const encrypted = await encryptCredentials(env.ENCRYPTION_KEY, input.candidate);
-
-  const [version] = await db.insert<{ id: string }[]>('credential_versions', {
-    org_id: input.orgId,
-    connection_id: input.connectionId,
-    auth_method: 'access_key',
-    status: 'active',
-    credentials_encrypted: encrypted,
-    // Identity metadata only — never the key itself.
-    nonsecret_identity_metadata: {
-      identityArn: input.identityArn,
-      accountId: input.accountId,
-      maskedAccessKey: maskAccessKey(input.candidate.accessKeyId),
-      previousCredentialArchived: Boolean(input.outgoingEncrypted),
-    },
-    created_by: input.actorId,
-    validated_at: now,
-    activated_at: now,
-    updated_at: now,
+  // All state transitions and the live credential replacement must happen in
+  // one database transaction. A sequence of client-side REST writes can be
+  // interrupted between any two calls, leaving the version history and the
+  // credential actually used by the connection disagreeing.
+  return db.rpc<string>('rotate_aws_access_key', {
+    p_org_id: input.orgId,
+    p_connection_id: input.connectionId,
+    p_actor_id: input.actorId,
+    p_credentials_encrypted: encrypted,
+    p_masked_access_key: maskAccessKey(input.candidate.accessKeyId),
+    p_identity_arn: input.identityArn,
+    p_account_id: input.accountId,
+    p_outgoing_credentials_encrypted: input.outgoingEncrypted,
   });
-
-  // The live swap. Status is NOT reset to 'pending': the credential has
-  // already been proven against STS, so degrading a working connection to
-  // pending would be a lie about its state.
-  await db.update(
-    'cloud_connections',
-    { id: `eq.${input.connectionId}` },
-    {
-      credentials_encrypted: encrypted,
-      masked_access_key: maskAccessKey(input.candidate.accessKeyId),
-      key_rotated_at: now,
-      status: 'connected',
-      error_message: null,
-      updated_at: now,
-    },
-    'return=minimal',
-  );
-
-  return version.id;
 }
 
 /**
@@ -172,19 +132,9 @@ export async function rollbackToPrevious(db: Db, connectionId: string): Promise<
     return { ok: false, code: 'no_active_credential', message: 'There is no archived previous credential to roll back to.' };
   }
 
-  const now = new Date().toISOString();
-  await db.update('credential_versions', { connection_id: `eq.${connectionId}`, status: 'eq.active' }, { status: 'revoked', revoked_at: now, updated_at: now }, 'return=minimal');
-  await db.update('credential_versions', { id: `eq.${previous.id}` }, { status: 'active', retired_at: null, updated_at: now }, 'return=minimal');
-  await db.update(
-    'cloud_connections',
-    { id: `eq.${connectionId}` },
-    {
-      credentials_encrypted: previous.credentials_encrypted,
-      masked_access_key: previous.nonsecret_identity_metadata?.maskedAccessKey ?? null,
-      updated_at: now,
-    },
-    'return=minimal',
-  );
-
-  return { ok: true, versionId: previous.id };
+  const versionId = await db.rpc<string>('rollback_aws_access_key', {
+    p_connection_id: connectionId,
+    p_previous_version_id: previous.id,
+  });
+  return { ok: true, versionId };
 }

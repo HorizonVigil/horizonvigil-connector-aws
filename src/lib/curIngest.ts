@@ -122,17 +122,45 @@ function parseCsvLine(line: string): string[] {
   return out;
 }
 
-function lineSplitter(): TransformStream<string, string> {
-  let buffer = '';
+/**
+ * Splits complete CSV records while preserving quoted newlines. CUR is CSV,
+ * not line-oriented text: a valid quoted field may contain a newline.
+ */
+function csvRecordSplitter(): TransformStream<string, string> {
+  let record = '';
+  let inQuotes = false;
+  // A quote at a chunk boundary might be a closing quote or the first half
+  // of an escaped quote pair. Defer that decision until the next character.
+  let pendingQuote = false;
   return new TransformStream<string, string>({
     transform(chunk, controller) {
-      buffer += chunk;
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) controller.enqueue(line);
+      for (const ch of chunk) {
+        if (pendingQuote) {
+          pendingQuote = false;
+          if (ch === '"') {
+            // Escaped quote inside a quoted field. The first quote was
+            // appended in the preceding iteration; retain this one too.
+            record += ch;
+            continue;
+          }
+          inQuotes = false;
+        }
+
+        record += ch;
+        if (ch === '"') {
+          if (inQuotes) pendingQuote = true;
+          else inQuotes = true;
+        } else if (ch === '\n' && !inQuotes) {
+          controller.enqueue(record.slice(0, -1).replace(/\r$/, ''));
+          record = '';
+        }
+      }
     },
     flush(controller) {
-      if (buffer) controller.enqueue(buffer);
+      // At EOF a pending quote is necessarily a normal closing quote.
+      pendingQuote = false;
+      inQuotes = false;
+      if (record) controller.enqueue(record.replace(/\r$/, ''));
     },
   });
 }
@@ -155,7 +183,7 @@ export async function parseCurBatch(creds: AwsCreds, bucket: string, region: str
   if (!res.ok || !res.body) return { error: `Failed to fetch CUR data file (HTTP ${res.status}).` };
 
   const byteStream = reportKey.endsWith('.gz') ? res.body.pipeThrough(new DecompressionStream('gzip')) : res.body;
-  const lineStream = byteStream.pipeThrough(new TextDecoderStream()).pipeThrough(lineSplitter());
+  const lineStream = byteStream.pipeThrough(new TextDecoderStream()).pipeThrough(csvRecordSplitter());
   const reader = lineStream.getReader();
 
   let header: string[] | null = null;
@@ -170,14 +198,23 @@ export async function parseCurBatch(creds: AwsCreds, bucket: string, region: str
       await reader.cancel().catch(() => {});
       return { rowsProcessed: skipRows + readThisBatch, rowsIngestedThisBatch: costRows.length, done: true, costRows };
     }
-    if (header === null) {
-      header = parseCsvLine(value);
-      colIndex = Object.fromEntries(header.map((h, i) => [h, i]));
-      continue;
-    }
-    dataLineIndex++;
-    if (dataLineIndex < skipRows) continue; // cheap skip — no field parsing for rows a prior step already ingested
-    if (!value.trim()) continue;
+      if (header === null) {
+        header = parseCsvLine(value);
+        colIndex = Object.fromEntries(header.map((h, i) => [h, i]));
+        const required = ['lineItem/ResourceId', 'lineItem/UnblendedCost', 'lineItem/UsageStartDate'];
+        const missingColumns = required.filter((name) => colIndex[name] === undefined);
+        if (missingColumns.length > 0) {
+          await reader.cancel().catch(() => {});
+          return { error: `CUR file is missing required columns: ${missingColumns.join(', ')}` };
+        }
+        continue;
+      }
+      dataLineIndex++;
+      if (dataLineIndex < skipRows) continue; // cheap skip — no field parsing for rows a prior step already ingested
+      // Count every CSV record, including blank records, so the persisted
+      // cursor always points after exactly the records this step consumed.
+      readThisBatch++;
+      if (!value.trim()) continue;
 
     const fields = parseCsvLine(value);
     const resourceIdRaw = fields[colIndex['lineItem/ResourceId']];
@@ -186,8 +223,7 @@ export async function parseCurBatch(creds: AwsCreds, bucket: string, region: str
     const service = fields[colIndex['product/ProductName']] || fields[colIndex['lineItem/ProductCode']] || 'unknown';
     const rowRegion = fields[colIndex['product/region']] || null;
 
-    readThisBatch++;
-    if (resourceIdRaw && usageDate && cost) {
+      if (resourceIdRaw && usageDate && cost) {
       costRows.push({ resource_id: bareResourceId(resourceIdRaw), service, region: rowRegion, usage_date: usageDate, unblended_cost: cost });
     }
     if (readThisBatch >= BATCH_SIZE) {

@@ -23,7 +23,8 @@ export function parseCpuMillicores(q?: string | null): number | null {
     return Number.isFinite(n) && n >= 0 ? n : null;
   }
   const n = Number(s);
-  return Number.isFinite(n) && n >= 0 ? n * 1000 : null;
+  const millicores = n * 1000;
+  return Number.isFinite(n) && n >= 0 && Number.isFinite(millicores) ? millicores : null;
 }
 
 // Binary (power-of-1024) and decimal (power-of-1000) suffixes, per the K8s
@@ -44,7 +45,8 @@ export function parseMemoryBytes(q?: string | null): number | null {
   for (const [suffix, multiplier] of MEMORY_SUFFIXES) {
     if (s.endsWith(suffix)) {
       const n = Number(s.slice(0, -suffix.length));
-      return Number.isFinite(n) && n >= 0 ? n * multiplier : null;
+      const bytes = n * multiplier;
+      return Number.isFinite(n) && n >= 0 && Number.isFinite(bytes) ? bytes : null;
     }
   }
   const n = Number(s);

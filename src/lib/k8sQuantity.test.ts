@@ -18,6 +18,7 @@ describe('parseCpuMillicores', () => {
     expect(parseCpuMillicores('')).toBeNull();
     expect(parseCpuMillicores('not-a-number')).toBeNull();
     expect(parseCpuMillicores('-500m')).toBeNull();
+    expect(parseCpuMillicores('1e308')).toBeNull();
   });
 });
 
@@ -42,6 +43,7 @@ describe('parseMemoryBytes', () => {
     expect(parseMemoryBytes('')).toBeNull();
     expect(parseMemoryBytes('garbage')).toBeNull();
     expect(parseMemoryBytes('-1Gi')).toBeNull();
+    expect(parseMemoryBytes('1e308Gi')).toBeNull();
   });
   it('prefers the longer binary suffix over a shadowing single-letter decimal suffix', () => {
     // "Ki" must not be parsed as "K" + stray "i" -- exercises the longest-suffix-first ordering.

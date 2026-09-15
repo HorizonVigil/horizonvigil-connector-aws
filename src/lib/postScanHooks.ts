@@ -47,24 +47,32 @@ export type HookOutcome =
   | { state: 'not_configured'; missing: string[] }
   | { state: 'failed'; reason: string };
 
+export const POST_SCAN_HOOK_TIMEOUT_MS = 10_000;
+
 async function callInternal(url: string | undefined, secret: string | undefined, path: string, body: Record<string, unknown>): Promise<HookOutcome> {
   const missing: string[] = [];
   if (!url) missing.push('url');
   if (!secret) missing.push('secret');
   if (missing.length > 0) return { state: 'not_configured', missing };
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), POST_SCAN_HOOK_TIMEOUT_MS);
   try {
-    await fetch(`${url}${path}`, {
+    const response = await fetch(`${url}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Internal-Scan-Secret': secret as string },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
+    if (!response.ok) return { state: 'failed', reason: `HTTP ${response.status}` };
     return { state: 'called' };
   } catch (err) {
     // Still best-effort — see the doc comment above. The scan must not fail
     // because a downstream service is unreachable; it must only stop
     // pretending the hook ran.
     return { state: 'failed', reason: err instanceof Error ? err.message : String(err) };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

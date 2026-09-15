@@ -31,6 +31,12 @@ describe('mapReservationRecommendation', () => {
     const detail = { EstimatedMonthlySavingsAmount: '0' };
     expect(mapReservationRecommendation(rec, detail, 'AmazonEC2', 'conn-1')).toBeNull();
   });
+
+  it('never produces non-finite monetary values from malformed AWS fields', () => {
+    const row = mapReservationRecommendation({}, { EstimatedMonthlySavingsAmount: '12', EstimatedMonthlyOnDemandCost: 'bad', UpfrontCost: 'Infinity' }, 'AmazonEC2', 'conn-1');
+    expect(row?.issue).toContain('$0.00');
+    expect(row?.estimated_upfront_cost).toBeNull();
+  });
 });
 
 describe('mapRightsizingRecommendation', () => {

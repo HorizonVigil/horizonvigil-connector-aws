@@ -1,6 +1,4 @@
-import { AwsClient } from 'aws4fetch';
-import { extractXmlField } from './awsApi';
-import type { AwsCreds } from './awsApi';
+import { callQueryApi, extractXmlField, type AwsCreds } from './awsApi';
 
 export interface AssumeRoleOutcome {
   ok: boolean;
@@ -25,34 +23,26 @@ export async function assumeConnectionRole(
     return { ok: false, reason: 'Platform AWS credentials (PLATFORM_AWS_ACCESS_KEY_ID/SECRET) are not configured on this Worker — cross-account-role validation is not available until they are.' };
   }
 
-  const client = new AwsClient({ accessKeyId: platformCreds.accessKeyId, secretAccessKey: platformCreds.secretAccessKey, service: 'sts', region: 'us-east-1' });
-  const body = new URLSearchParams({
-    Action: 'AssumeRole',
-    Version: '2011-06-15',
-    RoleArn: roleArn,
-    RoleSessionName: 'horizonvigil-validation',
-    ExternalId: externalId,
-    DurationSeconds: '900',
-  }).toString();
-
-  try {
-    const res = await client.fetch('https://sts.amazonaws.com/', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body,
-    });
-    const text = await res.text();
-    if (!res.ok) {
-      return { ok: false, reason: extractXmlField(text, 'Message') ?? `AssumeRole failed (${extractXmlField(text, 'Code') ?? res.status})` };
-    }
-    const accessKeyId = extractXmlField(text, 'AccessKeyId');
-    const secretAccessKey = extractXmlField(text, 'SecretAccessKey');
-    const sessionToken = extractXmlField(text, 'SessionToken');
-    if (!accessKeyId || !secretAccessKey || !sessionToken) {
-      return { ok: false, reason: 'AssumeRole succeeded but the response was missing expected credential fields.' };
-    }
-    return { ok: true, credentials: { accessKeyId, secretAccessKey, sessionToken } };
-  } catch (err) {
-    return { ok: false, reason: err instanceof Error ? err.message : 'AssumeRole request failed' };
+  // Use the common signed-call path rather than raw AwsClient.fetch so this
+  // security-sensitive call has the same abort deadline, retry policy and
+  // response normalization as every other AWS request in the connector.
+  const result = await callQueryApi(
+    { accessKeyId: platformCreds.accessKeyId, secretAccessKey: platformCreds.secretAccessKey },
+    {
+      service: 'sts', region: 'us-east-1', host: 'sts.amazonaws.com',
+      action: 'AssumeRole', version: '2011-06-15',
+      params: { RoleArn: roleArn, RoleSessionName: 'horizonvigil-validation', ExternalId: externalId, DurationSeconds: '900' },
+    },
+  );
+  const text = typeof result.body === 'string' ? result.body : '';
+  if (!result.ok) {
+    return { ok: false, reason: extractXmlField(text, 'Message') ?? result.errorMessage ?? `AssumeRole failed (${extractXmlField(text, 'Code') ?? result.errorCode ?? result.status})` };
   }
+  const accessKeyId = extractXmlField(text, 'AccessKeyId');
+  const secretAccessKey = extractXmlField(text, 'SecretAccessKey');
+  const sessionToken = extractXmlField(text, 'SessionToken');
+  if (!accessKeyId || !secretAccessKey || !sessionToken) {
+    return { ok: false, reason: 'AssumeRole succeeded but the response was missing expected credential fields.' };
+  }
+  return { ok: true, credentials: { accessKeyId, secretAccessKey, sessionToken } };
 }

@@ -16,10 +16,10 @@ steps:
       - '-c'
       - |
         set -euo pipefail
+        trap 'rm -f /tmp/gh_pat' EXIT
         docker buildx create --use --name ci-builder --driver docker-container >/dev/null 2>&1 || docker buildx use ci-builder
         printf '%s' "$$GH_PAT" > /tmp/gh_pat
         docker buildx build --secret id=gh_pat,src=/tmp/gh_pat --load -t us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws:latest .
-        rm -f /tmp/gh_pat
     secretEnv: ['GH_PAT']
   - name: 'gcr.io/cloud-builders/docker'
     id: push

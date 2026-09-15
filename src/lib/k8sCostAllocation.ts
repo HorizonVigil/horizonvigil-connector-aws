@@ -168,6 +168,11 @@ function round2(n: number): number {
 
 export function computeClusterAllocation(nodes: NodeInput[], pods: PodInput[]): ClusterAllocationResult {
   const nodeByName = new Map(nodes.map((n) => [n.nodeName, n]));
+  const requestedCpuByNode = new Map<string, number>();
+  for (const pod of pods) {
+    if (!pod.nodeName || !pod.hasResourceRequest || pod.cpuRequestMillicores <= 0) continue;
+    requestedCpuByNode.set(pod.nodeName, (requestedCpuByNode.get(pod.nodeName) ?? 0) + pod.cpuRequestMillicores);
+  }
 
   let totalNodeCost = 0;
   let excludedNodeCount = 0;
@@ -205,7 +210,12 @@ export function computeClusterAllocation(nodes: NodeInput[], pods: PodInput[]): 
       continue;
     }
 
-    const share = p.cpuRequestMillicores / node.allocatableCpuMillicores;
+    // Requests may legitimately overcommit a node. Normalize those requests
+    // to the allocatable capacity so allocations never exceed the node's
+    // actual cost or turn the idle remainder negative.
+    const requestedCpu = requestedCpuByNode.get(node.nodeName) ?? 0;
+    const allocationBase = Math.max(node.allocatableCpuMillicores, requestedCpu);
+    const share = p.cpuRequestMillicores / allocationBase;
     const cost = round2(node.monthlyCost * share);
     pods_.push({ podName: p.podName, namespace: p.namespace, nodeName: p.nodeName, monthlyCost: cost });
     totalAllocatedCost += cost;
