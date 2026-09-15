@@ -132,24 +132,40 @@ export async function createOrGetActiveRun(
 }
 
 /**
- * Claims runs a worker may advance: queued, or running with an expired lease
- * (their worker died), or due for retry.
+ * Claims runs a worker may advance: queued, parked between slices, running
+ * with an expired lease (their worker died), or due for retry.
  *
  * The claim is a conditional UPDATE, so two workers cannot hold the same run:
  * whichever writes first owns the lease, and the loser's update matches no row.
+ *
+ * THE CONDITION IS THE LEASE, NOT THE STATUS.
+ *
+ * Comparing `status` alone did not actually exclude a second worker on the
+ * recovery path. Reclaiming a RUNNING run with an expired lease transitions
+ * RUNNING -> RUNNING, so the winner's write leaves `status` exactly as the
+ * loser's filter expects and BOTH updates match. The status comparison only
+ * ever protected the QUEUED -> RUNNING case.
+ *
+ * Conditioning on the lease closes it, because Postgres serialises the two
+ * writes on the row lock and the loser re-evaluates its WHERE against the
+ * winner's row: once the winner has set `lease_expires_at` into the future,
+ * neither `lease_owner is null` nor `lease_expires_at < now` holds any more,
+ * so the loser matches zero rows.
  */
 export async function claimRun(db: Db, run: CollectionRunRow, leaseOwner: string, now: number = Date.now()): Promise<boolean> {
   const nextStatus: JobStatus = 'RUNNING';
   assertTransition(run.status, nextStatus);
 
+  const nowIso = new Date(now).toISOString();
   const leaseExpiry = new Date(now + LEASE_SECONDS * 1000).toISOString();
   const updated = await db.update<CollectionRunRow[]>(
     'collection_runs',
     {
       id: `eq.${run.id}`,
-      // Only claim if nobody else has since taken it. Without this the two
-      // workers would both believe they own the run.
       status: `eq.${run.status}`,
+      // Free means released by the last slice, or abandoned by a worker that
+      // died holding it. Anything else is live and must not be taken.
+      or: `(lease_owner.is.null,lease_expires_at.lt.${nowIso})`,
     },
     {
       status: nextStatus,
@@ -164,7 +180,32 @@ export async function claimRun(db: Db, run: CollectionRunRow, leaseOwner: string
   return updated.length > 0;
 }
 
-/** Extends the lease and advances the checkpoint after a slice. */
+/**
+ * Advances the checkpoint and RELEASES the lease after a slice.
+ *
+ * WHY IT RELEASES RATHER THAN EXTENDS
+ *
+ * This runs on the way OUT of a slice, when no worker is holding the run any
+ * more. Renewing the lease here left a parked run reserved for a further 15
+ * minutes against a worker that had already returned, so the next tick could
+ * not claim it however often the scheduler fired.
+ *
+ * Measured on a real 1,628-step run: 14 slices took **4h15m** — about 18
+ * minutes each, the 15-minute lease plus scheduler granularity — where a
+ * 5-minute scheduler should have finished in roughly 70 minutes. Inventory
+ * was therefore up to four hours stale for no reason other than this line.
+ *
+ * Crash recovery is unaffected, and that is the whole reason the lease has a
+ * timeout at all: a worker that dies MID-slice never reaches this call, so
+ * its lease stands and expires on its own 15 minutes later.
+ *
+ * Releasing here does not weaken the concurrency guard. "One job despite
+ * repeated clicks" is enforced by the partial unique index on
+ * `(connection_id) WHERE status IN (active)` — in the database. The lease
+ * only stops two workers advancing the SAME run at once, and `claimRun` now
+ * conditions on the lease being free, which is a stronger test than the
+ * status comparison it previously relied on.
+ */
 export async function checkpoint(
   db: Db,
   runId: string,
@@ -180,7 +221,8 @@ export async function checkpoint(
       failed_steps: patch.failedSteps,
       degraded_resource_types: patch.degradedResourceTypes,
       heartbeat_at: new Date(now).toISOString(),
-      lease_expires_at: new Date(now + LEASE_SECONDS * 1000).toISOString(),
+      lease_owner: null,
+      lease_expires_at: null,
       updated_at: new Date(now).toISOString(),
     },
     'return=minimal',
