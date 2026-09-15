@@ -13,6 +13,7 @@ import { cloudtrailEventsRoutes } from './routes/cloudtrailEvents';
 import { reportsRoutes } from './routes/reports';
 import { discoveryRoutes } from './routes/discovery';
 import { internalScanRoutes } from './routes/internalScan';
+import { regionCatalogRoutes } from './routes/regionCatalog';
 import { internalRegistryTokenRoutes } from './routes/internalRegistryToken';
 import { remediationRoutes } from './routes/remediation';
 import { isProviderRemediationEnabled, remediationDisabledResponse } from './lib/capabilities';
@@ -50,6 +51,7 @@ app.route('/api/aws-accounts', cloudtrailEventsRoutes);
 app.route('/api/aws-accounts', reportsRoutes);
 app.route('/api/aws-accounts', discoveryRoutes);
 app.route('/api/aws-accounts', internalScanRoutes);
+app.route('/api/aws-accounts', regionCatalogRoutes);
 app.route('/api/aws-accounts', internalRegistryTokenRoutes);
 /**
  * Direct provider mutation is disabled in V1 (2026-09-08 production-
@@ -114,6 +116,7 @@ app.route('/api/v1/aws', cloudtrailEventsRoutes);
 app.route('/api/v1/aws', reportsRoutes);
 app.route('/api/v1/aws', discoveryRoutes);
 app.route('/api/v1/aws', internalScanRoutes);
+app.route('/api/v1/aws', regionCatalogRoutes);
 app.route('/api/v1/aws', internalRegistryTokenRoutes);
 app.route('/api/v1/aws', remediationRoutes);
 app.route('/api/v1/aws', curRoutes);
