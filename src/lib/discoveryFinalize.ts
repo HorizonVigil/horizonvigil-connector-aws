@@ -15,7 +15,17 @@ export interface FinalizeCandidateResource {
   category: string;
   last_seen_at: string;
   deleted_at: string | null;
+  /** Null for global resources, which are scoped as GLOBAL_SCOPE below. */
+  region?: string | null;
 }
+
+/**
+ * The scope key a resource with no region belongs to. Global resources are
+ * proven by the global scanners, not by any region, so they need a scope of
+ * their own rather than being lumped in with an arbitrary region or silently
+ * excluded from every scope check.
+ */
+export const GLOBAL_SCOPE = '__global__';
 
 export interface FinalizeResult {
   vanishedIds: string[];
@@ -55,15 +65,38 @@ export function computeFinalizeResult(
   coveredResourceTypes: readonly string[],
   runStartedAt: string,
   degradedResourceTypes: readonly string[] = [],
+  /**
+   * AWS-12. The scopes this run actually evaluated WITHOUT failure — region
+   * codes, plus GLOBAL_SCOPE when the global scanners succeeded.
+   *
+   * The type-level rule above closes the case where a scanner failed
+   * everywhere. It does NOT close the region-level case: a run that scanned
+   * fifteen regions successfully and failed two would still tombstone
+   * everything in the two failed regions, because the resource TYPE was
+   * covered somewhere. Absence can only be established inside a scope that
+   * was actually evaluated.
+   *
+   * `null` means no scope filtering, preserving the previous behaviour for
+   * any caller that cannot yet supply scopes. That is a deliberate hole, not
+   * an oversight — it is named here so it stays visible, and the durable
+   * worker always supplies a set.
+   */
+  provenScopes: ReadonlySet<string> | null = null,
 ): FinalizeResult {
   const degraded = new Set(degradedResourceTypes);
+  const scopeProven = (r: FinalizeCandidateResource): boolean => {
+    if (provenScopes === null) return true;
+    const scope = r.region && r.region.trim() !== '' ? r.region : GLOBAL_SCOPE;
+    return provenScopes.has(scope);
+  };
   const vanishedIds = existing
     .filter(
       (r) =>
         !r.deleted_at &&
         r.last_seen_at < runStartedAt &&
         coveredResourceTypes.includes(r.resource_type_key) &&
-        !degraded.has(r.resource_type_key),
+        !degraded.has(r.resource_type_key) &&
+        scopeProven(r),
     )
     .map((r) => r.id);
 
