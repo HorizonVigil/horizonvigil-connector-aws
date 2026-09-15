@@ -7,6 +7,7 @@ import type { Env } from '../env';
 import { regionsEstablishingAbsence } from '../lib/generations';
 import { GLOBAL_SCOPE } from '../lib/discoveryFinalize';
 import { loadConnection, regionsFor, runResourceStep, runFindingStep, runMetricStep, runFinalize, REGIONAL_SCANNERS, GLOBAL_SCANNERS, FINDING_SCANNERS, METRIC_STEP_NAME, SCANNER_RESOURCE_TYPES } from './discovery';
+import { buildScanHealth, type StepRow } from '../lib/scanHealth';
 import {
   createOrGetActiveRun, claimRun, checkpoint, finalizeRun, toRunResponse, isLeaseExpired,
   queueRetryRun, STEPS_PER_SLICE, type CollectionRunRow,
@@ -179,6 +180,64 @@ collectionRunRoutes.get('/collection-runs/:id', (c) =>
     await requirePermittedConnection(db, orgId, auth.userId, run.connection_id, getActiveScope(c.req.raw, orgId));
 
     return okJson({ ...toRunResponse(run), explanation: describeJobStatus(run.status) });
+  }),
+);
+
+/**
+ * GET /accounts/:id/scan-health — the coverage behind the resource count.
+ *
+ * The UI rendered `resource_summary.totalResources` as a bare number. On
+ * 2026-09-15 one account showed "430 resources" with `errors: 0` beside it
+ * while EC2 had failed in all 17 regions — the failures live on
+ * `collection_run_steps`, and nothing surfaced them, because the durable
+ * worker calls runFinalize with an empty stepErrors array.
+ *
+ * A count without its coverage is a claim the data does not support. This is
+ * what lets the page qualify the number instead of asserting it.
+ */
+collectionRunRoutes.get('/accounts/:id/scan-health', (c) =>
+  guarded(async () => {
+    const auth = getAuthContext(c.req.raw);
+    const orgId = requireOrgId(c.req.raw);
+    const db = createDb(c.env, auth.accessToken);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
+
+    const connectionId = c.req.param('id');
+    await requirePermittedConnection(db, orgId, auth.userId, connectionId, getActiveScope(c.req.raw, orgId));
+
+    // Latest run for this connection, whatever its outcome. Filtering to
+    // terminal runs would hide an in-flight one, and "a scan is running" is
+    // itself a reason the count is not yet authoritative.
+    const runs = await db.select<CollectionRunRow[]>('collection_runs', {
+      select: 'id,status,total_steps,completed_steps,failed_steps,degraded_resource_types,started_at,finished_at,queued_at',
+      filters: { connection_id: `eq.${connectionId}`, org_id: `eq.${orgId}`, capability: 'eq.inventory' },
+      order: 'queued_at.desc',
+      limit: 1,
+    });
+    const run = runs[0];
+
+    if (!run) {
+      return okJson({ ...buildScanHealth(null, []), runId: null, finishedAt: null });
+    }
+
+    const steps = await db.select<StepRow[]>('collection_run_steps', {
+      select: 'step_id,status,normalized_code,error_message',
+      filters: { run_id: `eq.${run.id}` },
+      limit: 5000,
+    });
+
+    const health = buildScanHealth(
+      {
+        status: run.status,
+        totalSteps: run.total_steps ?? 0,
+        completedSteps: run.completed_steps ?? 0,
+        failedSteps: run.failed_steps ?? 0,
+        degradedResourceTypes: run.degraded_resource_types ?? [],
+      },
+      steps,
+    );
+
+    return okJson({ ...health, runId: run.id, finishedAt: run.finished_at ?? null });
   }),
 );
 
