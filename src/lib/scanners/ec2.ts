@@ -1,5 +1,6 @@
 import { callQueryApi, listParams } from '../awsApi';
 import { extractSection, extractListItems, field, boolField, numField, tagsFromSet } from '../xmlList';
+import { paginateQueryApi, detectQueryTruncation, incompleteSink, type PaginationTermination } from '../pagination';
 import type { ScannedResource, ScannerContext } from './types';
 
 const VERSION = '2016-11-15';
@@ -26,20 +27,29 @@ export const EC2_RESOURCE_TYPES = [
  * Workers cost, which is why every AWS call elsewhere in this rebuild
  * already avoids it.
  */
+/**
+ * Per-operation outcome for one regional EC2 scan.
+ *
+ * `termination` is carried through from the shared page walker rather than
+ * re-derived here: it is the same value that decides whether the operation's
+ * resource types may be treated as fully enumerated, so a scanner-local guess
+ * would be a second source of truth for the thing that governs tombstoning.
+ */
 export interface Ec2ScanOperation {
   action: string;
-  status: 'success' | 'failed';
+  status: 'success' | 'partial';
   pages: number;
   resources: number;
-  attempts: number;
-  error?: string;
+  termination: PaginationTermination;
+  detail?: string;
 }
 
 export interface Ec2ScanDiagnostics {
   scanner: 'ec2';
-  scanner_version: 'v1';
+  scanner_version: 'v2';
   region: string;
-  status: 'success' | 'partial' | 'failed';
+  /** 'partial' when any one operation did not read every page or failed. */
+  status: 'success' | 'partial';
   startedAt: string;
   completedAt: string;
   operations: Ec2ScanOperation[];
@@ -48,123 +58,99 @@ export interface Ec2ScanDiagnostics {
 /**
  * Production-grade EC2 discovery.
  *
- * Important contract:
- * - A failed Describe* operation is never represented as an empty result.
- * - Each API operation is retried for transient/throttling failures.
- * - EC2 Query APIs are paginated centrally.
- * - Per-operation diagnostics are attached to returned resources.
+ * Contract:
+ * - Every Describe* operation reads EVERY page and says so when it could not
+ *   (see the `termination` field on each operation).
+ * - Retries, backoff, jitter, timeouts and throttling are the shared provider
+ *   layer's job (awsApi.ts + awsErrors.ts), not this file's. This scanner used
+ *   to carry its own retry loop, which meant the EC2 path could silently drift
+ *   away from the policy every other scanner gets — including the
+ *   `Retry-After` handling and the terminal-failure reporting that degrades
+ *   coverage.
+ * - A failed operation degrades coverage and is reported, then the scan
+ *   continues with the operations that worked. It is NOT represented as an
+ *   empty result, and it is NOT allowed to abort the other 33 operations: a
+ *   single AccessDenied on an optional API such as DescribeElasticGpus would
+ *   otherwise cost the customer their entire EC2 and networking inventory for
+ *   that region.
+ * - Per-operation diagnostics are attached to the returned resources.
  *
- * The existing Promise<ScannedResource[]> contract is intentionally preserved
- * so discovery.ts and the rest of the provider pipeline do not need a
- * breaking change.
+ * The Promise<ScannedResource[]> contract is intentionally preserved so
+ * discovery.ts and the rest of the provider pipeline do not need a breaking
+ * change.
  */
 export async function scanEc2(ctx: ScannerContext): Promise<ScannedResource[]> {
   const startedAt = new Date().toISOString();
   const endpoint = `ec2.${ctx.region}.amazonaws.com`;
   const operations: Ec2ScanOperation[] = [];
 
-  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-  const retryableCodes = new Set([
-    'RequestLimitExceeded',
-    'Throttling',
-    'ThrottlingException',
-    'TooManyRequestsException',
-    'ServiceUnavailable',
-    'InternalError',
-    'InternalFailure',
-    'RequestTimeout',
-    'RequestTimeoutException',
-  ]);
-
-  const isRetryable = (code?: string, status?: number) =>
-    (typeof status === 'number' && (status === 429 || status >= 500)) ||
-    (!!code && retryableCodes.has(code));
-
-  const call = async (
-    action: string,
-    params?: Record<string, string>,
-    options: { maxAttempts?: number } = {},
-  ): Promise<string> => {
-    const maxAttempts = Math.max(1, options.maxAttempts ?? 4);
-    let lastError = 'unknown EC2 API error';
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const result = await callQueryApi(ctx.creds, {
-        service: 'ec2',
-        region: ctx.region,
-        host: endpoint,
-        action,
-        version: VERSION,
-        params,
-      });
-
-      if (result.ok) return result.body as string;
-
-      lastError = result.normalizedCode ?? result.errorCode ?? result.errorMessage ?? String(result.status);
-
-      if (!isRetryable(result.normalizedCode ?? result.errorCode, result.status) || attempt === maxAttempts) {
-        break;
-      }
-
-      // Bounded exponential backoff with jitter to avoid retry storms.
-      const delay = Math.min(2000, 250 * (2 ** (attempt - 1))) + Math.floor(Math.random() * 150);
-      await sleep(delay);
-    }
-
-    throw new Error(`EC2 ${action} failed after ${maxAttempts} attempt(s): ${lastError}`);
-  };
+  /**
+   * An incomplete walk (page cap, repeated token, or a page that failed) has to
+   * degrade this scanner's coverage. A failed page already reports itself
+   * through awsApi's terminal-failure path; this sink is for the incomplete
+   * cases that arrive with a 200 and would otherwise be recorded nowhere.
+   */
+  const onIncomplete = incompleteSink(ctx.creds);
 
   /**
-   * EC2 Describe APIs generally expose NextToken. Some response shapes use
-   * nextToken through the XML helper. Centralizing this prevents one resource
-   * type from silently becoming incomplete as the account grows.
+   * One EC2 Describe* operation, reading every page.
+   *
+   * The page bodies are kept as pages rather than joined, and extraction
+   * happens per page in `allItems` below. That separation is the whole point:
+   * the previous version concatenated the pages and then sliced the list out
+   * with `extractSection`, which returns only the FIRST matching section — so
+   * it made the calls for pages 2..N and threw every one of them away, and the
+   * resources on them then looked deleted to finalize.
    */
   const listPages = async (
     action: string,
     params?: Record<string, string>,
-  ): Promise<{ pages: string[]; attempts: number }> => {
-    const pages: string[] = [];
-    let nextToken: string | undefined;
-    let attempts = 0;
-
-    do {
-      const pageParams = nextToken ? { ...(params ?? {}), NextToken: nextToken } : params;
-      attempts++;
-
-      const xml = await call(action, pageParams);
-      pages.push(xml);
-
-      const discoveredToken =
-        field(xml, 'nextToken') ??
-        field(xml, 'NextToken');
-
-      if (!discoveredToken) break;
-      if (discoveredToken === nextToken) {
-        throw new Error(`EC2 ${action} returned an unchanged pagination token`);
-      }
-
-      nextToken = discoveredToken;
-    } while (true);
+  ): Promise<{ pages: string[]; termination: PaginationTermination }> => {
+    const walk = await paginateQueryApi<string, string>(
+      ctx.creds,
+      { service: 'ec2', region: ctx.region, host: endpoint, action, version: VERSION, params },
+      // Each page is carried through as itself; per-page list extraction is
+      // done by section below, because one Describe* response can contain
+      // several different lists we care about.
+      (page) => [page],
+      (page) => detectQueryTruncation(page),
+      { onIncomplete },
+    );
 
     operations.push({
       action,
-      status: 'success',
-      pages: pages.length,
+      status: walk.termination === 'complete' ? 'success' : 'partial',
+      pages: walk.pages,
       resources: 0,
-      attempts,
+      termination: walk.termination,
+      detail: walk.detail,
     });
 
-    return { pages, attempts };
+    return { pages: walk.items, termination: walk.termination };
   };
+
+  /**
+   * Every item of `section`, from every page — the fix described above.
+   *
+   * A page with no such section contributes nothing rather than aborting the
+   * others: EC2 legitimately omits an empty result set container.
+   */
+  const allItems = (result: { pages: string[] }, section: string, itemTag = 'item'): string[] =>
+    result.pages.flatMap((page) => extractListItems(extractSection(page, section), itemTag));
+
+  /**
+   * The same items, re-wrapped in their container so the extraction code below
+   * can keep reading them through `extractSection` unchanged.
+   */
+  const mergeSection = (result: { pages: string[] }, section: string, itemTag = 'item'): string =>
+    `<${section}>${allItems(result, section, itemTag).map((i) => `<${itemTag}>${i}</${itemTag}>`).join('')}</${section}>`;
 
   const setOperationResourceCount = (action: string, count: number) => {
     const operation = operations.find((item) => item.action === action);
     if (operation) operation.resources = count;
   };
 
-  try {
-    const [
+  const [
       instancesResult, imagesResult, keyPairsResult, volumesResult, snapshotsResult,
       sgsResult, addressesResult, enisResult, vpcsResult, subnetsResult,
       routeTablesResult, igwsResult, natGatewaysResult, naclsResult, vpcEndpointsResult,
@@ -211,42 +197,48 @@ export async function scanEc2(ctx: ScannerContext): Promise<ScannedResource[]> {
       listPages('DescribeElasticGpus'),
     ]);
 
-    const joinPages = (result: { pages: string[] }) => result.pages.join('\n');
-
-    const instances = joinPages(instancesResult);
-    const images = joinPages(imagesResult);
-    const keyPairs = joinPages(keyPairsResult);
-    const volumes = joinPages(volumesResult);
-    const snapshots = joinPages(snapshotsResult);
-    const sgs = joinPages(sgsResult);
-    const addresses = joinPages(addressesResult);
-    const enis = joinPages(enisResult);
-    const vpcs = joinPages(vpcsResult);
-    const subnets = joinPages(subnetsResult);
-    const routeTables = joinPages(routeTablesResult);
-    const igws = joinPages(igwsResult);
-    const natGateways = joinPages(natGatewaysResult);
-    const nacls = joinPages(naclsResult);
-    const vpcEndpoints = joinPages(vpcEndpointsResult);
-    const peerings = joinPages(peeringsResult);
-    const launchTemplates = joinPages(launchTemplatesResult);
-    const flowLogs = joinPages(flowLogsResult);
-    const placementGroups = joinPages(placementGroupsResult);
-    const prefixLists = joinPages(prefixListsResult);
-    const transitGateways = joinPages(transitGatewaysResult);
-    const transitGatewayAttachments = joinPages(transitGatewayAttachmentsResult);
-    const vpnGateways = joinPages(vpnGatewaysResult);
-    const vpnConnections = joinPages(vpnConnectionsResult);
-    const customerGateways = joinPages(customerGatewaysResult);
-    const clientVpnEndpoints = joinPages(clientVpnEndpointsResult);
-    const egressOnlyIgws = joinPages(egressOnlyIgwsResult);
-    const capacityReservations = joinPages(capacityReservationsResult);
-    const hosts = joinPages(hostsResult);
-    const fleets = joinPages(fleetsResult);
-    const spotFleetRequests = joinPages(spotFleetRequestsResult);
-    const spotInstanceRequests = joinPages(spotInstanceRequestsResult);
-    const reservedInstances = joinPages(reservedInstancesResult);
-    const elasticGpus = joinPages(elasticGpusResult);
+    /**
+     * One merged container per resource type, built from EVERY page.
+     *
+     * Each section name is the AWS response container for that Describe*
+     * operation. They differ per service family (EC2 uses `<item>`, so the
+     * wrapper names below are the only per-operation part), which is exactly
+     * why the walker takes them as parameters instead of hardcoding one shape.
+     */
+    const instances = mergeSection(instancesResult, 'reservationSet');
+    const images = mergeSection(imagesResult, 'imagesSet');
+    const keyPairs = mergeSection(keyPairsResult, 'keySet');
+    const volumes = mergeSection(volumesResult, 'volumeSet');
+    const snapshots = mergeSection(snapshotsResult, 'snapshotSet');
+    const sgs = mergeSection(sgsResult, 'securityGroupInfo');
+    const addresses = mergeSection(addressesResult, 'addressesSet');
+    const enis = mergeSection(enisResult, 'networkInterfaceSet');
+    const vpcs = mergeSection(vpcsResult, 'vpcSet');
+    const subnets = mergeSection(subnetsResult, 'subnetSet');
+    const routeTables = mergeSection(routeTablesResult, 'routeTableSet');
+    const igws = mergeSection(igwsResult, 'internetGatewaySet');
+    const natGateways = mergeSection(natGatewaysResult, 'natGatewaySet');
+    const nacls = mergeSection(naclsResult, 'networkAclSet');
+    const vpcEndpoints = mergeSection(vpcEndpointsResult, 'vpcEndpointSet');
+    const peerings = mergeSection(peeringsResult, 'vpcPeeringConnectionSet');
+    const launchTemplates = mergeSection(launchTemplatesResult, 'launchTemplates');
+    const flowLogs = mergeSection(flowLogsResult, 'flowLogSet');
+    const placementGroups = mergeSection(placementGroupsResult, 'placementGroupSet');
+    const prefixLists = mergeSection(prefixListsResult, 'prefixListSet');
+    const transitGateways = mergeSection(transitGatewaysResult, 'transitGatewaySet');
+    const transitGatewayAttachments = mergeSection(transitGatewayAttachmentsResult, 'transitGatewayAttachments');
+    const vpnGateways = mergeSection(vpnGatewaysResult, 'vpnGatewaySet');
+    const vpnConnections = mergeSection(vpnConnectionsResult, 'vpnConnectionSet');
+    const customerGateways = mergeSection(customerGatewaysResult, 'customerGatewaySet');
+    const clientVpnEndpoints = mergeSection(clientVpnEndpointsResult, 'clientVpnEndpoint');
+    const egressOnlyIgws = mergeSection(egressOnlyIgwsResult, 'egressOnlyInternetGatewaySet');
+    const capacityReservations = mergeSection(capacityReservationsResult, 'capacityReservationSet');
+    const hosts = mergeSection(hostsResult, 'hostSet');
+    const fleets = mergeSection(fleetsResult, 'fleetSet');
+    const spotFleetRequests = mergeSection(spotFleetRequestsResult, 'spotFleetRequestConfigSet');
+    const spotInstanceRequests = mergeSection(spotInstanceRequestsResult, 'spotInstanceRequestSet');
+    const reservedInstances = mergeSection(reservedInstancesResult, 'reservedInstancesSet');
+    const elasticGpus = mergeSection(elasticGpusResult, 'elasticGpuSet');
 
     const out: ScannedResource[] = [];
 
@@ -847,14 +839,22 @@ export async function scanEc2(ctx: ScannerContext): Promise<ScannedResource[]> {
       } as Record<string, number>)[operation.action] ?? operation.resources;
     }
 
-    const completedAt = new Date().toISOString();
+    /**
+     * 'partial' when any single operation did not read every page or failed.
+     *
+     * Derived from the walks rather than asserted, and carried on the resources
+     * so the partial case is visible in the data itself rather than only in a
+     * log line. The failed and incomplete operations have already reported
+     * themselves through the creds sink, which is what excludes this scanner's
+     * resource types from tombstoning for this run.
+     */
     const diagnostics: Ec2ScanDiagnostics = {
       scanner: 'ec2',
-      scanner_version: 'v1',
+      scanner_version: 'v2',
       region: ctx.region,
-      status: 'success',
+      status: operations.every((o) => o.termination === 'complete') ? 'success' : 'partial',
       startedAt,
-      completedAt,
+      completedAt: new Date().toISOString(),
       operations,
     };
 
@@ -866,24 +866,4 @@ export async function scanEc2(ctx: ScannerContext): Promise<ScannedResource[]> {
     }
 
     return out;
-  } catch (err) {
-    const completedAt = new Date().toISOString();
-    const diagnostics: Ec2ScanDiagnostics = {
-      scanner: 'ec2',
-      scanner_version: 'v1',
-      region: ctx.region,
-      status: 'failed',
-      startedAt,
-      completedAt,
-      operations,
-    };
-
-    // Fail closed so discovery/finalization cannot interpret a failed regional
-    // inventory call as evidence that the corresponding resources vanished.
-    throw new Error(
-      `AWS EC2 inventory scan failed in ${ctx.region}: ` +
-      `${err instanceof Error ? err.message : String(err)}. ` +
-      `Diagnostics: ${JSON.stringify(diagnostics)}`,
-    );
-  }
 }
