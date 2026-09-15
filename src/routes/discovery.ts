@@ -6,6 +6,7 @@ import { scanEc2, EC2_RESOURCE_TYPES } from '../lib/scanners/ec2';
 import { scanRds, RDS_RESOURCE_TYPES } from '../lib/scanners/rds';
 import { scanIam, IAM_RESOURCE_TYPES, extractCloudIdentityRows } from '../lib/scanners/iam';
 import { materializeResourceEdges } from '../lib/edgeMaterialization';
+import { materializeNetworkTopology } from '../lib/networkTopology';
 import { scanSns, SNS_RESOURCE_TYPES } from '../lib/scanners/sns';
 import { scanSqs, SQS_RESOURCE_TYPES } from '../lib/scanners/sqs';
 import { scanDynamoDb, DYNAMODB_RESOURCE_TYPES } from '../lib/scanners/dynamodb';
@@ -1103,6 +1104,11 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   // on the next cycle, so a failure here must never fail the whole scan.
   try {
     await materializeResourceEdges(db, connection.id);
+    // AWS-10. Network topology from direct provider references. Runs here for
+    // the same reason as the edges above: the resources it joins are scanned
+    // by different steps, so deriving mid-scan could see an instance before
+    // its subnet exists.
+    await materializeNetworkTopology(db, connection.id);
   } catch (err) {
     console.error(`Edge materialization failed for connection ${connection.id} (continuing without it): ${err instanceof Error ? err.message : err}`);
   }

@@ -58,31 +58,61 @@ regionCatalogRoutes.post('/internal/refresh-region-catalog', (c) =>
       }
 
       const observedAt = new Date().toISOString();
-      const rows = probe.regions.map((r) => ({
+
+      /**
+       * Two tables, because these are two different kinds of fact.
+       *
+       * Region EXISTENCE is provider fact: us-east-1 exists for everyone.
+       * Region OPT-IN is ACCOUNT fact: whether this account may use
+       * ap-east-1 says nothing about any other account.
+       *
+       * Conflating them is not hypothetical — the first run of this endpoint
+       * against two production accounts returned 18 available versus 17, and
+       * the second write overwrote the first, leaving one account's view
+       * presented as global truth.
+       */
+      const existenceRows = probe.regions.map((r) => ({
         provider: 'aws',
         partition: r.partition,
         region_code: r.regionCode,
-        status: r.status,
+        // Provider-level: the region exists and is reachable. Whether THIS
+        // account has opted in is recorded per connection below.
+        status: 'AVAILABLE',
+        // Whether the region requires opt-in at all is a provider fact;
+        // whether an account has done so is not.
         opt_in_required: r.optInRequired,
         source: 'describe_regions',
         observed_at: observedAt,
         updated_at: observedAt,
       }));
 
-      /**
-       * Upsert on the catalog's identity. `describe_regions` rows overwrite
-       * `observed` ones, which is the point — an inferred row should yield to
-       * the provider's own answer the moment one exists.
-       */
+      const optInRows = probe.regions.map((r) => ({
+        org_id: row.org_id,
+        connection_id: row.id,
+        partition: r.partition,
+        region_code: r.regionCode,
+        status: r.status,
+        opt_in_required: r.optInRequired,
+        provider_opt_in_status: r.optInStatus,
+        source: 'describe_regions',
+        observed_at: observedAt,
+        updated_at: observedAt,
+      }));
+
       await db.insert(
         'provider_regions?on_conflict=provider,partition,region_code',
-        rows,
+        existenceRows,
+        'resolution=merge-duplicates,return=minimal',
+      );
+      await db.insert(
+        'connection_region_opt_in?on_conflict=connection_id,region_code',
+        optInRows,
         'resolution=merge-duplicates,return=minimal',
       );
 
       results.push({
         connectionId: row.id,
-        regions: rows.length,
+        regions: existenceRows.length,
         available: probe.regions.filter((r) => r.status === 'AVAILABLE').length,
         notOptedIn: probe.regions.filter((r) => r.status === 'NOT_OPTED_IN').length,
         unknown: probe.regions.filter((r) => r.status === 'UNKNOWN').length,
