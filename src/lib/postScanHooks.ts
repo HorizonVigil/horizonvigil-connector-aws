@@ -27,25 +27,53 @@ import type { Env } from '../env';
  * same best-effort contract materializeResourceEdges already has in
  * runFinalize.
  */
-async function callInternal(url: string | undefined, secret: string | undefined, path: string, body: Record<string, unknown>): Promise<void> {
-  if (!url || !secret) return;
+/**
+ * Outcome of one hook. `not_configured` is a first-class result, not a
+ * variant of "nothing to do".
+ *
+ * The previous version returned void and skipped silently on a missing URL or
+ * secret. In production `connector-aws` carries neither `POST_SCAN_HOOK_SECRET`
+ * nor `COST_OPTIMIZATION_API_URL`, so all three hooks below have been no-ops —
+ * and a no-op is indistinguishable from a hook that ran and found nothing to
+ * do. That is the operational reason stale cost recommendations survived for
+ * three weeks: the step that clears them never fired, and nothing said so.
+ *
+ * Same defect class as the edge materialization that reported an empty graph
+ * while every write was failing. A skipped step must announce that it was
+ * skipped.
+ */
+export type HookOutcome =
+  | { state: 'called' }
+  | { state: 'not_configured'; missing: string[] }
+  | { state: 'failed'; reason: string };
+
+async function callInternal(url: string | undefined, secret: string | undefined, path: string, body: Record<string, unknown>): Promise<HookOutcome> {
+  const missing: string[] = [];
+  if (!url) missing.push('url');
+  if (!secret) missing.push('secret');
+  if (missing.length > 0) return { state: 'not_configured', missing };
+
   try {
     await fetch(`${url}${path}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Internal-Scan-Secret': secret },
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Scan-Secret': secret as string },
       body: JSON.stringify(body),
     });
-  } catch {
-    // best-effort — see doc comment above
+    return { state: 'called' };
+  } catch (err) {
+    // Still best-effort — see the doc comment above. The scan must not fail
+    // because a downstream service is unreachable; it must only stop
+    // pretending the hook ran.
+    return { state: 'failed', reason: err instanceof Error ? err.message : String(err) };
   }
 }
 
-export async function triggerRecommendationGeneration(env: Env, connectionId: string, orgId: string): Promise<void> {
-  await callInternal(env.COST_OPTIMIZATION_API_URL, env.POST_SCAN_HOOK_SECRET, '/internal/generate-recommendations', { connectionId, orgId });
+export async function triggerRecommendationGeneration(env: Env, connectionId: string, orgId: string): Promise<HookOutcome> {
+  return callInternal(env.COST_OPTIMIZATION_API_URL, env.POST_SCAN_HOOK_SECRET, '/internal/generate-recommendations', { connectionId, orgId });
 }
 
-export async function triggerAlertEvaluation(env: Env, connectionId: string, orgId: string): Promise<void> {
-  await callInternal(env.ALERTS_API_URL, env.POST_SCAN_HOOK_SECRET, '/internal/evaluate-alert-rules', { connectionId, orgId });
+export async function triggerAlertEvaluation(env: Env, connectionId: string, orgId: string): Promise<HookOutcome> {
+  return callInternal(env.ALERTS_API_URL, env.POST_SCAN_HOOK_SECRET, '/internal/evaluate-alert-rules', { connectionId, orgId });
 }
 
 /**
@@ -57,6 +85,6 @@ export async function triggerAlertEvaluation(env: Env, connectionId: string, org
  * frontend/src/pages/AwsAccountDetail.tsx's syncCost), now reachable from a
  * context with no browser/user session to have driven that click.
  */
-export async function triggerAnomalyDetection(env: Env, connectionId: string): Promise<void> {
-  await callInternal(env.COST_OPTIMIZATION_API_URL, env.POST_SCAN_HOOK_SECRET, '/internal/detect-anomalies', { connectionId });
+export async function triggerAnomalyDetection(env: Env, connectionId: string): Promise<HookOutcome> {
+  return callInternal(env.COST_OPTIMIZATION_API_URL, env.POST_SCAN_HOOK_SECRET, '/internal/detect-anomalies', { connectionId });
 }
