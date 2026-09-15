@@ -22,11 +22,17 @@ interface ListPoliciesResponse { Policies?: OrgPolicy[] }
  * call, which is the expected, common case for most connections — logged
  * and returned as empty rather than treated as a failure.
  *
- * OU listing is shallow: only the direct children of each root, not a
- * recursive walk of the full OU tree — a real, tracked gap for orgs with
- * nested OUs, not silently different from what it claims to cover
- * (OrganizationsResourceTypes lists 'organizations_ou' generically, this
- * scanner just doesn't walk arbitrarily deep).
+ * AWS-01: the OU walk is now RECURSIVE and shared with the hierarchy view.
+ *
+ * This scanner used to list only the direct children of each root, and said
+ * so — a tracked gap for orgs with nested OUs. Meanwhile listOrganizationTree
+ * below already walked the full tree correctly, but only to render a view;
+ * nothing persisted it. So the product could DISPLAY a nested hierarchy it
+ * could not STORE.
+ *
+ * Both now use the same walk. Writing a second recursion would have left two
+ * implementations of one traversal free to disagree about depth, cycles and
+ * bounds — and the shallow one was already the wrong answer.
  */
 export async function scanOrganizations(ctx: ScannerContext): Promise<ScannedResource[]> {
   const host = 'organizations.us-east-1.amazonaws.com';
@@ -47,12 +53,43 @@ export async function scanOrganizations(ctx: ScannerContext): Promise<ScannedRes
     });
   }
 
-  const rootsResult = await call('ListRoots');
-  const roots = rootsResult.ok ? (rootsResult.body as ListRootsResponse).Roots ?? [] : [];
-  for (const root of roots) {
-    const ousResult = await call('ListOrganizationalUnitsForParent', { ParentId: root.Id });
-    for (const ou of (ousResult.ok ? (ousResult.body as ListOUsResponse).OrganizationalUnits : []) ?? []) {
-      out.push({ resourceTypeKey: 'organizations_ou', resourceId: ou.Id, region: null, resourceName: ou.Name, relationships: { parentId: root.Id } });
+  /**
+   * Full hierarchy, flattened into inventory rows.
+   *
+   * Every OU carries its parent, and every account carries the OU it sits
+   * in, so the nested shape is reconstructable from flat rows without a
+   * second table. Identity is the AWS-native id (ou-…, r-…, the 12-digit
+   * account id) — never the display name, which a rename changes and which
+   * is not unique across an org.
+   */
+  const tree = await listOrganizationTree(ctx.creds);
+  if (tree.ok) {
+    for (const node of flattenOrgTree(tree.roots)) {
+      if (node.kind === 'ou' || node.kind === 'root') {
+        out.push({
+          resourceTypeKey: 'organizations_ou',
+          resourceId: node.id,
+          region: null,
+          resourceName: node.name,
+          state: node.kind,
+          // parentId is null for a root. Storing the depth makes a nesting
+          // regression visible in data rather than only in a rendered tree.
+          relationships: { parentId: node.parentId },
+          metadata: { nodeType: node.kind, depth: node.depth },
+        });
+      } else {
+        // An account's membership is an attribute of the account, so moving
+        // it between OUs updates one row rather than rewriting the tree.
+        out.push({
+          resourceTypeKey: 'organizations_account',
+          resourceId: node.id,
+          region: null,
+          resourceName: node.name,
+          state: node.status,
+          relationships: { parentId: node.parentId },
+          metadata: { email: node.email, nodeType: 'account', depth: node.depth },
+        });
+      }
     }
   }
 
@@ -91,6 +128,60 @@ export async function listOrganizationAccounts(creds: AwsCreds): Promise<{ ok: t
     return { ok: false, error: result.errorMessage ?? result.errorCode ?? `AWS Organizations ListAccounts failed (status ${result.status}) -- is this connection's account the Organization's management account (or a delegated administrator)?` };
   }
   return { ok: true, accounts: (result.body as ListAccountsResponse).Accounts ?? [] };
+}
+
+// ── Hierarchy flattening (AWS-01) ──────────────────────────────────────────
+
+export interface FlatOrgNode {
+  kind: 'root' | 'ou' | 'account';
+  id: string;
+  name: string;
+  /** Native id of the containing root/OU. Null only for a root. */
+  parentId: string | null;
+  depth: number;
+  email?: string;
+  status?: string;
+}
+
+/**
+ * Flattens the OU tree into rows, preserving parentage and depth.
+ *
+ * Pure, so every hierarchy rule below is testable without an AWS account —
+ * which matters because this environment has no Organizations access, and a
+ * rule that can only be checked against a management account is a rule that
+ * never gets checked.
+ *
+ * Cycle-safe by construction: `seen` means a malformed or hostile response
+ * that points an OU at its own ancestor terminates instead of recursing
+ * forever. AWS should never return one, but "should never" is not a bound.
+ */
+export function flattenOrgTree(roots: readonly OrgTreeNode[]): FlatOrgNode[] {
+  const out: FlatOrgNode[] = [];
+  const seen = new Set<string>();
+
+  const walk = (node: OrgTreeNode, parentId: string | null, depth: number) => {
+    if (seen.has(node.id)) return;
+    seen.add(node.id);
+
+    out.push({ kind: node.type, id: node.id, name: node.name, parentId, depth });
+
+    for (const a of node.accounts) {
+      // An account can only sit in one OU, so a duplicate here means the
+      // same account was returned under two parents — kept once, under the
+      // first, rather than emitting a row that contradicts itself.
+      if (seen.has(a.id)) continue;
+      seen.add(a.id);
+      out.push({
+        kind: 'account', id: a.id, name: a.name, parentId: node.id,
+        depth: depth + 1, email: a.email, status: a.status,
+      });
+    }
+
+    for (const child of node.children) walk(child, node.id, depth + 1);
+  };
+
+  for (const root of roots) walk(root, null, 0);
+  return out;
 }
 
 // ── Full OU tree (spec §25) ────────────────────────────────────────────────
