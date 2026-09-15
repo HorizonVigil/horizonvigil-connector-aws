@@ -35,6 +35,25 @@ export type NormalizedErrorCode =
   | 'AWS_SERVICE_UNAVAILABLE'
   | 'INVALID_REQUEST'
   | 'UNSUPPORTED_CAPABILITY'
+  /**
+   * The call SUCCEEDED but AWS stated there was more to read and the caller
+   * did not read it. Not a transport failure, not a permission problem — an
+   * incompleteness of coverage, which is the one thing finalize must never
+   * confuse with absence.
+   *
+   * This is the vocabulary's answer to the defect class the whole pagination
+   * work exists to close. AWS returns `NextToken`/`NextMarker`/`IsTruncated`
+   * on a 200 with a partial list; a scanner that reads only the first page
+   * therefore returns FEWER resources than exist, with no error anywhere. The
+   * degraded-coverage sink (creds.onCallFailure) had nothing to fire on, so a
+   * nightly scan of an account with 1,500 volumes would report 1,000 and
+   * finalize would tombstone the other 500 — a mass soft-delete caused by a
+   * triumphant API call rather than a failed one.
+   *
+   * Deliberately NOT retryable: retrying an unfollowed page 1 returns the same
+   * page 1. The fix is to follow the token, not to ask again.
+   */
+  | 'PAGINATION_TRUNCATED'
   | 'UNKNOWN';
 
 /**
@@ -156,7 +175,9 @@ export function classifyAwsError(input: ClassifyInput): NormalizedErrorCode {
  * PERMISSION_DENIED and INVALID_REQUEST are deliberately excluded: retrying
  * them cannot succeed, and doing so multiplies the API pressure that caused
  * the throttling in the first place. UNSUPPORTED_CAPABILITY is a settled
- * answer, not a failure.
+ * answer, not a failure. PAGINATION_TRUNCATED is excluded for a different
+ * reason: the call already succeeded, so re-issuing it returns the same first
+ * page. Only following the token makes progress.
  */
 export function isRetryable(code: NormalizedErrorCode): boolean {
   return code === 'THROTTLED' || code === 'RATE_LIMITED' || code === 'AWS_SERVICE_UNAVAILABLE' || code === 'NETWORK_ERROR' || code === 'TIMEOUT';
@@ -228,6 +249,8 @@ export function describeNormalizedError(code: NormalizedErrorCode): string {
       return 'AWS rejected the request as invalid.';
     case 'UNSUPPORTED_CAPABILITY':
       return 'This AWS capability is not enabled or not available in this region.';
+    case 'PAGINATION_TRUNCATED':
+      return 'AWS returned more results than were read; this resource type was only partially enumerated.';
     default:
       return 'An unrecognized AWS error occurred.';
   }

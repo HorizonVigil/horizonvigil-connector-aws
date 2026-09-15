@@ -8,6 +8,7 @@ import {
   type NormalizedErrorCode,
   type RetryPolicy,
 } from './awsErrors';
+import { detectTruncation } from './paginationSignals';
 
 /** One AWS call that exhausted its retries. Reported to `AwsCreds.onCallFailure`. */
 export interface AwsCallFailure {
@@ -114,15 +115,103 @@ export interface AwsCallResult {
 /** Hard ceiling on a single AWS request. Without it a hung connection blocks a scan step until the platform's own timeout kills the whole run. */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 
+/**
+ * Largest response body the truncation guard will decode to look for a
+ * continuation token.
+ *
+ * Well above any list response (EC2's 1,000-instance page is roughly 1 MB) and
+ * well below the payloads safeFetch callers stream for other reasons, so the
+ * guard costs nothing on the calls it cannot help.
+ */
+export const MAX_TRUNCATION_PROBE_BYTES = 8 * 1024 * 1024;
+
 export interface AwsCallOptions {
   retry?: RetryPolicy;
   timeoutMs?: number;
   /** Injectable for tests, so retry behaviour is asserted without real sleeping. */
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
+  /**
+   * Whether the caller is the thing reading the pages.
+   *
+   * `'auto'` (the default) means the caller asked for one page and did not say
+   * it would follow a continuation token — so if AWS says there is more, that
+   * is a real, and until now silent, shortfall in coverage, and it is reported
+   * through `creds.onCallFailure` as PAGINATION_TRUNCATED.
+   *
+   * `'follow'` is set by lib/pagination.ts's walkers, which DO read every page
+   * and report their own incompleteness (page cap, repeated token). Suppressing
+   * the guard there is what keeps a correctly-paginating scanner from being
+   * reported as degraded on every page-1 response.
+   *
+   * Why this belongs here rather than in each scanner: it is the same lever
+   * that already made throttle-safety universal. `creds` is the one object all
+   * ~150 scanner files thread into every AWS call, so a scanner that has not
+   * been migrated to the walker yet is still protected from the tombstones its
+   * missing page 2 would otherwise cause — and a scanner written next month is
+   * protected on the day it is written.
+   */
+  pagination?: 'auto' | 'follow';
 }
 
 const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Reports a SUCCESSFUL but incomplete response as degraded coverage.
+ *
+ * This is the guard that makes pagination safety universal. A truncated page 1
+ * is the one failure mode in the whole connector that arrives with a 200 and no
+ * error: AWS says "here are your first 1,000 volumes, and here is the token for
+ * the rest", the scanner reads the 1,000, and finalize — which establishes
+ * absence from "a scanner that covers this type did not return it" — soft-deletes
+ * the rest. There is no exception to catch and no failed call for the existing
+ * degraded-coverage sink to fire on, so nothing anywhere records that coverage
+ * was partial.
+ *
+ * Fixing that per-scanner means editing ~150 files and being right every time,
+ * including the ones written later. Reporting it centrally means every scanner
+ * that has not been migrated is protected now, and each migration to
+ * lib/pagination.ts removes a report by actually reading the pages.
+ *
+ * Cost when nothing is truncated: two cheap string/tag probes on the response.
+ * Cost when it is: the scanner's resource types are excluded from tombstoning
+ * for that run, which is the strictly-safe direction — a stale row is corrected
+ * by the next clean run, a wrongly deleted one destroys history and cost
+ * attribution.
+ *
+ * Never fires for UNSUPPORTED_CAPABILITY-style settled answers, because those
+ * are failures, not truncations, and are classified before this is reached.
+ */
+function reportTruncationIfUnread(
+  body: unknown,
+  report: { creds: AwsCreds; service: string; region: string; action: string } | undefined,
+  opts: AwsCallOptions,
+): void {
+  if (!report?.creds.onCallFailure) return;
+  // The walker is reading the pages itself and reports its own incompleteness.
+  if (opts.pagination === 'follow') return;
+
+  let signal;
+  try {
+    signal = detectTruncation(body);
+  } catch {
+    // Detection must never break a scan that otherwise succeeded.
+    return;
+  }
+  if (!signal.truncated) return;
+
+  try {
+    report.creds.onCallFailure({
+      service: report.service,
+      action: report.action,
+      region: report.region,
+      normalizedCode: 'PAGINATION_TRUNCATED',
+      attempts: 1,
+    });
+  } catch {
+    // As with lineage: a sink that throws must not fail the call it describes.
+  }
+}
 
 /**
  * Runs `attempt` under the retry policy, backing off with full jitter between
@@ -177,6 +266,10 @@ async function withRetry(
 
     const result = { ...outcome.result, attempts: tries + 1 };
     if (result.ok) {
+      // A 200 that says "there is more" is incomplete coverage, not success.
+      // See reportTruncationIfUnread — this is what stops a scanner that reads
+      // only page 1 from being trusted to prove absence at finalize.
+      reportTruncationIfUnread(result.body, report, opts);
       reportCall(result, outcome.requestId, tries + 1);
       return result;
     }
@@ -429,6 +522,17 @@ export async function safeFetch(
       const buf = await res.arrayBuffer();
       const buffered = new Response(buf, { status: res.status, statusText: res.statusText, headers: res.headers });
       if (res.ok) {
+        // Same truncation guard as the Query/JSON helpers above, for the 38
+        // scanners that talk to the raw client. The body is already an
+        // in-memory buffer here, so decoding it costs no extra I/O — but it is
+        // size-capped anyway, because a list response is text while some
+        // safeFetch callers stream genuinely large payloads (an S3 object, a
+        // CloudTrail event page) where decoding megabytes to look for a token
+        // would be work for nothing.
+        if (buf.byteLength <= MAX_TRUNCATION_PROBE_BYTES) {
+          const rep = client.__hvReport;
+          if (rep) reportTruncationIfUnread(new TextDecoder().decode(buf), { ...rep, action: safePathOf(url) }, opts);
+        }
         reportCall(buffered, 'succeeded', undefined, tries + 1);
         return buffered;
       }
@@ -494,10 +598,32 @@ export function extractXmlField(xml: string, tag: string): string | null {
   return match ? match[1] : null;
 }
 
-/** The URL's path only — a raw AWS URL can carry bucket names and object keys, which do not belong in a failure record. */
+/**
+ * A redacted description of a raw request URL, safe to record.
+ *
+ * The pathname alone is NOT safe, although this function's previous comment
+ * claimed it was. S3 is addressed by path (`/<bucket>/<key>`) and by virtual
+ * host, and both put the customer's bucket — and often an object key derived
+ * from their data — into the path. Those values were landing in
+ * `provider_requests.operation` and in the `[degraded] ...` console.warn that
+ * discovery.ts prints per failed call, which is shared infrastructure output,
+ * not customer-scoped UI.
+ *
+ * Redaction keeps the route SHAPE, which is what the record is actually for —
+ * distinguishing a collection list from a per-object fetch — and drops every
+ * segment VALUE, because nothing available here can tell a static AWS route
+ * name (`clusters`, `repositories`) from a customer identifier without
+ * per-service knowledge. Any heuristic loose enough to keep `clusters` also
+ * keeps a bucket called `mybucket`, so a heuristic would be a leak with extra
+ * steps rather than a fix. Query/JSON calls are unaffected: they pass an
+ * explicit API action name, which is a protocol constant and not customer data.
+ */
 function safePathOf(url: string): string {
   try {
-    return new URL(url).pathname || '/';
+    const { pathname } = new URL(url);
+    if (!pathname || pathname === '/') return '/';
+    const segments = pathname.split('/').filter((s) => s !== '');
+    return `/<redacted:${segments.length}>`;
   } catch {
     return 'unknown';
   }
