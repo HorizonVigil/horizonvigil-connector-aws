@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { isLeaseExpired, createOrGetActiveRun, claimRun, finalizeRun, toRunResponse, LEASE_SECONDS, STEPS_PER_SLICE, type CollectionRunRow } from './collectionRuns';
+import { isLeaseExpired, createOrGetActiveRun, claimRun, checkpoint, finalizeRun, toRunResponse, LEASE_SECONDS, STEPS_PER_SLICE, type CollectionRunRow } from './collectionRuns';
 import type { Db } from '@horizonvigil/shared-lib';
 
 /**
@@ -158,5 +158,70 @@ describe('run projection', () => {
 
   it('reports 0 percent for an empty plan rather than dividing by zero', () => {
     expect(toRunResponse(run({ total_steps: 0, step_cursor: 0 })).progress.percent).toBe(0);
+  });
+});
+
+/**
+ * AWS-06 — the lease must not outlive the slice that held it.
+ *
+ * `checkpoint` previously renewed the lease to now + 15 minutes on the way
+ * OUT of a slice, when no worker was holding the run any more. A parked run
+ * therefore stayed reserved against a worker that had already returned, and
+ * the next tick could not claim it however often the scheduler fired.
+ *
+ * Measured on a real 1,628-step production run: 14 slices, attempt=14,
+ * 03:35 -> 07:50 = 4h15m, roughly 18 minutes per slice against a 5-minute
+ * scheduler. Inventory was up to four hours stale for no other reason.
+ */
+describe('lease lifetime', () => {
+  it('releases the lease at the end of a slice instead of extending it', async () => {
+    const update = vi.fn().mockResolvedValue([]);
+    const db = { update } as unknown as Db;
+    await checkpoint(db, 'run-1', { stepCursor: 120, completedSteps: 120, failedSteps: 0, degradedResourceTypes: [] }, NOW);
+
+    const patch = update.mock.calls[0][2] as Record<string, unknown>;
+    expect(patch.lease_owner).toBeNull();
+    expect(patch.lease_expires_at).toBeNull();
+    // The load-bearing negative: the pre-fix code wrote a future expiry here.
+    expect(patch.lease_expires_at).not.toBe(new Date(NOW + LEASE_SECONDS * 1000).toISOString());
+  });
+
+  /**
+   * Crash recovery is the only reason the lease has a timeout, so it must
+   * survive this change: a worker that dies MID-slice never reaches
+   * checkpoint, so nothing releases its lease and it expires on its own.
+   */
+  it('still treats a lease held into the future as live', () => {
+    const held = run({ status: 'RUNNING', lease_expires_at: new Date(NOW + 60_000).toISOString() });
+    expect(isLeaseExpired(held, NOW)).toBe(false);
+  });
+
+  it('treats a released lease as claimable immediately', () => {
+    expect(isLeaseExpired(run({ status: 'RUNNING', lease_expires_at: null }), NOW)).toBe(true);
+  });
+
+  /**
+   * Comparing `status` alone did not exclude a second worker on the recovery
+   * path: reclaiming a RUNNING run transitions RUNNING -> RUNNING, so the
+   * winner's write leaves `status` exactly as the loser's filter expects and
+   * both updates match. The lease condition is what actually serialises them.
+   */
+  it('claims only when the lease is free, not merely when the status matches', async () => {
+    const update = vi.fn().mockResolvedValue([run({ status: 'RUNNING' })]);
+    const db = { update } as unknown as Db;
+    await claimRun(db, run({ status: 'RUNNING' }), 'worker-a', NOW);
+
+    const filters = update.mock.calls[0][1] as Record<string, string>;
+    expect(filters.or).toBe(`(lease_owner.is.null,lease_expires_at.lt.${new Date(NOW).toISOString()})`);
+    expect(filters.status).toBe('eq.RUNNING');
+  });
+
+  it('takes a lease that extends past the slice it is claimed for', async () => {
+    const update = vi.fn().mockResolvedValue([run({ status: 'RUNNING' })]);
+    const db = { update } as unknown as Db;
+    await claimRun(db, run(), 'worker-a', NOW);
+    const patch = update.mock.calls[0][2] as Record<string, unknown>;
+    expect(patch.lease_expires_at).toBe(new Date(NOW + LEASE_SECONDS * 1000).toISOString());
+    expect(patch.lease_owner).toBe('worker-a');
   });
 });
