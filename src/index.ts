@@ -15,6 +15,7 @@ import { discoveryRoutes } from './routes/discovery';
 import { internalScanRoutes } from './routes/internalScan';
 import { regionCatalogRoutes } from './routes/regionCatalog';
 import { adapterManifestRoutes } from './routes/adapterManifest';
+import { costReadinessRoutes } from './routes/costReadiness';
 import { internalRegistryTokenRoutes } from './routes/internalRegistryToken';
 import { remediationRoutes } from './routes/remediation';
 import { isProviderRemediationEnabled, remediationDisabledResponse } from './lib/capabilities';
@@ -54,6 +55,7 @@ app.route('/api/aws-accounts', discoveryRoutes);
 app.route('/api/aws-accounts', internalScanRoutes);
 app.route('/api/aws-accounts', regionCatalogRoutes);
 app.route('/api/aws-accounts', adapterManifestRoutes);
+app.route('/api/aws-accounts', costReadinessRoutes);
 app.route('/api/aws-accounts', internalRegistryTokenRoutes);
 /**
  * Direct provider mutation is disabled in V1 (2026-09-08 production-
@@ -120,6 +122,7 @@ app.route('/api/v1/aws', discoveryRoutes);
 app.route('/api/v1/aws', internalScanRoutes);
 app.route('/api/v1/aws', regionCatalogRoutes);
 app.route('/api/v1/aws', adapterManifestRoutes);
+app.route('/api/v1/aws', costReadinessRoutes);
 app.route('/api/v1/aws', internalRegistryTokenRoutes);
 app.route('/api/v1/aws', remediationRoutes);
 app.route('/api/v1/aws', curRoutes);
