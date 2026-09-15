@@ -1005,9 +1005,12 @@ export interface FinalizeOutcome { totalResources: number; deleted: number; find
  * deleted resources whose region simply hadn't been re-checked yet this
  * cycle, not resources that had actually vanished from AWS.
  */
-export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], env: Env, coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES, totalSteps = 0, degradedResourceTypes: readonly string[] = []): Promise<FinalizeOutcome> {
-  const existing = await db.select<{ id: string; resource_type_key: string; category: string; last_seen_at: string; deleted_at: string | null }[]>('cloud_resources', {
-    select: 'id,resource_type_key,category,last_seen_at,deleted_at',
+export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], env: Env, coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES, totalSteps = 0, degradedResourceTypes: readonly string[] = [], provenScopes: ReadonlySet<string> | null = null): Promise<FinalizeOutcome> {
+  // `region` is selected for AWS-12: a resource in a region this run did not
+  // successfully evaluate must not be tombstoned, however well its resource
+  // type fared elsewhere.
+  const existing = await db.select<{ id: string; resource_type_key: string; category: string; last_seen_at: string; deleted_at: string | null; region: string | null }[]>('cloud_resources', {
+    select: 'id,resource_type_key,category,last_seen_at,deleted_at,region',
     filters: { connection_id: `eq.${connection.id}` },
     limit: 10000,
   });
@@ -1015,7 +1018,7 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   // Only resource types a currently-implemented scanner actually checked
   // this run are eligible to be marked vanished — see the coveredResourceTypes
   // param above and lib/discoveryFinalize.ts (extracted so this is unit-testable).
-  const { vanishedIds, activeCategoryCounts, activeCount } = computeFinalizeResult(existing, coveredResourceTypes, runStartedAt, degradedResourceTypes);
+  const { vanishedIds, activeCategoryCounts, activeCount } = computeFinalizeResult(existing, coveredResourceTypes, runStartedAt, degradedResourceTypes, provenScopes);
   const now = new Date().toISOString();
   if (vanishedIds.length > 0) {
     // lifecycle_state moves with deleted_at. If the two could drift, the

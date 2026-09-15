@@ -4,6 +4,8 @@ import {
   describeJobStatus, isTerminal, assertTransition, type Db,
 } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
+import { regionsEstablishingAbsence } from '../lib/generations';
+import { GLOBAL_SCOPE } from '../lib/discoveryFinalize';
 import { loadConnection, regionsFor, runResourceStep, runFindingStep, runMetricStep, runFinalize, REGIONAL_SCANNERS, GLOBAL_SCANNERS, FINDING_SCANNERS, METRIC_STEP_NAME, SCANNER_RESOURCE_TYPES } from './discovery';
 import {
   createOrGetActiveRun, claimRun, checkpoint, finalizeRun, toRunResponse, isLeaseExpired,
@@ -396,10 +398,48 @@ collectionRunRoutes.post('/internal/advance-collection-runs', (c) =>
               .flatMap((n) => SCANNER_RESOURCE_TYPES[n] ?? []),
           ];
 
+          /**
+           * AWS-12. Scope-level absence, on top of the type-level rule above.
+           *
+           * A run that scanned fifteen regions successfully and failed two
+           * would still have tombstoned everything in the two failed
+           * regions, because the resource TYPE was covered somewhere else.
+           * Absence can only be established inside a scope that was actually
+           * evaluated.
+           *
+           * `regionsEstablishingAbsence` is the already-unit-tested helper in
+           * lib/generations.ts; this is the call site it was written for.
+           * A region is evaluated only if every planned step for it committed
+           * a row, so a slice that never reached a region proves nothing
+           * about it either.
+           */
+          const regionOf = (stepId: string): string | null => {
+            const parts = stepId.split(':');
+            return parts.length >= 3 ? parts[2] : null;
+          };
+          const committedIds = new Set(committedSteps.map((c2) => c2.step_id));
+          const requestedRegions = new Set(steps.map(regionOf).filter((r): r is string => !!r));
+          const failedRegions = new Set([...failedStepIds].map(regionOf).filter((r): r is string => !!r));
+          const unfinishedRegions = new Set(
+            steps.filter((id) => !committedIds.has(id)).map(regionOf).filter((r): r is string => !!r),
+          );
+          const provenScopes = regionsEstablishingAbsence({
+            requested: [...requestedRegions],
+            evaluated: [...requestedRegions].filter((r) => !unfinishedRegions.has(r)),
+            failed: [...failedRegions],
+          });
+
+          // Global resources carry no region, so they are proven by the
+          // global scanners rather than by any region.
+          const globalSteps = steps.filter((id) => id.startsWith('global:'));
+          const globalProven = globalSteps.length > 0
+            && globalSteps.every((id) => committedIds.has(id) && !failedStepIds.has(id));
+          if (globalProven) provenScopes.add(GLOBAL_SCOPE);
+
           await runFinalize(
             db, run.org_id, run.requested_by, connection,
             run.started_at ?? run.queued_at, [], c.env, coveredResourceTypes,
-            steps.length, [...degraded],
+            steps.length, [...degraded], provenScopes,
           );
         }
         const status = await finalizeRun(db, { ...run, completed_steps: completed, failed_steps: failed });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeFinalizeResult, type FinalizeCandidateResource } from './discoveryFinalize';
+import { computeFinalizeResult, type FinalizeCandidateResource , GLOBAL_SCOPE } from './discoveryFinalize';
 
 const EC2_TYPES = ['ec2_instance', 'ebs_volume', 'vpc'] as const;
 const RUN_STARTED_AT = '2026-07-31T00:00:00.000Z';
@@ -122,5 +122,63 @@ describe('computeFinalizeResult — degraded coverage must not delete', () => {
     // Backwards compatibility for any caller not yet threading the list.
     const r = computeFinalizeResult(inventory, ['ec2_instance'], runStartedAt);
     expect(r.vanishedIds.sort()).toEqual(['i-1', 'i-2']);
+  });
+});
+
+describe('AWS-12 — scope-level absence', () => {
+  const base = {
+    category: 'Compute', last_seen_at: '2026-01-01T00:00:00Z', deleted_at: null,
+  };
+  const rows = [
+    { id: 'in-good-region', resource_type_key: 'ec2_instance', region: 'us-east-1', ...base },
+    { id: 'in-failed-region', resource_type_key: 'ec2_instance', region: 'eu-west-1', ...base },
+    { id: 'global-resource', resource_type_key: 'iam_role', region: null, ...base },
+  ];
+  const RUN_STARTED = '2026-02-01T00:00:00Z';
+  const COVERED = ['ec2_instance', 'iam_role'];
+
+  /**
+   * The exact §9 invariant. Region B failed, so a resource last seen in
+   * region B must survive — even though its resource TYPE succeeded in
+   * region A, which is what the type-level rule alone would look at.
+   */
+  it('a resource in a failed region is not tombstoned', () => {
+    const proven = new Set(['us-east-1', GLOBAL_SCOPE]);
+    const { vanishedIds } = computeFinalizeResult(rows, COVERED, RUN_STARTED, [], proven);
+    expect(vanishedIds).toContain('in-good-region');
+    expect(vanishedIds).not.toContain('in-failed-region');
+  });
+
+  /**
+   * The positive control, and the load-bearing half: with scope filtering
+   * absent — the pre-AWS-12 behaviour — the resource in the failed region IS
+   * tombstoned. Without this, the test above could pass for the wrong reason
+   * and prove nothing.
+   */
+  it('control: without scope filtering the failed region WOULD be tombstoned', () => {
+    const { vanishedIds } = computeFinalizeResult(rows, COVERED, RUN_STARTED, [], null);
+    expect(vanishedIds).toContain('in-failed-region');
+  });
+
+  it('a global resource is proven by global scope, not by any region', () => {
+    const regionsOnly = new Set(['us-east-1', 'eu-west-1']);
+    const { vanishedIds } = computeFinalizeResult(rows, COVERED, RUN_STARTED, [], regionsOnly);
+    expect(vanishedIds).not.toContain('global-resource');
+
+    const withGlobal = new Set(['us-east-1', 'eu-west-1', GLOBAL_SCOPE]);
+    expect(computeFinalizeResult(rows, COVERED, RUN_STARTED, [], withGlobal).vanishedIds)
+      .toContain('global-resource');
+  });
+
+  it('an empty proven set tombstones nothing', () => {
+    const { vanishedIds } = computeFinalizeResult(rows, COVERED, RUN_STARTED, [], new Set());
+    expect(vanishedIds).toEqual([]);
+  });
+
+  /** Type-level degradation still wins regardless of scope. */
+  it('a degraded type is spared even inside a proven scope', () => {
+    const proven = new Set(['us-east-1', 'eu-west-1', GLOBAL_SCOPE]);
+    const { vanishedIds } = computeFinalizeResult(rows, COVERED, RUN_STARTED, ['ec2_instance'], proven);
+    expect(vanishedIds).not.toContain('in-good-region');
   });
 });
