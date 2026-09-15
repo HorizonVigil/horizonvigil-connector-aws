@@ -14,7 +14,21 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
 
-      - run: npm install
+      # package-lock resolves the private shared library to git+ssh. Rewrite
+      # that transport to HTTPS and supply the repository-read token via netrc
+      # so npm's git subprocess can install it without an SSH key. This is the
+      # same authenticated, non-build-arg pattern used by deploy.yml.
+      - name: Configure git for private shared-lib dependency
+        run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          printf "machine github.com\nlogin x-access-token\npassword %s\n" "${{ secrets.GH_PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc
+
+      - name: Install locked dependencies
+        run: |
+          trap 'rm -f ~/.netrc' EXIT
+          npm ci
 
       - name: Type check
         run: npm run typecheck --if-present
