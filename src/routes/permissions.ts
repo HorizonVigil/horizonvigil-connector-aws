@@ -130,19 +130,38 @@ export async function runConnectionValidation(
      * connection cannot say "inventory is fine but Cost Explorer is denied",
      * which is the only form of this information a customer can act on.
      */
-    // Both paths supply an org now (the interactive one from the request, the
-    // scheduled one from the connection row), so this is no longer skipped in
-    // the case that matters most -- the weekly automatic validation.
-    if (actor?.orgId) await writeCapabilityStatuses(
-      db,
-      buildCapabilityStatuses({
-        orgId: actor?.orgId ?? '',
-        connectionId: connection.id,
-        checks,
-        snapshotId: run.id,
-        connectionStatus: overallStatus === 'succeeded' ? 'connected' : 'error',
-      }),
-    );
+    /**
+     * Written under the SERVICE ROLE, never the caller's token.
+     *
+     * `connector_capability_status` has RLS enabled with a member-READ policy
+     * and no insert policy -- which is the correct design: capability health
+     * is evidence about whether a connection works, and evidence a customer
+     * can write is not evidence.
+     *
+     * But the interactive path passed the caller's own db, so every insert was
+     * silently rejected by RLS. "Validate Permissions" returned `succeeded`
+     * with 12 checks and wrote ZERO capability rows, and the panel stayed
+     * empty saying it had never been evaluated. Measured 2026-09-15: the only
+     * rows in the table belonged to one connection and were dated 09-09 -- the
+     * weekly SCHEDULED run, which alone uses the service role.
+     *
+     * Falls back to the caller's db only when no service key is configured,
+     * so a misconfigured environment degrades rather than throwing -- and it
+     * will write nothing there, exactly as before.
+     */
+    if (actor?.orgId) {
+      const statusDb = env.SUPABASE_SERVICE_ROLE_KEY ? createDb(env, env.SUPABASE_SERVICE_ROLE_KEY) : db;
+      await writeCapabilityStatuses(
+        statusDb,
+        buildCapabilityStatuses({
+          orgId: actor.orgId,
+          connectionId: connection.id,
+          checks,
+          snapshotId: run.id,
+          connectionStatus: overallStatus === 'succeeded' ? 'connected' : 'error',
+        }),
+      );
+    }
 
     const connectionPatch: Record<string, unknown> = { last_permission_check_at: new Date().toISOString() };
     if (overallStatus === 'succeeded') {
