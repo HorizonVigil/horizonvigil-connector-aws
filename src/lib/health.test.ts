@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeHealth, summarizeHealth, type HealthConnectionInput, type HealthValidationInput } from './health';
+import { computeHealth, summarizeHealth, canonicalStateFor, type AccountHealth, type HealthConnectionInput, type HealthValidationInput } from './health';
 
 const NOW = Date.parse('2026-03-01T00:00:00Z');
 const daysAgo = (n: number) => new Date(NOW - n * 86_400_000).toISOString();
@@ -106,20 +106,24 @@ describe('computeHealth', () => {
   });
 });
 
+/** Builds an AccountHealth for rollup tests, deriving the canonical state. */
+const acct = (connectionId: string, score: number | null, state: 'healthy' | 'warning' | 'critical' | 'unknown'): AccountHealth =>
+  ({ connectionId, score, state, canonicalState: canonicalStateFor(state, false), notAssessedReason: null, signals: [] });
+
 describe('summarizeHealth', () => {
   it('counts states and computes health% over rated accounts only', () => {
     const s = summarizeHealth([
-      { connectionId: 'a', score: 100, state: 'healthy', signals: [] },
-      { connectionId: 'b', score: 100, state: 'healthy', signals: [] },
-      { connectionId: 'c', score: 65, state: 'warning', signals: [] },
-      { connectionId: 'd', score: 0, state: 'unknown', signals: [] },
+      acct('a', 100, 'healthy'),
+      acct('b', 100, 'healthy'),
+      acct('c', 65, 'warning'),
+      acct('d', 0, 'unknown'),
     ]);
     expect(s).toMatchObject({ total: 4, healthy: 2, warning: 1, critical: 0, unknown: 1 });
     expect(s.healthPercent).toBe(67); // 2 of 3 rated
   });
 
   it('all-unknown → healthPercent null', () => {
-    expect(summarizeHealth([{ connectionId: 'a', score: 0, state: 'unknown', signals: [] }]).healthPercent).toBeNull();
+    expect(summarizeHealth([acct('a', 0, 'unknown')]).healthPercent).toBeNull();
   });
 });
 
@@ -154,5 +158,62 @@ describe('a disconnected connection has no score at all', () => {
     // 0 reads as "scored, and failing"; null reads as "not scored".
     const h = computeHealth(conn({ status: 'disconnected' }), null, NOW);
     expect(h.score).toBeNull();
+  });
+});
+
+/**
+ * AWS-19 — NOT_ASSESSED is not UNKNOWN.
+ *
+ * `state` collapsed both into `'unknown'`, so a connection nobody had ever
+ * checked was indistinguishable from one that was checked and came back
+ * ambiguous. That is the same conflation this codebase has had to remove from
+ * cost ($0 vs no data), posture (clean vs not configured), compliance (passed
+ * vs not evaluated) and identity (no stale keys vs not examined).
+ */
+describe('canonical health states', () => {
+  const conn = (over: Partial<HealthConnectionInput> = {}): HealthConnectionInput => ({
+    id: 'c1', status: 'connected', last_discovery_at: new Date().toISOString(),
+    last_sync_at: new Date().toISOString(), key_rotated_at: new Date().toISOString(),
+    ...over,
+  } as HealthConnectionInput);
+
+  it('maps the wire state onto the canonical vocabulary', () => {
+    expect(canonicalStateFor('healthy', false)).toBe('HEALTHY');
+    expect(canonicalStateFor('warning', false)).toBe('DEGRADED');
+    expect(canonicalStateFor('critical', false)).toBe('AT_RISK');
+    expect(canonicalStateFor('unknown', false)).toBe('UNKNOWN');
+  });
+
+  /** notAssessed wins over any state, because it is the stronger statement. */
+  it('reports NOT_ASSESSED regardless of the wire state', () => {
+    for (const s of ['healthy', 'warning', 'critical', 'unknown'] as const) {
+      expect(canonicalStateFor(s, true)).toBe('NOT_ASSESSED');
+    }
+  });
+
+  it('a disconnected connection is NOT_ASSESSED, with the reason', () => {
+    const h = computeHealth(conn({ status: 'disconnected' }), null);
+    expect(h.canonicalState).toBe('NOT_ASSESSED');
+    expect(h.notAssessedReason).toBe('connection_disconnected');
+    // The score stays null -- a disconnected account must not contribute a
+    // number to any rollup.
+    expect(h.score).toBeNull();
+  });
+
+  /** An assessed connection always carries a reason of null, never a stale one. */
+  it('an assessed connection reports no not-assessed reason', () => {
+    const h = computeHealth(conn(), null);
+    expect(h.notAssessedReason).toBeNull();
+    expect(h.canonicalState).not.toBe('NOT_ASSESSED');
+  });
+
+  /**
+   * The wire contract is deliberately unchanged: the frontend, the rollups and
+   * the account list all switch on these four strings, and renaming them would
+   * break every consumer to gain nothing.
+   */
+  it('leaves the wire state values untouched', () => {
+    expect(computeHealth(conn({ status: 'disconnected' }), null).state).toBe('unknown');
+    expect(['healthy', 'warning', 'critical', 'unknown']).toContain(computeHealth(conn(), null).state);
   });
 });

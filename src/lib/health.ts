@@ -26,6 +26,34 @@
 export type HealthState = 'healthy' | 'warning' | 'critical' | 'unknown';
 export type SignalStatus = 'ok' | 'warn' | 'fail' | 'unknown';
 
+/**
+ * AWS-19's canonical vocabulary.
+ *
+ * `state` above is the WIRE CONTRACT and is deliberately unchanged -- the
+ * frontend, the health rollups and the account list all switch on those four
+ * strings, and renaming them would break every consumer to gain nothing.
+ * This is derived alongside it.
+ *
+ * The distinction that actually matters, and the one `state` cannot express:
+ *
+ *   UNKNOWN       assessed, and the signals did not determine an answer
+ *   NOT_ASSESSED  never assessed -- nothing was attempted
+ *
+ * Both collapse into `'unknown'` today, so a connection nobody has ever
+ * checked is indistinguishable from one that was checked and came back
+ * ambiguous. That is the same conflation this codebase has had to remove from
+ * cost ($0 vs no data), posture (clean vs not configured), compliance (passed
+ * vs not evaluated) and identity (no stale keys vs not examined).
+ */
+export type CanonicalHealthState = 'HEALTHY' | 'DEGRADED' | 'AT_RISK' | 'UNKNOWN' | 'NOT_ASSESSED';
+
+/** Why an account has no health verdict. Present only when it has none. */
+export type NotAssessedReason =
+  /** The connection is disconnected, so there is no current evidence to score. */
+  | 'connection_disconnected'
+  /** Every signal returned unknown: nothing has been measured yet. */
+  | 'no_signal_measured';
+
 export interface HealthSignal {
   key: 'connection' | 'permissions' | 'discovery' | 'sync_freshness' | 'credentials';
   label: string;
@@ -46,8 +74,32 @@ export interface AccountHealth {
    * contribute to provider-level health.
    */
   score: number | null;
+  /** The wire contract. Unchanged, so existing consumers keep working. */
   state: HealthState;
+  /**
+   * The §6 vocabulary, derived. Distinguishes NOT_ASSESSED from UNKNOWN,
+   * which `state` cannot.
+   */
+  canonicalState: CanonicalHealthState;
+  /** Set only when canonicalState is NOT_ASSESSED. */
+  notAssessedReason: NotAssessedReason | null;
   signals: HealthSignal[];
+}
+
+/**
+ * Maps the wire state onto the canonical vocabulary.
+ *
+ * `notAssessed` is passed explicitly rather than inferred from `'unknown'`,
+ * because that is precisely the information `state` throws away.
+ */
+export function canonicalStateFor(state: HealthState, notAssessed: boolean): CanonicalHealthState {
+  if (notAssessed) return 'NOT_ASSESSED';
+  switch (state) {
+    case 'healthy': return 'HEALTHY';
+    case 'warning': return 'DEGRADED';
+    case 'critical': return 'AT_RISK';
+    case 'unknown': return 'UNKNOWN';
+  }
 }
 
 export interface HealthConnectionInput {
@@ -181,7 +233,12 @@ export function computeHealth(
   // Nothing measurable at all: no score, rather than a 0 that reads as a
   // failing grade.
   if (denom === 0) {
-    return { connectionId: conn.id, score: null, state: 'unknown', signals };
+    // Nothing was measured, which is not the same as measuring and being
+    // unsure. Recorded as NOT_ASSESSED with the reason.
+    return {
+      connectionId: conn.id, score: null, state: 'unknown',
+      canonicalState: 'NOT_ASSESSED', notAssessedReason: 'no_signal_measured', signals,
+    };
   }
 
   /**
@@ -195,7 +252,10 @@ export function computeHealth(
    * with one of two connections disconnected.
    */
   if (conn.status === 'disconnected') {
-    return { connectionId: conn.id, score: null, state: 'unknown', signals };
+    return {
+      connectionId: conn.id, score: null, state: 'unknown',
+      canonicalState: 'NOT_ASSESSED', notAssessedReason: 'connection_disconnected', signals,
+    };
   }
 
   const score = Math.round((weighted / denom) * 100);
@@ -219,7 +279,12 @@ export function computeHealth(
   else if (score >= 60) state = 'warning';
   else state = 'critical';
 
-  return { connectionId: conn.id, score, state, signals };
+  return {
+    connectionId: conn.id, score, state,
+    canonicalState: canonicalStateFor(state, false),
+    notAssessedReason: null,
+    signals,
+  };
 }
 
 /** Roll a set of per-account healths into the spec §6 counters. */
