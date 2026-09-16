@@ -339,10 +339,10 @@ async function executeStep(db: Db, env: Env, run: CollectionRunRow, stepId: stri
   // null userId: the worker runs under the service role with no requesting
   // user; the run was authorized when it was created.
   const result = stepId.startsWith('finding:')
-    ? await runFindingStep(db, run.org_id, null, env, run.connection_id, stepId)
+    ? await runFindingStep(db, run.org_id, null, env, run.connection_id, stepId, run.id)
     : stepId.startsWith('metric:')
-      ? await runMetricStep(db, run.org_id, null, env, run.connection_id, stepId)
-      : await runResourceStep(db, run.org_id, null, env, run.connection_id, stepId);
+      ? await runMetricStep(db, run.org_id, null, env, run.connection_id, stepId, run.id)
+      : await runResourceStep(db, run.org_id, null, env, run.connection_id, stepId, run.id);
 
   const severity = result.errorSeverity ?? 'error';
   const status = result.error ? (severity === 'info' ? 'info' : 'failed') : 'succeeded';

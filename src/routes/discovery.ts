@@ -523,7 +523,14 @@ interface CatalogRow { key: string; category: string; service: string }
  * AWS (PostgREST's `resolution=merge-duplicates` only touches columns
  * actually present in the payload).
  */
-export async function runFindingStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+export async function runFindingStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string,
+  /**
+   * The durable run this step belongs to. Optional so the signature stays
+   * compatible, but the durable worker always supplies it -- without it
+   * `ingestion_batches.collection_run_id` is NULL and a stored resource
+   * cannot be traced back to the run that collected it.
+   */
+  collectionRunId: string | null = null): Promise<StepResult> {
   const rest = stepId.slice('finding:'.length);
   const sep = rest.indexOf(':');
   if (sep === -1) return { stepId, resourceCount: 0, created: 0, error: `Malformed stepId "${stepId}"`, errorSeverity: 'error' };
@@ -589,7 +596,14 @@ export async function runFindingStep(db: Db, orgId: string, userId: string | nul
  * instance that isn't running, so pulling their metrics would just waste
  * subrequests on empty responses.
  */
-export async function runMetricStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+export async function runMetricStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string,
+  /**
+   * The durable run this step belongs to. Optional so the signature stays
+   * compatible, but the durable worker always supplies it -- without it
+   * `ingestion_batches.collection_run_id` is NULL and a stored resource
+   * cannot be traced back to the run that collected it.
+   */
+  collectionRunId: string | null = null): Promise<StepResult> {
   const rest = stepId.slice('metric:'.length);
   const sep = rest.indexOf(':');
   if (sep === -1) return { stepId, resourceCount: 0, created: 0, error: `Malformed stepId "${stepId}"`, errorSeverity: 'error' };
@@ -634,7 +648,14 @@ export async function runMetricStep(db: Db, orgId: string, userId: string | null
  * routes/internalScan.ts's scheduled-scan path can drive the exact same
  * upsert logic server-side instead of duplicating it.
  */
-export async function runResourceStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+export async function runResourceStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string,
+  /**
+   * The durable run this step belongs to. Optional so the signature stays
+   * compatible, but the durable worker always supplies it -- without it
+   * `ingestion_batches.collection_run_id` is NULL and a stored resource
+   * cannot be traced back to the run that collected it.
+   */
+  collectionRunId: string | null = null): Promise<StepResult> {
   let scanner: ScannerFn | undefined;
   let region: string;
   let scannerName: string;
@@ -708,7 +729,7 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
     orgId,
     connectionId: connection.id,
     accountNativeId: connection.aws_account_id ?? null,
-    collectionRunId: null,
+    collectionRunId,
     collectionStepId: stepId,
   });
 
