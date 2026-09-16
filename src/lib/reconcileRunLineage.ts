@@ -13,14 +13,45 @@ export async function reconcileRunLineage(
   db: Db,
   ctx: { orgId: string; connectionId: string; collectionRunId: string; accountId: string | null; evaluatedScopes: readonly string[] },
 ): Promise<{ status: string; drift: number }> {
-  const batchRows = await db.select<{
+  /**
+   * Paged to exhaustion, not capped.
+   *
+   * The first version read one page of 1,000 and reported BLOCKED whenever
+   * the cap was reached. That was the right refusal -- passing over a partial
+   * read is exactly what this control exists to prevent -- but it made the
+   * control useless in practice: a 1,628-step run writes one batch per step,
+   * so EVERY run exceeded the cap and every reconciliation came back BLOCKED.
+   * A control that can only ever say "I could not tell" is not a control.
+   *
+   * Measured on run b28b0f30: 1,509 batches, of which 1,000 were read and 370
+   * records accounted for. Paging sees all of them in two round trips.
+   *
+   * PAGE_LIMIT stays at the server's own cap rather than something larger,
+   * because PostgREST silently truncates above it -- asking for 5,000 and
+   * receiving 1,000 looks like a run with 1,000 batches.
+   */
+  const PAGE_LIMIT = 1000;
+  const MAX_PAGES = 50;
+  type BatchRow = {
     collector: string; observed_count: number | null; accepted_count: number | null;
     quarantined_count: number | null; rejected_count: number | null;
-  }[]>('ingestion_batches', {
-    select: 'collector,observed_count,accepted_count,quarantined_count,rejected_count',
-    filters: { collection_run_id: `eq.${ctx.collectionRunId}` },
-    limit: 1000,
-  });
+  };
+
+  const batchRows: BatchRow[] = [];
+  let truncated = false;
+  for (let page = 0; ; page++) {
+    if (page >= MAX_PAGES) { truncated = true; break; }
+    const rows = await db.select<BatchRow[]>('ingestion_batches', {
+      select: 'collector,observed_count,accepted_count,quarantined_count,rejected_count',
+      filters: { collection_run_id: `eq.${ctx.collectionRunId}` },
+      // Stable ordering, or paging can repeat one row and miss another.
+      order: 'id.asc',
+      limit: PAGE_LIMIT,
+      offset: page * PAGE_LIMIT,
+    });
+    batchRows.push(...rows);
+    if (rows.length < PAGE_LIMIT) break;
+  }
 
   /**
    * Collapsed per collector before comparison.
@@ -55,9 +86,12 @@ export async function reconcileRunLineage(
   const result = reconcileLineage([...byCollector.values()], persisted);
 
   const row = toReconciliationRow(result, ctx);
-  // The page cap is recorded on the row rather than silently ignored: a
-  // reconciliation that only saw part of a run must say so.
-  if (batchRows.length >= 1000) {
+  /**
+   * Only a run so large it exhausts MAX_PAGES is BLOCKED now -- 50,000
+   * batches, which no real run approaches. A reconciliation that saw part of
+   * a run must still say so rather than pass on what it could read.
+   */
+  if (truncated) {
     row.reason_code = 'batch_page_cap_reached';
     row.status = 'BLOCKED';
   }
