@@ -178,6 +178,35 @@ export function buildScanHealth(
     };
   }
 
+  /**
+   * Degraded types make the count non-authoritative even when every step
+   * succeeded.
+   *
+   * A truncated read SUCCEEDS. The truncation guard in awsApi.ts catches it
+   * and excludes the scanner's resource types from tombstoning -- which
+   * prevents data loss -- but the step still reports `succeeded`, so a run
+   * where 83 scanners silently stopped at page one reported COMPLETE with
+   * `countIsAuthoritative: true`.
+   *
+   * That is the defect this whole module exists to prevent, sitting inside
+   * the module. The estate was not fully read; saying so is the entire point.
+   *
+   * Checked BEFORE the failed-step branch so a run with both reports the
+   * failure, which is the more actionable of the two.
+   */
+  if (failed === 0 && degradedResourceTypes.length > 0) {
+    const shown = degradedResourceTypes.slice(0, 3).join(', ');
+    const more = degradedResourceTypes.length > 3 ? ` and ${degradedResourceTypes.length - 3} more` : '';
+    return {
+      ...base,
+      completeness: 'PARTIAL',
+      countIsAuthoritative: false,
+      summary:
+        `Every collection step succeeded, but ${degradedResourceTypes.length} resource type(s) were not fully read `
+        + `(${shown}${more}). Those resources were kept rather than marked deleted, and the count below is a floor, not a total.`,
+    };
+  }
+
   if (run.status === 'PARTIALLY_SUCCEEDED' || failed > 0) {
     const worst = failures[0];
     const where = worst

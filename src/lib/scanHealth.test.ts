@@ -189,3 +189,60 @@ describe('counts never come from a capped page', () => {
     expect(h.succeededSteps).toBe(2);
   });
 });
+
+/**
+ * A truncated read SUCCEEDS.
+ *
+ * The guard in awsApi.ts catches truncation and excludes the scanner's
+ * resource types from tombstoning, which prevents data loss. But the STEP
+ * still reports `succeeded` — so a run where 83 scanners silently stopped at
+ * page one reported COMPLETE with countIsAuthoritative: true, and the banner
+ * rendered nothing at all.
+ *
+ * Measured 2026-09-16: 83 of 111 scanner files are structurally single-page.
+ * On a large customer account that is most of the estate.
+ */
+describe('degraded coverage downgrades the verdict', () => {
+  const clean = { status: 'SUCCEEDED', totalSteps: 100, completedSteps: 100, failedSteps: 0, degradedResourceTypes: [] };
+
+  it('a run with degraded types is PARTIAL even when every step succeeded', () => {
+    const h = buildScanHealth({ ...clean, degradedResourceTypes: ['ec2_instance', 'vpc', 'subnet', 's3_bucket'] }, [],
+      { succeededSteps: 100, failedSteps: 0 });
+    expect(h.completeness).toBe('PARTIAL');
+    expect(h.countIsAuthoritative).toBe(false);
+    expect(h.summary).toContain('4 resource type(s) were not fully read');
+    expect(h.summary).toContain('floor, not a total');
+  });
+
+  /** Naming the types is what makes it actionable rather than alarming. */
+  it('names the degraded types, bounded, with a count for the rest', () => {
+    const h = buildScanHealth({ ...clean, degradedResourceTypes: ['a', 'b', 'c', 'd', 'e'] }, [],
+      { succeededSteps: 100, failedSteps: 0 });
+    expect(h.summary).toContain('a, b, c and 2 more');
+  });
+
+  /** Reassuring and true: degraded coverage suppresses deletion, not causes it. */
+  it('says the resources were kept rather than deleted', () => {
+    const h = buildScanHealth({ ...clean, degradedResourceTypes: ['ec2_instance'] }, [],
+      { succeededSteps: 100, failedSteps: 0 });
+    expect(h.summary).toContain('kept rather than marked deleted');
+  });
+
+  /** A failed step is more actionable than a degraded type, so it wins. */
+  it('reports the failure when a run has both', () => {
+    const h = buildScanHealth(
+      { ...clean, status: 'PARTIALLY_SUCCEEDED', failedSteps: 2, degradedResourceTypes: ['ec2_instance'] },
+      [step('regional:ec2:us-east-1', 'failed')],
+      { succeededSteps: 98, failedSteps: 2 },
+    );
+    expect(h.completeness).toBe('PARTIAL');
+    expect(h.summary).toContain('ec2 failed in');
+  });
+
+  /** A genuinely complete run still says so — this must not flag everything. */
+  it('still reports COMPLETE when nothing was degraded', () => {
+    const h = buildScanHealth(clean, [], { succeededSteps: 100, failedSteps: 0 });
+    expect(h.completeness).toBe('COMPLETE');
+    expect(h.countIsAuthoritative).toBe(true);
+  });
+});
