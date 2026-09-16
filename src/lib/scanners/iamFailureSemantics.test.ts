@@ -95,6 +95,28 @@ describe('IAM failure semantics', () => {
   });
 
   /**
+   * The credential report is ASYNCHRONOUS: GenerateCredentialReport answers
+   * STARTED and the report is unreadable for a few seconds.
+   *
+   * This used to work BY ACCIDENT -- the hand-rolled retry loop's backoff was
+   * long enough for the report to become ready. Removing that loop (correct;
+   * it duplicated withRetry) removed the accidental poll, and acquisition
+   * silently started failing: identities were still written, just without
+   * mfaActive, accessKeys or passwordEnabled, and mfa_enabled went NULL for
+   * every human in the estate. Measured in production 2026-09-16.
+   *
+   * Pinned so the poll cannot be removed again as "redundant retry logic".
+   */
+  it('polls explicitly for the credential report rather than relying on retry backoff', () => {
+    expect(SOURCE).toContain('REPORT_POLL_DELAYS_MS');
+    expect(SOURCE).toMatch(/for \(const delay of REPORT_POLL_DELAYS_MS\)/);
+    // Bounded, and the first attempt is immediate so a ready report costs nothing.
+    expect(SOURCE).toMatch(/REPORT_POLL_DELAYS_MS = \[0,/);
+    // Exhausting the poll must report not_ready, never an empty-but-fine report.
+    expect(SOURCE).toContain("credentialReportStatus = 'not_ready'");
+  });
+
+  /**
    * Only values the shared union actually declares. The first version of this
    * work invented 'incomplete' and 'stuck_token', and 'PAGINATION_INCOMPLETE'
    * — none of which exist. tsc caught all four, but pinning them here keeps

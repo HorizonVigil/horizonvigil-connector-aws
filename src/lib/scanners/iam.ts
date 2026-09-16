@@ -503,9 +503,36 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
     let credentialReportError: string | undefined;
 
     try {
+      /**
+       * GenerateCredentialReport is ASYNCHRONOUS. It answers STARTED and the
+       * report is not readable for a few seconds; GetCredentialReport reports
+       * ReportInProgress until then.
+       *
+       * This used to work by accident. The hand-rolled retry loop that
+       * wrapped every IAM call retried with backoff, and that incidental
+       * delay was long enough for the report to become ready. Removing that
+       * loop -- correct in itself, it duplicated `withRetry` -- removed the
+       * accidental poll with it, and credential-report acquisition silently
+       * started failing: identities kept being written, just without
+       * mfaActive, accessKeys or passwordEnabled, and `mfa_enabled` went NULL
+       * for every human in the estate.
+       *
+       * Polling explicitly is what the API actually asks for, so this is now
+       * deliberate rather than a side effect. Bounded: a report that is still
+       * not ready after these attempts is reported `not_ready`, never
+       * confused with an account that has no IAM users.
+       */
       await call('GenerateCredentialReport');
-      const reportXml = await call('GetCredentialReport', undefined, { required: false });
-      const content = field(reportXml, 'Content');
+
+      const REPORT_POLL_DELAYS_MS = [0, 500, 1000, 2000, 3000];
+      let reportXml = '';
+      let content: string | null = null;
+      for (const delay of REPORT_POLL_DELAYS_MS) {
+        if (delay > 0) await new Promise<void>((r) => setTimeout(r, delay));
+        reportXml = await call('GetCredentialReport', undefined, { required: false });
+        content = field(reportXml, 'Content');
+        if (content) break;
+      }
 
       if (!content) {
         credentialReportStatus = 'not_ready';
