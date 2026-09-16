@@ -15,6 +15,7 @@ import {
 import { fetchCurManifest, parseCurBatch } from '../lib/curIngest';
 import { resolveCredentials } from './permissions';
 import { ingestCurFile, advanceCheckpoint, allFilesComplete, finalizeCurRun, type CurCheckpoint } from '../lib/curWorkflow';
+import { reconcileRunLineage } from '../lib/reconcileRunLineage';
 
 export const collectionRunRoutes = new Hono<{ Bindings: Env }>();
 
@@ -528,6 +529,30 @@ collectionRunRoutes.post('/internal/advance-collection-runs', (c) =>
             run.started_at ?? run.queued_at, [], c.env, coveredResourceTypes,
             steps.length, [...degraded], provenScopes,
           );
+
+          /**
+           * AWS-11. `inventory_reconciliations` existed empty because nothing
+           * ever called the reconciler; this is that caller.
+           *
+           * It runs AFTER finalize so it sees the estate as finalize left it --
+           * tombstones applied, generations resolved -- and it is best-effort
+           * for the same reason edge materialization is: a reconciliation that
+           * fails must not fail a collection that gathered real inventory. But
+           * unlike a silent skip, the failure is logged AND the absence of a
+           * row is itself detectable, because a completed run should always
+           * have one.
+           */
+          try {
+            await reconcileRunLineage(db, {
+              orgId: run.org_id,
+              connectionId: run.connection_id,
+              collectionRunId: run.id,
+              accountId: connection.aws_account_id ?? null,
+              evaluatedScopes: [...provenScopes],
+            });
+          } catch (err) {
+            console.error(`Lineage reconciliation failed for run ${run.id} (collection stands): ${err instanceof Error ? err.message : err}`);
+          }
         }
         const status = await finalizeRun(db, { ...run, completed_steps: completed, failed_steps: failed });
 
