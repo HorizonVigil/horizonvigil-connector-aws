@@ -50,7 +50,23 @@ describe('lineage write path runs under the service role', () => {
   it('the worker tick that executes steps also runs under the service role', () => {
     const src = read('collectionRuns.ts');
     expect(src).toContain('createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY)');
-    expect(src).toContain('runResourceStep(db, run.org_id, null, env, run.connection_id, stepId)');
+
+    /**
+     * Asserts the PROPERTY this guard exists for -- the worker passes a null
+     * userId, so the step runs as the service role -- rather than the exact
+     * argument list.
+     *
+     * It previously pinned the whole call verbatim, which broke the moment a
+     * run id was threaded through for lineage. A guard that fails on any
+     * signature change teaches people to edit the guard rather than read it,
+     * and the next edit is the one that quietly drops the `null`.
+     */
+    for (const fn of ['runResourceStep', 'runFindingStep', 'runMetricStep']) {
+      const at = src.indexOf(`${fn}(db, run.org_id,`);
+      expect(at, `${fn} must be called with the worker's service-role db and run org`).toBeGreaterThan(-1);
+      const call = src.slice(at, src.indexOf(`)`, at) + 1);
+      expect(call, `${fn} must pass a null userId -- the worker has no requesting user`).toContain('run.org_id, null,');
+    }
   });
 
   it('no route hands runResourceStep a caller-JWT Db', () => {
