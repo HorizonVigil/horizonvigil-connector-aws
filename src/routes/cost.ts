@@ -5,6 +5,7 @@ import { resolveCredentials, type ResolvableConnection } from './permissions';
 import { triggerAnomalyDetection } from '../lib/postScanHooks';
 import { ensureBillingPeriod, writeCostFacts } from '../lib/costFacts';
 import { recordCostSourceState, stateForFailure, stateForSuccess } from '../lib/costSourceState';
+import { nextDueAtHours } from '../lib/scheduleCadence';
 
 const MAX_CONNECTIONS_PER_COST_SYNC_RUN = 5;
 
@@ -419,7 +420,9 @@ costRoutes.post('/internal/run-due-cost-syncs', (c) =>
       }
 
       const outcome = await syncConnectionCost(db, resolved.creds, connection);
-      const nextSync = new Date(Date.now() + row.cost_sync_interval_hours * 60 * 60 * 1000).toISOString();
+      // See lib/scheduleCadence.ts: anchoring on Date.now() let scheduler
+      // jitter skip a whole sync interval.
+      const nextSync = nextDueAtHours(row.cost_sync_interval_hours);
       await db.update('cloud_connections', { id: `eq.${row.id}` }, { next_scheduled_cost_sync_at: nextSync }, 'return=minimal');
 
       if (!outcome.ok) {

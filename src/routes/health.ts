@@ -1,6 +1,7 @@
 import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, getActiveScope, inFilter, guarded, okJson, errJson, requirePermittedConnection } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { computeHealth, summarizeHealth, type HealthConnectionInput, type HealthValidationInput } from '../lib/health';
+import { evaluateFreshness, type CapabilityRow } from '../lib/capabilityFreshness';
 
 export const healthRoutes = new Hono<{ Bindings: Env }>();
 
@@ -166,15 +167,37 @@ healthRoutes.get('/accounts/:id/capabilities', (c) =>
     await requirePermittedConnection(db, orgId, auth.userId, id, getActiveScope(c.req.raw, orgId));
 
     const rows = await db.select<Record<string, unknown>[]>('connector_capability_status', {
-      select: 'capability,state,reason_code,source,expected_scope,covered_scope,last_attempt_at,last_success_at,permission_snapshot_id,updated_at',
+      select: 'capability,state,reason_code,source,expected_scope,covered_scope,last_attempt_at,last_success_at,freshness_slo_seconds,permission_snapshot_id,updated_at',
       filters: { connection_id: `eq.${id}`, org_id: `eq.${orgId}` },
       order: 'capability.asc',
       limit: 100,
     });
 
+    /*
+     * `state` is a verdict from whenever the probe last ran; it does not decay
+     * on its own. Returning it raw let `billing_cost_explorer` answer
+     * `available` for six days after cost collection had started failing
+     * closed. The row already carried last_success_at and its own SLO --
+     * evaluateFreshness is what compares them. See lib/capabilityFreshness.ts.
+     */
+    const items = rows.map((row) => {
+      const freshness = evaluateFreshness(row as unknown as CapabilityRow);
+      return {
+        ...row,
+        // The effective answer. A caller reading `state` cannot now be told
+        // `available` about something last proven a week ago.
+        state: freshness.state,
+        recorded_state: freshness.recordedState,
+        stale: freshness.stale,
+        staleness_reason: freshness.reason,
+        age_seconds: freshness.ageSeconds,
+      };
+    });
+
     return okJson({
-      items: rows,
-      total: rows.length,
+      items,
+      total: items.length,
+      staleCount: items.filter((i) => i.stale).length,
       // An empty list is "never evaluated", not "all healthy" -- stated
       // explicitly so a client cannot read absence as success.
       evaluated: rows.length > 0,

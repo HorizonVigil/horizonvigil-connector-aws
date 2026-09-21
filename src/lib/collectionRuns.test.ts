@@ -145,6 +145,81 @@ describe('terminal status comes from committed steps, not from counters', () => 
   });
 });
 
+/**
+ * AWS-06 / AWS-12 regression: the evidence read was silently truncated.
+ *
+ * `finalizeRun` asked for `limit: 5000`, but PostgREST caps a response at
+ * 1,000 rows server-side before any app-level limit applies. A 1,628-step run
+ * was therefore finalized from its first 1,000 steps.
+ *
+ * Production, 2026-09-15: the run stored `error_summary` = "12 of 1000
+ * step(s) failed" when it had **17** failures across **1,628** steps.
+ */
+describe('finalize reads every committed step, not the first page', () => {
+  /** A db whose select honours limit/offset and caps each page at 1,000, as PostgREST does. */
+  const pagedDb = (statuses: ('succeeded' | 'failed' | 'skipped' | 'info')[]) => {
+    const update = vi.fn().mockResolvedValue([]);
+    const select = vi.fn(async (_table: string, opts: { limit?: number; offset?: number }) => {
+      const offset = opts.offset ?? 0;
+      const limit = Math.min(opts.limit ?? 1000, 1000); // the server-side cap
+      return statuses.slice(offset, offset + limit).map((status) => ({ status }));
+    });
+    return { db: { select, update } as unknown as Db, select, update };
+  };
+
+  const run1628 = (failedIndices: number[]) => {
+    const statuses = Array.from({ length: 1628 }, () => 'succeeded' as const);
+    const out: ('succeeded' | 'failed')[] = [...statuses];
+    for (const i of failedIndices) out[i] = 'failed';
+    return out;
+  };
+
+  it('does not report SUCCEEDED when every failure sits beyond the first page', async () => {
+    // The exact shape that made the guarantee unreachable: 17 failures, all
+    // past row 1,000, so a truncated read sees a flawless run.
+    const failed = Array.from({ length: 17 }, (_, i) => 1100 + i);
+    const { db } = pagedDb(run1628(failed));
+
+    expect(await finalizeRun(db, run({ status: 'RUNNING' }))).toBe('PARTIALLY_SUCCEEDED');
+  });
+
+  it('counts failures against the true total, not the page size', async () => {
+    const failed = Array.from({ length: 17 }, (_, i) => 1100 + i);
+    const { db, update } = pagedDb(run1628(failed));
+
+    await finalizeRun(db, run({ status: 'RUNNING' }));
+
+    const patch = update.mock.calls[0]?.[2] as { error_summary: string };
+    expect(patch.error_summary).toBe('17 of 1628 step(s) failed');
+    // The literal that gave the truncation away in production.
+    expect(patch.error_summary).not.toContain('of 1000');
+  });
+
+  it('pages until the run is exhausted', async () => {
+    const { db, select } = pagedDb(run1628([]));
+    await finalizeRun(db, run({ status: 'RUNNING' }));
+
+    // 1,628 rows over a 1,000-row cap is two pages; the second is short, so
+    // no third request is needed to prove the end.
+    expect(select).toHaveBeenCalledTimes(2);
+    expect((select.mock.calls[1]?.[1] as { offset: number }).offset).toBe(1000);
+  });
+
+  it('orders the read so paging cannot repeat or skip a row', async () => {
+    const { db, select } = pagedDb(run1628([]));
+    await finalizeRun(db, run({ status: 'RUNNING' }));
+
+    // Without an explicit order, PostgREST's row order is unspecified between
+    // requests -- which is also why WHICH 1,000 rows came back was luck.
+    expect((select.mock.calls[0]?.[1] as { order: string }).order).toBe('step_index.asc');
+  });
+
+  it('still succeeds a genuinely clean multi-page run', async () => {
+    const { db } = pagedDb(run1628([]));
+    expect(await finalizeRun(db, run({ status: 'RUNNING' }))).toBe('SUCCEEDED');
+  });
+});
+
 describe('run projection', () => {
   it('derives percent rather than storing it', () => {
     const r = toRunResponse(run({ step_cursor: 1, total_steps: 4 }));

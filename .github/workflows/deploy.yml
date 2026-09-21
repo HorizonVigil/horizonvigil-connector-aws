@@ -57,11 +57,50 @@ jobs:
           docker push "$IMAGE"
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
 
+      # --set-env-vars REPLACES the whole environment, so any variable not
+      # listed on the deploy line is destroyed by the next deploy. That is the
+      # right, reproducible default -- but only if every required variable is
+      # actually listed AND actually has a value.
+      #
+      # On 2026-09-16 it was neither. INTERNAL_COST_SYNC_SECRET had been set by
+      # hand on the service and was never added here, so the next deploy wiped
+      # it. POST /internal/run-due-cost-syncs fails closed without it, and AWS
+      # cost collection then returned 503 in 3ms every day for six days. The
+      # only trace was a status code on a Cloud Scheduler job nobody watches:
+      # the connection still read `connected`, and the billing_cost_explorer
+      # capability still read `available` from its last success on 09-15.
+      #
+      # An empty GitHub secret expands to an empty string and fails-closed in
+      # exactly the same silent way, so absence is checked here rather than
+      # discovered a week later.
+      - name: Verify required deploy secrets are present
+        env:
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          INTERNAL_SCAN_SECRET: ${{ secrets.INTERNAL_SCAN_SECRET }}
+          INTERNAL_COST_SYNC_SECRET: ${{ secrets.INTERNAL_COST_SYNC_SECRET }}
+          POST_SCAN_HOOK_SECRET: ${{ secrets.POST_SCAN_HOOK_SECRET }}
+        run: |
+          missing=""
+          for name in ENCRYPTION_KEY SUPABASE_SERVICE_ROLE_KEY INTERNAL_SCAN_SECRET \
+                      INTERNAL_COST_SYNC_SECRET POST_SCAN_HOOK_SECRET; do
+            # Indirect expansion; never echo the value itself.
+            if [ -z "${!name}" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing"
+            echo "Each one disables a scheduled job that fails closed and stays silent."
+            exit 1
+          fi
+          echo "All required deploy secrets are present."
+
       - name: Deploy to Cloud Run
         env:
           ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           INTERNAL_SCAN_SECRET: ${{ secrets.INTERNAL_SCAN_SECRET }}
+          INTERNAL_COST_SYNC_SECRET: ${{ secrets.INTERNAL_COST_SYNC_SECRET }}
+          POST_SCAN_HOOK_SECRET: ${{ secrets.POST_SCAN_HOOK_SECRET }}
         run: |
           gcloud run deploy ${{ env.SERVICE }} \
             --image="${{ env.IMAGE }}" \
@@ -72,7 +111,7 @@ jobs:
             --max-instances=1 \
             --memory=256Mi \
             --timeout=1800 \
-            --set-env-vars="^##^SUPABASE_URL=https://dvyoghaqeknyyrdujssi.supabase.co##SUPABASE_ANON_KEY=sb_publishable_gRal6V08wNzz0drb1F1QAw_Na-j9XoL##ALLOWED_ORIGIN=https://frontend-7yo5yw7xca-uc.a.run.app|https://frontend-153395452624.us-central1.run.app|https://horizonvigil.com|https://www.horizonvigil.com##DB_SCHEMA=public##AUTOMATION_API_URL=https://automation-7yo5yw7xca-uc.a.run.app##ENCRYPTION_KEY=${ENCRYPTION_KEY}##SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}##INTERNAL_SCAN_SECRET=${INTERNAL_SCAN_SECRET}"
+            --set-env-vars="^##^SUPABASE_URL=https://dvyoghaqeknyyrdujssi.supabase.co##SUPABASE_ANON_KEY=sb_publishable_gRal6V08wNzz0drb1F1QAw_Na-j9XoL##ALLOWED_ORIGIN=https://frontend-7yo5yw7xca-uc.a.run.app|https://frontend-153395452624.us-central1.run.app|https://horizonvigil.com|https://www.horizonvigil.com##DB_SCHEMA=public##AUTOMATION_API_URL=https://automation-7yo5yw7xca-uc.a.run.app##ENCRYPTION_KEY=${ENCRYPTION_KEY}##SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}##INTERNAL_SCAN_SECRET=${INTERNAL_SCAN_SECRET}##INTERNAL_COST_SYNC_SECRET=${INTERNAL_COST_SYNC_SECRET}##POST_SCAN_HOOK_SECRET=${POST_SCAN_HOOK_SECRET}##COST_OPTIMIZATION_API_URL=https://cost-7yo5yw7xca-uc.a.run.app"
 
       - name: Show service URL
         run: gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }} --format='value(status.url)'
