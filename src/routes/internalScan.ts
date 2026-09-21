@@ -3,7 +3,7 @@ import type { Env } from '../env';
 import { planSteps } from './collectionRuns';
 import { createOrGetActiveRun } from '../lib/collectionRuns';
 import { loadConnection } from './discovery';
-import { nextDueAtHours } from '../lib/scheduleCadence';
+import { nextDueAtHours, missedPeriods } from '../lib/scheduleCadence';
 
 export const internalScanRoutes = new Hono<{ Bindings: Env }>();
 
@@ -68,7 +68,7 @@ const MAX_STEPS_PER_CONNECTION = 1500;
 // genuinely abandoned, not ones still honestly in progress in an open tab.
 const ABANDONED_SCAN_THRESHOLD_MINUTES = 30;
 
-interface ConnectionDue { id: string; org_id: string; scan_interval_hours: number }
+interface ConnectionDue { id: string; org_id: string; scan_interval_hours: number; next_scheduled_scan_at: string | null }
 
 /**
  * Both endpoints below ENQUEUE durable runs; neither executes steps. The
@@ -88,7 +88,9 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
     const now = new Date().toISOString();
 
     const due = await db.select<ConnectionDue[]>('cloud_connections', {
-      select: 'id,org_id,scan_interval_hours',
+      // next_scheduled_scan_at is selected so a missed period can be DETECTED,
+      // not merely prevented -- see the reporting below.
+      select: 'id,org_id,scan_interval_hours,next_scheduled_scan_at',
       filters: {
         provider: 'eq.aws', auto_scan_enabled: 'eq.true',
         or: `(next_scheduled_scan_at.is.null,next_scheduled_scan_at.lte.${now})`,
@@ -153,10 +155,41 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
       const nextScan = nextDueAtHours(row.scan_interval_hours);
       await db.update('cloud_connections', { id: `eq.${row.id}` }, { next_scheduled_scan_at: nextScan }, 'return=minimal');
 
-      results.push({ connectionId: row.id, runId: run.id, status: run.status, created, plannedSteps: plannedSteps.length });
+      /*
+       * A collection that never happened used to leave no trace at all: the
+       * connection still read `connected`, health was unchanged, and only
+       * `last_sync_at` quietly fell behind. Two of five daily collections were
+       * lost that way before anyone noticed. Whatever causes the next gap --
+       * scheduler outage, deploy window, quota denial -- it is reported here
+       * rather than inferred later from a stale timestamp.
+       */
+      const missed = missedPeriods(
+        row.next_scheduled_scan_at ?? null,
+        Date.parse(now),
+        row.scan_interval_hours * 60 * 60 * 1000,
+      );
+
+      if (missed > 0) {
+        console.warn(JSON.stringify({
+          event: 'collection.schedule.missed_periods',
+          connectionId: row.id,
+          orgId: row.org_id,
+          missedPeriods: missed,
+          wasDueAt: row.next_scheduled_scan_at,
+          intervalHours: row.scan_interval_hours,
+        }));
+      }
+
+      results.push({ connectionId: row.id, runId: run.id, status: run.status, created, plannedSteps: plannedSteps.length, missedPeriods: missed });
     }
 
-    return okJson({ connectionsEnqueued: results.length, results });
+    return okJson({
+      connectionsEnqueued: results.length,
+      // Surfaced at the top level so a scheduler gap is visible without
+      // reading every per-connection entry.
+      missedPeriods: results.reduce((sum, r) => sum + r.missedPeriods, 0),
+      results,
+    });
   }),
 );
 

@@ -160,3 +160,79 @@ describe('scanEc2 failure semantics', () => {
     expect(failures.some((f) => f.normalizedCode === 'PAGINATION_TRUNCATED')).toBe(true);
   });
 });
+/**
+ * AWS-16 / Blocker 6. The scanner used to store only `inboundRuleCount`, which
+ * made open-ingress uncomputable across the whole estate. These assert the
+ * EVIDENCE actually reaches the resource, because a correct normalizer that
+ * nothing calls fixes nothing.
+ */
+describe('scanEc2 retains security-group rule evidence', () => {
+  const sgResponse = (permissions: string) =>
+    `<DescribeSecurityGroupsResponse><securityGroupInfo><item>` +
+    `<groupId>sg-1</groupId><groupName>web</groupName><vpcId>vpc-1</vpcId>` +
+    `<groupDescription>web tier</groupDescription>` +
+    `<ipPermissions>${permissions}</ipPermissions>` +
+    `<ipPermissionsEgress><item><ipProtocol>-1</ipProtocol><ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges></item></ipPermissionsEgress>` +
+    `</item></securityGroupInfo></DescribeSecurityGroupsResponse>`;
+
+  const serveSg = (permissions: string) => {
+    fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
+      const { action } = request(init);
+      if (action === 'DescribeSecurityGroups') return ok(sgResponse(permissions));
+      return empty(action);
+    });
+  };
+
+  const sgFrom = (resources: ScannedResource[]) =>
+    resources.find((r) => r.resourceTypeKey === 'security_group');
+
+  it('stores the actual inbound rules, not just a count', async () => {
+    serveSg('<item><ipProtocol>tcp</ipProtocol><fromPort>22</fromPort><toPort>22</toPort>' +
+      '<ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges></item>');
+
+    const sg = sgFrom(await scanEc2(ctx));
+    const rules = sg?.metadata?.inboundRules as { protocol: string; fromPort: number }[];
+
+    expect(rules).toHaveLength(1);
+    expect(rules[0]).toMatchObject({ protocol: 'tcp', fromPort: 22 });
+    // The old field stays correct for existing consumers.
+    expect(sg?.metadata?.inboundRuleCount).toBe(1);
+  });
+
+  /**
+   * The honesty property. A group with no ingress and a group whose rules were
+   * never read both yield zero findings, and only one is safe — so the KEY must
+   * be present even when the list is empty.
+   */
+  it('writes an empty inboundRules array rather than omitting the key', async () => {
+    serveSg('');
+
+    const sg = sgFrom(await scanEc2(ctx));
+
+    expect(sg?.metadata).toHaveProperty('inboundRules');
+    expect(sg?.metadata?.inboundRules).toEqual([]);
+    expect(sg?.metadata?.rulesEvidenceVersion).toBe(1);
+  });
+
+  it('reports rules it could not normalize instead of silently dropping them', async () => {
+    // A permission carrying a source but no protocol.
+    serveSg('<item><ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges></item>');
+
+    const sg = sgFrom(await scanEc2(ctx));
+
+    expect(sg?.metadata?.inboundRules).toEqual([]);
+    expect(sg?.metadata?.unparsedInboundRuleCount).toBe(1);
+  });
+
+  it('keeps egress separate from ingress', async () => {
+    serveSg('<item><ipProtocol>tcp</ipProtocol><fromPort>443</fromPort><toPort>443</toPort>' +
+      '<ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges></item>');
+
+    const sg = sgFrom(await scanEc2(ctx));
+    const inbound = sg?.metadata?.inboundRules as { direction: string }[];
+    const outbound = sg?.metadata?.outboundRules as { direction: string }[];
+
+    expect(inbound.every((r) => r.direction === 'ingress')).toBe(true);
+    expect(outbound.every((r) => r.direction === 'egress')).toBe(true);
+  });
+});

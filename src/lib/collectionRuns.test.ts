@@ -300,3 +300,108 @@ describe('lease lifetime', () => {
     expect(patch.lease_owner).toBe('worker-a');
   });
 });
+
+/**
+ * Blocker 2 boundary matrix. The cap is 1,000, so the interesting sizes are
+ * the ones either side of it and the real 1,628-step run that exposed this.
+ */
+describe('finalize across page boundaries', () => {
+  const pagedDb = (statuses: ('succeeded' | 'failed')[]) => {
+    const update = vi.fn().mockResolvedValue([]);
+    const select = vi.fn(async (_t: string, opts: { limit?: number; offset?: number }) => {
+      const offset = opts.offset ?? 0;
+      const limit = Math.min(opts.limit ?? 1000, 1000);
+      return statuses.slice(offset, offset + limit).map((status) => ({ status }));
+    });
+    return { db: { select, update } as unknown as Db, update, select };
+  };
+
+  const withFailuresAt = (total: number, failedIndices: number[]) => {
+    const out: ('succeeded' | 'failed')[] = Array.from({ length: total }, () => 'succeeded');
+    for (const i of failedIndices) out[i] = 'failed';
+    return out;
+  };
+
+  const summaryOf = (update: ReturnType<typeof vi.fn>) =>
+    (update.mock.calls[0]?.[2] as { error_summary: string | null }).error_summary;
+
+  for (const total of [0, 1, 999, 1000, 1001, 1628, 5000]) {
+    it(`reads all ${total} steps`, async () => {
+      const { db, update } = pagedDb(withFailuresAt(total, total > 0 ? [total - 1] : []));
+      const status = await finalizeRun(db, run({ status: 'RUNNING' }));
+
+      if (total === 0) {
+        // A run that executed nothing has produced no trustworthy result.
+        expect(status).toBe('FAILED');
+        return;
+      }
+      if (total === 1) {
+        // Its only step failed, so there is no success to partially credit.
+        expect(status).toBe('FAILED');
+        return;
+      }
+      expect(status).toBe('PARTIALLY_SUCCEEDED');
+      expect(summaryOf(update)).toBe(`1 of ${total} step(s) failed`);
+    });
+  }
+
+  it('sees a failure on the FIRST page', async () => {
+    const { db, update } = pagedDb(withFailuresAt(1628, [0]));
+    expect(await finalizeRun(db, run({ status: 'RUNNING' }))).toBe('PARTIALLY_SUCCEEDED');
+    expect(summaryOf(update)).toBe('1 of 1628 step(s) failed');
+  });
+
+  it('sees a failure on the LAST page', async () => {
+    // The case the old truncated read could not see at all.
+    const { db, update } = pagedDb(withFailuresAt(1628, [1627]));
+    expect(await finalizeRun(db, run({ status: 'RUNNING' }))).toBe('PARTIALLY_SUCCEEDED');
+    expect(summaryOf(update)).toBe('1 of 1628 step(s) failed');
+  });
+
+  it('sees failures spread across every page', async () => {
+    const { db, update } = pagedDb(withFailuresAt(5000, [10, 1500, 2500, 3500, 4999]));
+    expect(await finalizeRun(db, run({ status: 'RUNNING' }))).toBe('PARTIALLY_SUCCEEDED');
+    expect(summaryOf(update)).toBe('5 of 5000 step(s) failed');
+  });
+
+  it('writes no error summary when nothing failed', async () => {
+    const { db, update } = pagedDb(withFailuresAt(1628, []));
+    expect(await finalizeRun(db, run({ status: 'RUNNING' }))).toBe('SUCCEEDED');
+    expect(summaryOf(update)).toBeNull();
+  });
+
+  it('is FAILED when every step failed, however many pages', async () => {
+    const { db } = pagedDb(Array.from({ length: 1628 }, () => 'failed' as const));
+    expect(await finalizeRun(db, run({ status: 'RUNNING' }))).toBe('FAILED');
+  });
+
+  /** A cancelled run is reported by what it actually produced. */
+  it('reports a cancelled multi-page run by its committed work', async () => {
+    const clean = pagedDb(withFailuresAt(1628, []));
+    expect(await finalizeRun(clean.db, run({ status: 'CANCEL_REQUESTED' }), { canceled: true })).toBe('CANCELED');
+
+    const dirty = pagedDb(withFailuresAt(1628, [1600]));
+    expect(await finalizeRun(dirty.db, run({ status: 'CANCEL_REQUESTED' }), { canceled: true })).toBe('PARTIALLY_SUCCEEDED');
+  });
+
+  /** Finalizing twice must reach the same verdict, not drift. */
+  it('is deterministic when finalized twice', async () => {
+    const statuses = withFailuresAt(1628, [17, 1200, 1627]);
+    const first = pagedDb(statuses);
+    const second = pagedDb(statuses);
+
+    expect(await finalizeRun(first.db, run({ status: 'RUNNING' })))
+      .toBe(await finalizeRun(second.db, run({ status: 'RUNNING' })));
+    expect(summaryOf(first.update)).toBe(summaryOf(second.update));
+  });
+
+  /** The production regression, stated exactly. */
+  it('REGRESSION: 1,628 steps with 17 failures', async () => {
+    const { db, update } = pagedDb(withFailuresAt(1628, Array.from({ length: 17 }, (_, i) => 1100 + i)));
+
+    expect(await finalizeRun(db, run({ status: 'RUNNING' }))).toBe('PARTIALLY_SUCCEEDED');
+    expect(summaryOf(update)).toBe('17 of 1628 step(s) failed');
+    // What production actually stored on 2026-09-15.
+    expect(summaryOf(update)).not.toBe('12 of 1000 step(s) failed');
+  });
+});

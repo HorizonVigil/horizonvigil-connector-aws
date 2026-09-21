@@ -166,6 +166,25 @@ describe('aggregates never count another tenant', () => {
      */
     const res = await callApi(env, { path: '/api/aws-accounts/dashboard', token: tokenA, orgId: FIXTURES.tenantA.orgId });
     expect(res.status).toBe(200);
+
+    /*
+     * This assertion used to fail as a bare `expected 400 to be 200`, which
+     * named neither the section at fault nor the reason -- and it stayed that
+     * way for 30 consecutive runs. The dashboard no longer collapses to 400
+     * when one section fails; it degrades and NAMES the section, so the
+     * failure below now says which read could not be served.
+     *
+     * Deliberately NOT weakened: an unreadable alerts section still fails this
+     * test, because the assertion underneath it is exactly what goes vacuous
+     * when alerts return nothing for every tenant.
+     */
+    const unavailable = (res.json as { unavailableSections?: string[] })?.unavailableSections ?? [];
+    expect(
+      unavailable,
+      `the dashboard could not read: ${unavailable.join(', ')} — the cross-tenant ` +
+      `assertion above is vacuous until every section it inspects is readable`,
+    ).not.toContain('alerts');
+
     expect(res.raw).toContain('A-scope-A-alert');
   });
 });

@@ -2,6 +2,7 @@ import { callQueryApi, listParams } from '../awsApi';
 import { extractSection, extractListItems, field, boolField, numField, tagsFromSet } from '../xmlList';
 import { paginateQueryApi, detectQueryTruncation, incompleteSink, type PaginationTermination } from '../pagination';
 import type { ScannedResource, ScannerContext } from './types';
+import { parsePermissions, SECURITY_GROUP_RULES_EVIDENCE_VERSION } from './securityGroupRules';
 
 const VERSION = '2016-11-15';
 
@@ -330,14 +331,41 @@ export async function scanEc2(ctx: ScannerContext): Promise<ScannedResource[]> {
       const id = field(sg, 'groupId');
       if (!id) continue;
       const tags = tagsFromSet(sg);
+
+      /*
+       * AWS-16. The rules themselves are retained, not just counted. Storing
+       * `inboundRuleCount` alone made open-ingress -- the check customers most
+       * expect -- uncomputable across the whole estate.
+       *
+       * `inboundRules` is written UNCONDITIONALLY, including as an empty array.
+       * Its presence is what tells posture the rules were actually read: a
+       * group with no ingress and a group whose rules were never collected both
+       * yield zero findings, and only one of them is safe. Groups written by
+       * the previous scanner carry no such key and are reported NOT_ASSESSED
+       * until their next collection.
+       */
+      const inbound = parsePermissions(extractSection(sg, 'ipPermissions'), 'ingress');
+      const outbound = parsePermissions(extractSection(sg, 'ipPermissionsEgress'), 'egress');
+
       out.push({
         resourceTypeKey: 'security_group', resourceId: id, region: ctx.region,
         resourceName: field(sg, 'groupName') ?? undefined,
         isDefault: field(sg, 'groupName') === 'default', tags,
         metadata: {
           description: field(sg, 'groupDescription'),
-          inboundRuleCount: extractListItems(extractSection(sg, 'ipPermissions')).length,
-          outboundRuleCount: extractListItems(extractSection(sg, 'ipPermissionsEgress')).length,
+          // Kept: existing consumers read these, and they remain correct.
+          inboundRuleCount: inbound.rules.length,
+          outboundRuleCount: outbound.rules.length,
+          inboundRules: inbound.rules,
+          outboundRules: outbound.rules,
+          /*
+           * A permission entry we could not normalize. Non-zero means this
+           * group's evidence is incomplete, so posture must degrade rather
+           * than report a clean result from a partial read.
+           */
+          unparsedInboundRuleCount: inbound.unparsedCount,
+          unparsedOutboundRuleCount: outbound.unparsedCount,
+          rulesEvidenceVersion: SECURITY_GROUP_RULES_EVIDENCE_VERSION,
         },
         relationships: { vpcId: field(sg, 'vpcId') },
       });
