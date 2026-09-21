@@ -168,22 +168,26 @@ describe('aggregates never count another tenant', () => {
     expect(res.status).toBe(200);
 
     /*
-     * This assertion used to fail as a bare `expected 400 to be 200`, which
-     * named neither the section at fault nor the reason -- and it stayed that
-     * way for 30 consecutive runs. The dashboard no longer collapses to 400
-     * when one section fails; it degrades and NAMES the section, so the
-     * failure below now says which read could not be served.
+     * This used to fail as a bare `expected 400 to be 200` for 30 consecutive
+     * runs, naming neither the section at fault nor the reason. The cause was
+     * not the alerts table, as the comment above supposed -- it was that six
+     * independent reads sat behind one `Promise.all`, so ONE failing read
+     * returned 400 and the dashboard produced nothing for every tenant.
      *
-     * Deliberately NOT weakened: an unreadable alerts section still fails this
-     * test, because the assertion underneath it is exactly what goes vacuous
-     * when alerts return nothing for every tenant.
+     * The dashboard now degrades per section. That fix carries its own risk:
+     * a loud 400 could become a quiet degradation, and the cross-tenant
+     * assertion above would go vacuous for the degraded section instead of
+     * failing outright. So completeness is asserted HERE, for every section,
+     * not just for the one this test reads.
+     *
+     * Deliberately stronger than before, never weaker.
      */
     const unavailable = (res.json as { unavailableSections?: string[] })?.unavailableSections ?? [];
     expect(
       unavailable,
-      `the dashboard could not read: ${unavailable.join(', ')} — the cross-tenant ` +
-      `assertion above is vacuous until every section it inspects is readable`,
-    ).not.toContain('alerts');
+      `the dashboard could not read: ${unavailable.join(', ')} — every cross-tenant ` +
+      `assertion over a section it could not read is vacuous`,
+    ).toEqual([]);
 
     expect(res.raw).toContain('A-scope-A-alert');
   });
