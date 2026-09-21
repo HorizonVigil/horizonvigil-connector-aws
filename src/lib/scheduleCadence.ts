@@ -80,3 +80,46 @@ export function nextDueAt(intervalMs: number, now: number = Date.now()): string 
 export function nextDueAtHours(intervalHours: number, now: number = Date.now()): string {
   return nextDueAt(intervalHours * 60 * 60 * 1000, now);
 }
+
+/**
+ * How many whole intervals elapsed between when a job was due and when it
+ * actually ran.
+ *
+ * Preventing the drift above is necessary but not sufficient. The defect went
+ * unnoticed for days because a skipped period left no trace anywhere: the
+ * connection still read `connected`, health was unchanged, and the only symptom
+ * was `last_sync_at` quietly falling behind. Whatever the cause next time -- a
+ * scheduler outage, a deploy window, a quota denial, a paused job -- the gap
+ * itself has to be visible.
+ *
+ * 0 means it ran in the period it was due for, which is the normal case.
+ *
+ * @param previousDueAt The due timestamp the row carried before this run.
+ * @param now           When the worker actually picked it up.
+ * @param intervalMs    Nominal spacing between runs.
+ */
+export function missedPeriods(previousDueAt: string | null, now: number, intervalMs: number): number {
+  if (!previousDueAt || intervalMs <= 0) return 0;
+
+  const due = Date.parse(previousDueAt);
+  if (!Number.isFinite(due)) return 0;
+
+  const lateBy = now - due;
+  if (lateBy <= 0) return 0;
+
+  /*
+   * ROUND, not floor.
+   *
+   * The stored due time does not sit exactly on the cron slot: `nextDueAt`
+   * places it one tolerance BEFORE, and rows written before that change sit
+   * exactly on it. Flooring gets both wrong at opposite ends -- a punctual run
+   * against a tolerance-shifted due time floors to 0 (right), but a run one
+   * whole period late against an OLD due time is late by `interval` minus a
+   * few seconds and floors to 0 as well (wrong: a day was lost).
+   *
+   * Rounding reads both correctly, because lateness always lands near a
+   * multiple of the interval: ~0.01 periods for a punctual run, ~0.99 or ~1.01
+   * for one genuinely missed.
+   */
+  return Math.round(lateBy / intervalMs);
+}

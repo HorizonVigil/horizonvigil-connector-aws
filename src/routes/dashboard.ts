@@ -55,7 +55,27 @@ dashboardRoutes.get('/dashboard', (c) =>
     });
     const connectionIds = connections.map((conn) => conn.id);
 
-    const [resourceBreakdown, recentRuns, costRows, recommendationRows, activityRows, alertRows] = await Promise.all([
+    /*
+     * allSettled, not all.
+     *
+     * Six independent reads behind one `Promise.all` meant ANY single failure
+     * returned 400 for the entire dashboard -- no resources, no connections,
+     * no costs, nothing. That is the same defect already fixed in
+     * CloudSecurity.tsx and on the account page (AWS-P1-06), left in place
+     * here.
+     *
+     * It is also what makes a tenant-isolation assertion vacuous. The
+     * integration suite's anti-vacuity guard has failed 30 consecutive runs
+     * because this endpoint answers 400 there: its alerts block cannot read
+     * the fixture's `alerts` table, so the dashboard returns nothing for EVERY
+     * tenant, and "the totals exclude Tenant B" passes without ever having
+     * been capable of failing.
+     *
+     * Each section now stands on its own result, and a section that could not
+     * be read is NAMED in `unavailable` rather than rendered as empty --
+     * absence of data must not read as absence of resources.
+     */
+    const settled = await Promise.allSettled([
       /**
        * Phase 4 §24/§32. This was `db.select('cloud_resources', … limit 5000)`
        * followed by `resourceRows.length`, which was wrong twice over.
@@ -105,6 +125,29 @@ dashboardRoutes.get('/dashboard', (c) =>
         limit: 5,
       }),
     ]);
+
+    /*
+     * A rejected section yields its empty shape so the rest of the dashboard
+     * still renders, and its NAME is collected so the response can say which
+     * part of the answer is missing. The reason is deliberately not taken from
+     * the rejection: those carry sanitized DB text, and a section name is what
+     * a caller can act on.
+     */
+    const SECTION_NAMES = ['resources', 'validationRuns', 'cost', 'recommendations', 'activity', 'alerts'] as const;
+    const unavailable: string[] = [];
+    settled.forEach((r, i) => { if (r.status === 'rejected') unavailable.push(SECTION_NAMES[i]); });
+
+    const valueOf = <T>(i: number, fallback: T): T => {
+      const r = settled[i];
+      return r.status === 'fulfilled' ? (r.value as T) : fallback;
+    };
+
+    const resourceBreakdown = valueOf<{ entity_class: string | null; count: number }[]>(0, []);
+    const recentRuns = valueOf<{ connection_id: string; status: string; started_at: string }[]>(1, []);
+    const costRows = valueOf<{ connection_id: string; unblended_cost: string }[]>(2, []);
+    const recommendationRows = valueOf<{ potential_monthly_savings: string }[]>(3, []);
+    const activityRows = valueOf<{ id: string; action: string; target_id: string | null; created_at: string; profiles: { email: string } | null }[]>(4, []);
+    const alertRows = valueOf<{ id: string; alert_name: string; severity: string; connection_id: string | null; triggered_at: string }[]>(5, []);
 
     // Latest validation run per connection (already sorted desc above).
     const latestRunByConnection = new Map<string, { status: string; started_at: string }>();
@@ -178,6 +221,13 @@ dashboardRoutes.get('/dashboard', (c) =>
     }
 
     return okJson({
+      /*
+       * Sections that could not be read, by name. Empty array means every
+       * section answered. A client must not render a zero from a section
+       * listed here: it is missing, not empty.
+       */
+      unavailableSections: unavailable,
+      complete: unavailable.length === 0,
       totalAccounts: connections.length,
       healthyAccounts: healthy,
       failedAccounts: failed,

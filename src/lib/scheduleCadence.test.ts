@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { nextDueAt, nextDueAtHours, SCHEDULER_JITTER_TOLERANCE_MS } from './scheduleCadence';
+import { nextDueAt, nextDueAtHours, missedPeriods, SCHEDULER_JITTER_TOLERANCE_MS } from './scheduleCadence';
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -108,5 +108,78 @@ describe('no scheduled path re-anchors on Date.now()', () => {
       expect(source, `${file} does not use the shared cadence helper`)
         .toContain('nextDueAtHours');
     }
+  });
+});
+
+/**
+ * Detection, not just prevention. The drift went unnoticed for days because a
+ * skipped period left no trace: the connection still read `connected`, health
+ * was unchanged, and only `last_sync_at` quietly fell behind.
+ */
+describe('missedPeriods', () => {
+  const DAILY = DAY;
+  const dueAt = (iso: string) => iso;
+
+  it('is zero for a punctual run', () => {
+    const due = nextDueAt(DAILY, Date.parse('2026-09-20T18:30:25Z'));
+    // Next day's tick, at roughly the same slot.
+    expect(missedPeriods(due, Date.parse('2026-09-21T18:30:22Z'), DAILY)).toBe(0);
+  });
+
+  it('is zero for a run that is merely early within the tolerance', () => {
+    const due = nextDueAt(DAILY, Date.parse('2026-09-20T18:30:00Z'));
+    expect(missedPeriods(due, Date.parse('2026-09-21T18:20:00Z'), DAILY)).toBe(0);
+  });
+
+  it('counts several consecutive lost periods', () => {
+    // Due 09-15 and not run until 09-20: the 09-15..09-19 executions never
+    // happened, and the 09-20 one is the run doing the counting.
+    expect(missedPeriods(dueAt('2026-09-15T18:30:00Z'), Date.parse('2026-09-20T18:30:00Z'), DAILY)).toBe(5);
+  });
+
+  /**
+   * Due times written before the tolerance shift sit exactly on the cron slot,
+   * so a run one whole period late is late by `interval` minus a few seconds.
+   * Flooring would read that as zero and hide the lost day -- which is the
+   * precise state production is in right now.
+   */
+  it('counts a lost period against a pre-existing due time written by the old code', () => {
+    expect(missedPeriods(dueAt('2026-09-21T18:30:25.878Z'), Date.parse('2026-09-22T18:30:20Z'), DAILY)).toBe(1);
+  });
+
+  it('does not report a missed period for a run that has not come due', () => {
+    expect(missedPeriods(dueAt('2026-09-25T18:30:00Z'), Date.parse('2026-09-22T18:30:00Z'), DAILY)).toBe(0);
+  });
+
+  it('treats a never-scheduled connection as nothing missed', () => {
+    // A brand-new connection has no previous period to have missed.
+    expect(missedPeriods(null, Date.parse('2026-09-22T18:30:00Z'), DAILY)).toBe(0);
+  });
+
+  it('does not invent periods from an unparseable timestamp', () => {
+    expect(missedPeriods('not-a-date', Date.parse('2026-09-22T18:30:00Z'), DAILY)).toBe(0);
+  });
+
+  it('is safe for a zero or negative interval', () => {
+    expect(missedPeriods(dueAt('2026-09-01T00:00:00Z'), Date.parse('2026-09-22T00:00:00Z'), 0)).toBe(0);
+    expect(missedPeriods(dueAt('2026-09-01T00:00:00Z'), Date.parse('2026-09-22T00:00:00Z'), -1)).toBe(0);
+  });
+
+  it('scales to a weekly interval', () => {
+    const WEEK = 7 * DAY;
+    expect(missedPeriods(dueAt('2026-09-01T00:00:00Z'), Date.parse('2026-09-22T00:00:00Z'), WEEK)).toBe(3);
+  });
+});
+
+describe('the scan scheduler reports missed periods', () => {
+  it('detects and surfaces them rather than letting a gap pass silently', async () => {
+    const { readFileSync } = await import('node:fs');
+    const source = readFileSync('src/routes/internalScan.ts', 'utf8');
+
+    // It must READ the previous due time; without it, nothing can be detected.
+    expect(source).toMatch(/select:\s*'[^']*next_scheduled_scan_at[^']*'/);
+    expect(source).toContain('missedPeriods');
+    // And report it, not merely compute it.
+    expect(source).toContain('collection.schedule.missed_periods');
   });
 });
