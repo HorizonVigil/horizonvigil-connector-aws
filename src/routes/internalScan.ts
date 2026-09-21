@@ -3,6 +3,7 @@ import type { Env } from '../env';
 import { planSteps } from './collectionRuns';
 import { createOrGetActiveRun } from '../lib/collectionRuns';
 import { loadConnection } from './discovery';
+import { nextDueAtHours } from '../lib/scheduleCadence';
 
 export const internalScanRoutes = new Hono<{ Bindings: Env }>();
 
@@ -143,8 +144,13 @@ internalScanRoutes.post('/internal/run-due-scans', (c) =>
        * Advanced whether or not a run was created. If one was already active
        * the connection is collecting right now, and leaving next_scheduled_
        * scan_at in the past would re-enqueue it on every tick forever.
+       *
+       * nextDueAtHours, not `Date.now() + interval`: the latter inherited this
+       * tick's scheduler jitter and silently skipped a whole day whenever the
+       * next tick fired a few seconds earlier. See lib/scheduleCadence.ts for
+       * the production measurement.
        */
-      const nextScan = new Date(Date.now() + row.scan_interval_hours * 60 * 60 * 1000).toISOString();
+      const nextScan = nextDueAtHours(row.scan_interval_hours);
       await db.update('cloud_connections', { id: `eq.${row.id}` }, { next_scheduled_scan_at: nextScan }, 'return=minimal');
 
       results.push({ connectionId: row.id, runId: run.id, status: run.status, created, plannedSteps: plannedSteps.length });
@@ -238,7 +244,7 @@ internalScanRoutes.post('/internal/run-first-scans', (c) =>
       // Enters the normal daily cadence from here on. 24h matches the
       // scan_interval_hours column default; loadConnection does not select
       // it, and a freshly created row has never had a custom interval set.
-      const nextScan = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      const nextScan = nextDueAtHours(24);
       await db.update('cloud_connections', { id: `eq.${row.id}` }, { next_scheduled_scan_at: nextScan }, 'return=minimal');
 
       results.push({ connectionId: row.id, runId: run.id, status: run.status, created, plannedSteps: plannedSteps.length });

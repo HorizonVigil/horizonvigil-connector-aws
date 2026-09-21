@@ -237,12 +237,52 @@ export async function checkpoint(
  * rows are the evidence. This is the line that makes "succeeded with failed
  * steps" unreachable.
  */
+/**
+ * Every committed step outcome for a run, read in pages.
+ *
+ * `limit: 5000` did NOT return 5,000 rows. PostgREST applies its own
+ * server-side row cap (1,000 here) before an app-level limit is considered, so
+ * a 1,628-step run was finalized from its first 1,000 steps.
+ *
+ * Production evidence, run 2026-09-15: `error_summary` recorded
+ * "12 of 1000 step(s) failed" while the run really had **17** failures across
+ * **1,628** steps. The literal `1000` in a message that should never contain a
+ * round number is the truncation showing through.
+ *
+ * That is not a cosmetic miscount. `finalizeRun` derives the run's TERMINAL
+ * STATUS from these rows, and `terminalStatusFor` returns SUCCEEDED when it
+ * sees no failures. Had those 17 failures sorted beyond row 1,000 -- and the
+ * old read specified no `order`, so which 1,000 came back was not even
+ * deterministic -- the run would have been committed as SUCCEEDED with 17
+ * failed steps underneath it. The docstring below claims that state is
+ * unreachable; the row cap is what made it reachable.
+ *
+ * Ordered by `step_index` so paging is stable while the reconciler and other
+ * workers are writing, and so a row cannot be returned twice or skipped.
+ */
+async function allStepOutcomes(db: Db, runId: string): Promise<{ status: 'succeeded' | 'failed' | 'skipped' | 'info' }[]> {
+  const PAGE_SIZE = 1000;
+  const all: { status: 'succeeded' | 'failed' | 'skipped' | 'info' }[] = [];
+
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const page = await db.select<{ status: 'succeeded' | 'failed' | 'skipped' | 'info' }[]>('collection_run_steps', {
+      select: 'status',
+      filters: { run_id: `eq.${runId}` },
+      order: 'step_index.asc',
+      limit: PAGE_SIZE,
+      offset,
+    });
+
+    all.push(...page);
+
+    // A short page is the last page. An exactly-full one may not be, so it
+    // costs one more request to prove there is nothing after it.
+    if (page.length < PAGE_SIZE) return all;
+  }
+}
+
 export async function finalizeRun(db: Db, run: CollectionRunRow, opts: { canceled?: boolean } = {}, now: number = Date.now()): Promise<JobStatus> {
-  const steps = await db.select<{ status: 'succeeded' | 'failed' | 'skipped' | 'info' }[]>('collection_run_steps', {
-    select: 'status',
-    filters: { run_id: `eq.${run.id}` },
-    limit: 5000,
-  });
+  const steps = await allStepOutcomes(db, run.id);
 
   const status = terminalStatusFor(steps, opts);
   const failed = steps.filter((s) => s.status === 'failed').length;

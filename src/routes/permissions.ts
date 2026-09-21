@@ -5,6 +5,7 @@ import { decryptCredentials } from '../lib/crypto';
 import { assumeConnectionRole } from '../lib/assumeRole';
 import { runFullValidation, type PermissionCheckResult, type IdentitySummary } from '../lib/permissionChecks';
 import type { AwsCreds } from '../lib/awsApi';
+import { nextDueAtHours } from '../lib/scheduleCadence';
 
 export const permissionsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -266,7 +267,9 @@ permissionsRoutes.post('/internal/run-due-permission-checks', (c) =>
     const results = [];
     for (const connection of due) {
       const result = await runConnectionValidation(db, c.env, connection, { orgId: connection.org_id, userId: null });
-      const nextCheck = new Date(Date.now() + PERMISSION_CHECK_INTERVAL_DAYS * 24 * 60 * 60 * 1000).toISOString();
+      // See lib/scheduleCadence.ts. This is the weekly cron, so the jitter
+      // skip it used to suffer cost a full WEEK of permission validation.
+      const nextCheck = nextDueAtHours(PERMISSION_CHECK_INTERVAL_DAYS * 24);
       await db.update('cloud_connections', { id: `eq.${connection.id}` }, { next_permission_check_at: nextCheck }, 'return=minimal');
       results.push({ connectionId: connection.id, status: result.crashed ? 'crashed' : result.status });
     }
