@@ -6,6 +6,12 @@ import type { ScannedResource, ScannerContext } from './types';
 export const S3_RESOURCE_TYPES = ['s3_bucket', 's3_access_point', 's3_multi_region_access_point'] as const;
 
 /**
+ * Per-bucket GetBucketLocation follow-ups fit inside the Cloudflare free-tier
+ * subrequest budget. Exceeding it is reported as truncation, never dropped.
+ */
+const MAX_BUCKETS = 45;
+
+/**
  * S3's ListBuckets is REST-XML, not Query-protocol (no Action param, and
  * the response's root element IS the result — no "...Response" wrapper
  * around it like EC2/RDS/SNS/SQS have) — createAwsClient's raw signed
@@ -16,11 +22,16 @@ export const S3_RESOURCE_TYPES = ['s3_bucket', 's3_access_point', 's3_multi_regi
  * per scan region.
  *
  * ListBuckets doesn't say which region each bucket is in, so a follow-up
- * GetBucketLocation call is needed per bucket — capped at 45 buckets for
+ * GetBucketLocation call is needed per bucket — capped at MAX_BUCKETS for
  * the same Cloudflare free-tier subrequest-budget reason as DynamoDB's
- * DescribeTable follow-ups. A bucket whose location lookup fails (e.g. no
- * s3:GetBucketLocation permission) still gets recorded, just with a
- * best-effort "unknown" region rather than being dropped entirely.
+ * DescribeTable follow-ups. Hitting that cap is REPORTED, not silent: the
+ * scanner reports truncation so the count is known to be a lower bound
+ * rather than mistaken for the whole estate.
+ *
+ * A bucket whose location lookup fails still gets recorded, with a NULL
+ * region — which admission documents as legitimate for exactly this case.
+ * It previously used the string "unknown", which is not a valid AWS region
+ * name, so every such bucket was quarantined and none reached inventory.
  */
 export async function scanS3(ctx: ScannerContext): Promise<ScannedResource[]> {
   // ListBuckets is signed against us-east-1 regardless of ctx.region — same
@@ -33,21 +44,82 @@ export async function scanS3(ctx: ScannerContext): Promise<ScannedResource[]> {
     return [];
   }
 
-  const bucketItems = extractListItems(extractSection(listText, 'Buckets'), 'Bucket').slice(0, 45);
+  const allBuckets = extractListItems(extractSection(listText, 'Buckets'), 'Bucket');
+  const bucketItems = allBuckets.slice(0, MAX_BUCKETS);
+
+  /*
+   * AWS-P3 (M4). The cap was applied silently, so an account with more than
+   * MAX_BUCKETS buckets reported the first MAX_BUCKETS as though that were
+   * the whole estate -- the same shape as every other truncation defect in
+   * this product, and the one that hides because it under-reports.
+   *
+   * PAGINATION_TRUNCATED is the vocabulary's word for "the call succeeded and
+   * did not read everything AWS offered", which degrades the type rather than
+   * failing the scan.
+   */
+  if (allBuckets.length > MAX_BUCKETS) {
+    ctx.creds.onCallFailure?.({
+      service: 's3',
+      action: 'ListBuckets',
+      region: 'us-east-1',
+      normalizedCode: 'PAGINATION_TRUNCATED',
+      attempts: 1,
+    });
+    console.error(`S3 ListBuckets returned ${allBuckets.length} buckets; only the first ${MAX_BUCKETS} were read this run.`);
+  }
 
   const regions = await Promise.all(bucketItems.map(async (b) => {
     const name = field(b, 'Name');
     if (!name) return null;
     try {
       const locRes = await safeFetch(client, `https://${name}.s3.amazonaws.com/?location`, { method: 'GET' });
-      if (!locRes.ok) return 'unknown';
+
+      /*
+       * S3 returns the bucket's home region in `x-amz-bucket-region` on
+       * SUCCESS **and** on failure -- a 301 PermanentRedirect for a bucket
+       * outside the signing region, and a 403 when GetBucketLocation is not
+       * permitted, both carry it. Reading the header first means the region
+       * resolves without the follow-up call succeeding at all, which is what
+       * makes this robust to either cause.
+       */
+      const headerRegion = locRes.headers.get('x-amz-bucket-region');
+      if (headerRegion && headerRegion.trim()) return headerRegion.trim();
+
+      if (!locRes.ok) {
+        /*
+         * Previously `return 'unknown'`, silently. That string is not a valid
+         * AWS region name, so admission quarantined the bucket -- defeating
+         * this scanner's own stated intent that a bucket whose location
+         * lookup fails is "recorded, just with a best-effort region rather
+         * than being dropped entirely".
+         *
+         * Measured in production 2026-09-22: 48 quarantine_records, reason
+         * INVALID_REGION, 100% s3_bucket, accruing on every run since
+         * 2026-09-10. Zero S3 buckets reached inventory while 48 existed, so
+         * the s3_bucket_public posture check reported NOT_APPLICABLE instead
+         * of evaluating 48 buckets.
+         *
+         * NULL is the correct answer and admission already documents it as
+         * legitimate for exactly this case ("ScannedResource documents it as
+         * null for global services (IAM, Route 53, S3 bucket-level)"). The
+         * two components were designed to agree; one word broke it.
+         *
+         * Not defaulted to us-east-1: claiming a region we did not read would
+         * be a false answer, and a wrong region misfiles the bucket in every
+         * regional view.
+         */
+        console.error(`S3 GetBucketLocation failed for a bucket (recording it with no region): HTTP ${locRes.status}`);
+        return null;
+      }
+
       const locText = await locRes.text();
       const match = /<LocationConstraint[^>]*>([^<]*)<\/LocationConstraint>/.exec(locText);
       // An empty (or self-closing) LocationConstraint means us-east-1 — S3's
       // long-standing quirk for buckets in the original/default region.
       return match && match[1] ? match[1] : 'us-east-1';
-    } catch {
-      return 'unknown';
+    } catch (err) {
+      console.error(`S3 GetBucketLocation threw for a bucket (recording it with no region): ${err instanceof Error ? err.message : 'unknown error'}`);
+      return null;
     }
   }));
 
