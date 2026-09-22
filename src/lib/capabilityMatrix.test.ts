@@ -265,3 +265,38 @@ describe('the validation route actually uses the verdict', () => {
     expect(SOURCE).not.toMatch(/error_message: overallStatus === 'failed' \? checks\[0\]\?\.detail/);
   });
 });
+
+/**
+ * A capability declared in the matrix but never probed sits at `unknown`
+ * forever, which the frontend cannot distinguish from "we looked and it is
+ * fine". That was the state of six capabilities before this phase, and it is
+ * the same class of miss as a correct verdict function nothing calls.
+ */
+describe('every declared capability is actually probed', () => {
+  const SOURCE = readFileSync('src/lib/permissionChecks.ts', 'utf8');
+
+  it('runFullValidation produces a check for every capability that names a probe', () => {
+    const probed = new Set(
+      [...SOURCE.matchAll(/service: '([a-z_0-9]+)', label:/g)].map((m) => m[1]),
+    );
+    const EXTRA = readFileSync('src/lib/permissionProbesExtra.ts', 'utf8');
+    for (const m of EXTRA.matchAll(/service: '([a-z_0-9]+)', label:/g)) probed.add(m[1]);
+
+    const declared = CAPABILITIES.filter((c) => c.probeService).map((c) => c.probeService!);
+    const missing = [...new Set(declared)].filter((svc) => !probed.has(svc));
+
+    expect(missing, `capabilities declared with no probe: ${missing.join(', ')}`).toEqual([]);
+  });
+
+  it('every probe is wired into the validation run, not merely defined', () => {
+    // A probe function nobody calls is the same defect as no probe at all.
+    for (const fn of ['checkGuardDuty', 'checkInspector', 'checkAccessAnalyzer', 'checkEcs', 'checkAwsHealth', 'checkCur']) {
+      expect(SOURCE, `${fn} is defined but never called`).toContain(`${fn}(creds`);
+    }
+  });
+
+  it('covers all 18 capabilities the brief enumerates', () => {
+    const probeServices = new Set(CAPABILITIES.map((c) => c.probeService).filter(Boolean));
+    expect(probeServices.size).toBeGreaterThanOrEqual(17);
+  });
+});

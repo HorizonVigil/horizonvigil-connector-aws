@@ -1,4 +1,6 @@
 import { callQueryApi, callJsonApi, createAwsClient, extractXmlField, safeFetch, type AwsCreds } from './awsApi';
+import { checkGuardDuty, checkInspector, checkAccessAnalyzer, checkEcs, checkAwsHealth, checkCur } from './permissionProbesExtra';
+import { redactAwsText } from './redactAws';
 
 export type CheckStatus = 'granted' | 'denied' | 'error' | 'not_applicable';
 
@@ -195,10 +197,21 @@ export async function runFullValidation(creds: AwsCreds, region: string): Promis
   // other check would just fail the same way, so skip straight to reporting
   // that single root cause instead of 6 more denied/error rows saying nothing new.
   if (stsResult.status !== 'granted') {
-    return { identity: null, checks: [stsResult] };
+    // Same redaction: an STS failure message names the principal that failed.
+    return { identity: null, checks: [{ ...stsResult, detail: redactAwsText(stsResult.detail) }] };
   }
 
-  const [iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks, config, securityHub, computeOptimizer, trustedAdvisor] = await Promise.all([
+  /*
+   * AWS-P2. Six capabilities the matrix requires had NO probe, so their state
+   * was `unknown` forever -- indistinguishable, to the frontend, from "we
+   * looked and it is fine". They are probed here alongside the original
+   * twelve. See lib/permissionProbesExtra.ts.
+   */
+  const [
+    iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks, config,
+    securityHub, computeOptimizer, trustedAdvisor,
+    guardDuty, inspector, accessAnalyzer, ecs, health, cur,
+  ] = await Promise.all([
     checkIam(creds),
     checkOrganizations(creds),
     checkCloudWatch(creds, region),
@@ -210,9 +223,33 @@ export async function runFullValidation(creds: AwsCreds, region: string): Promis
     checkSecurityHub(creds, region),
     checkComputeOptimizer(creds, region),
     checkTrustedAdvisor(creds),
+    checkGuardDuty(creds, region),
+    checkInspector(creds, region),
+    checkAccessAnalyzer(creds, region),
+    checkEcs(creds, region),
+    checkAwsHealth(creds),
+    checkCur(creds),
   ]);
 
-  return { identity, checks: [stsResult, iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks, config, securityHub, computeOptimizer, trustedAdvisor] };
+  /*
+   * Every probe ends with `detail: res.errorMessage ?? ...`, passing AWS's own
+   * error text through to a column that is rendered on the account page,
+   * returned by the API, and written to logs. AWS routinely quotes the refused
+   * principal in that text, and for an IAM-user principal it contains the
+   * ACCESS-KEY ID.
+   *
+   * Redacted at this one chokepoint rather than in nineteen separate probes --
+   * a probe added later cannot forget to do it. Found by a test asserting no
+   * probe echoes credential material, which caught Inspector returning
+   * `failed for AKIA_TEST` verbatim. See lib/redactAws.ts.
+   */
+  const checks = [
+    stsResult, iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks, config,
+    securityHub, computeOptimizer, trustedAdvisor,
+    guardDuty, inspector, accessAnalyzer, ecs, health, cur,
+  ].map((check) => ({ ...check, detail: redactAwsText(check.detail) }));
+
+  return { identity, checks };
 }
 
 /**
