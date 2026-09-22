@@ -6,6 +6,7 @@ import { assumeConnectionRole } from '../lib/assumeRole';
 import { runFullValidation, type PermissionCheckResult, type IdentitySummary } from '../lib/permissionChecks';
 import type { AwsCreds } from '../lib/awsApi';
 import { nextDueAtHours } from '../lib/scheduleCadence';
+import { verdictFor } from '../lib/capabilityMatrix';
 
 export const permissionsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -101,8 +102,21 @@ export async function runConnectionValidation(
      * distinction is now carried per capability in
      * connector_capability_status rather than collapsed into one boolean.
      */
-    const stsCheck = checks.find((ck) => ck.service === 'sts');
-    const overallStatus = checks.length > 0 && stsCheck?.status === 'granted' ? 'succeeded' : 'failed';
+    /*
+     * AWS-P2. This was `stsCheck?.status === 'granted'` -- the run's verdict
+     * came from ONE check, so it said `succeeded` however many others errored.
+     * Production, 2026-09-22: both AWS connections reported `succeeded` while
+     * carrying TWO `error` checks each (Security Hub 401, Compute Optimizer
+     * RESOURCE_NOT_FOUND). A customer reading "succeeded" had been told their
+     * account was fine while two sources were dark.
+     *
+     * The verdict now comes from REQUIRED capabilities only, which is what
+     * keeps the opposite failure away too: an account with no Trusted Advisor
+     * support plan or no Config recorder is a normal account, not a broken
+     * connection. See lib/capabilityMatrix.ts.
+     */
+    const verdict = verdictFor(checks);
+    const overallStatus = verdict.status;
 
     await db.update(
       'connection_validation_runs',
@@ -113,7 +127,10 @@ export async function runConnectionValidation(
         identity_arn: identity?.arn ?? null,
         identity_account_id: identity?.accountId ?? null,
         identity_user_id: identity?.userId ?? null,
-        error_message: overallStatus === 'failed' ? checks[0]?.detail : null,
+        // Names the required capabilities that failed. Previously `checks[0]`
+        // -- the FIRST check in the array, which on a failing run was usually
+        // a passing one.
+        error_message: overallStatus === 'failed' ? verdict.summary : null,
       },
       'return=minimal',
     );

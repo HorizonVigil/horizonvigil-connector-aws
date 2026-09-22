@@ -254,9 +254,18 @@ export async function checkSecurityHub(creds: AwsCreds, region: string): Promise
   try {
     const client = createAwsClient(creds, 'securityhub', region);
     const res = await safeFetch(client, `https://securityhub.${region}.amazonaws.com/accounts`, { method: 'GET' });
-    if (res.status === 404 || res.status === 400) {
-      // Security Hub answers "not subscribed" rather than "forbidden" when the
-      // service was never enabled for the account.
+    if (res.status === 404 || res.status === 400 || res.status === 401) {
+      /*
+       * Security Hub answers "not subscribed" rather than "forbidden" when the
+       * service was never enabled for the account -- and unusually for AWS it
+       * uses **401** for that, not 400/404. Production, 2026-09-22: both
+       * connections recorded `error: AWS returned HTTP 401 for Security Hub`,
+       * which read as a fault in a product that was simply switched off.
+       *
+       * 401 is safe to read this way HERE specifically: STS is probed first
+       * and must pass, so credentials are known good by the time this runs.
+       * A genuine credential failure cannot reach this line.
+       */
       return { ...base, status: 'not_applicable', detail: 'Security Hub is not enabled in this region.' };
     }
     if (!res.ok) {
@@ -277,6 +286,20 @@ export async function checkComputeOptimizer(creds: AwsCreds, region: string): Pr
     });
     if (!res.ok) {
       if (res.normalizedCode === 'UNSUPPORTED_CAPABILITY') return { ...base, status: 'not_applicable', detail: 'Compute Optimizer is not available for this account.' };
+      /*
+       * GetEnrollmentStatus answers RESOURCE_NOT_FOUND when the account has
+       * never opted in. That is the same enablement state the `status !==
+       * 'Active'` branch below already handles correctly -- it just arrives by
+       * a different route when no enrollment record exists at all.
+       *
+       * Production, 2026-09-22: both connections recorded
+       * `error: RESOURCE_NOT_FOUND`, sending customers to debug a fault where
+       * the answer was a console opt-in.
+       */
+      const code = res.errorCode ?? res.normalizedCode ?? '';
+      if (/RESOURCE_NOT_FOUND|ResourceNotFound/i.test(code) || /RESOURCE_NOT_FOUND/i.test(res.errorMessage ?? '')) {
+        return { ...base, status: 'not_applicable', detail: 'Compute Optimizer is not enrolled for this account (AWS returned RESOURCE_NOT_FOUND).' };
+      }
       return { ...base, status: res.normalizedCode === 'PERMISSION_DENIED' ? 'denied' : 'error', detail: res.errorMessage ?? res.normalizedCode ?? `HTTP ${res.status}` };
     }
     const status = (res.body as { status?: string })?.status;
