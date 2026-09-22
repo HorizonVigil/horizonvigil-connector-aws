@@ -131,6 +131,22 @@ accountsRoutes.post('/accounts', (c) =>
     const body = (await c.req.json().catch(() => ({}))) as ConnectBody;
     if (!body.connectionName) return errJson(400, 'connectionName is required');
     if (!body.awsAccountId || !/^\d{12}$/.test(body.awsAccountId)) return errJson(400, 'awsAccountId must be a 12-digit AWS account id');
+    /*
+     * AWS-L2. `000000000000` passes the 12-digit test and is not an account.
+     *
+     * Production carries the consequence: 10 ACCOUNT_MISMATCH quarantine
+     * records from 2026-09-10 reading "Resource belongs to AWS account
+     * 604179600483, but this connection is bound to 000000000000." A
+     * connection collected a real estate under the placeholder and every
+     * resource it read was refused admission -- a scan that ran to completion
+     * and produced nothing but quarantine rows.
+     *
+     * Rejected here as well as caught at validation, because the cheapest
+     * place to stop this is before the connection exists.
+     */
+    if (/^0{12}$/.test(body.awsAccountId)) {
+      return errJson(400, '000000000000 is not an AWS account id. Enter the 12-digit id of the account these credentials belong to.');
+    }
     if (body.connectionMethod !== 'access_key' && body.connectionMethod !== 'cross_account_role') {
       return errJson(400, "connectionMethod must be 'access_key' or 'cross_account_role'");
     }
