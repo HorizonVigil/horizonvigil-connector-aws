@@ -1,5 +1,6 @@
 import { callQueryApi, createAwsClient, safeFetch } from '../awsApi';
 import { extractSection, extractListItems, field } from '../xmlList';
+import { isValidRegionFormat } from '../lineage';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -10,6 +11,24 @@ export const S3_RESOURCE_TYPES = ['s3_bucket', 's3_access_point', 's3_multi_regi
  * subrequest budget. Exceeding it is reported as truncation, never dropped.
  */
 const MAX_BUCKETS = 45;
+
+/**
+ * Returns a region only if admission would also accept it.
+ *
+ * This is the whole lesson of the outage in one function. The scanner emitted
+ * the string "unknown" as a region; admission rejected anything that is not a
+ * valid AWS region name; the two contracts contradicted each other and every
+ * S3 bucket was quarantined for twelve days. Validating here with the SAME
+ * predicate admission uses means the scanner cannot emit a region admission
+ * would refuse -- the contradiction is now impossible rather than merely
+ * fixed. Anything unacceptable becomes null, which admission documents as
+ * legitimate for a bucket whose region could not be read.
+ */
+function acceptRegion(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  return isValidRegionFormat(trimmed) ? trimmed : null;
+}
 
 /**
  * S3's ListBuckets is REST-XML, not Query-protocol (no Action param, and
@@ -82,10 +101,31 @@ export async function scanS3(ctx: ScannerContext): Promise<ScannedResource[]> {
        * resolves without the follow-up call succeeding at all, which is what
        * makes this robust to either cause.
        */
-      const headerRegion = locRes.headers.get('x-amz-bucket-region');
-      if (headerRegion && headerRegion.trim()) return headerRegion.trim();
+      const headerRegion = acceptRegion(locRes.headers.get('x-amz-bucket-region'));
+      if (headerRegion) return headerRegion;
 
       if (!locRes.ok) {
+        /*
+         * The third place S3 puts the region, and the one that applies here.
+         *
+         * Measured in production 2026-09-22: this call returns HTTP 400, not
+         * 403 and not 301. A bucket outside us-east-1 addressed through the
+         * legacy global endpoint and signed for us-east-1 gets:
+         *
+         *   <Error><Code>AuthorizationHeaderMalformed</Code>
+         *     <Message>... the region 'us-east-1' is wrong; expecting
+         *     'ap-south-1'</Message><Region>ap-south-1</Region></Error>
+         *
+         * The answer to the question we asked is inside the error telling us
+         * we asked it wrongly. Reading it costs nothing, needs no additional
+         * permission, and resolves the chicken-and-egg that GetBucketLocation
+         * exists to solve: the signing region cannot be known before the
+         * bucket's region is, so AWS returns it in the rejection.
+         */
+        const body = await locRes.text();
+        const fromError = acceptRegion(/<Region>([^<]*)<\/Region>/.exec(body)?.[1]);
+        if (fromError) return fromError;
+
         /*
          * Previously `return 'unknown'`, silently. That string is not a valid
          * AWS region name, so admission quarantined the bucket -- defeating
@@ -95,9 +135,10 @@ export async function scanS3(ctx: ScannerContext): Promise<ScannedResource[]> {
          *
          * Measured in production 2026-09-22: 48 quarantine_records, reason
          * INVALID_REGION, 100% s3_bucket, accruing on every run since
-         * 2026-09-10. Zero S3 buckets reached inventory while 48 existed, so
-         * the s3_bucket_public posture check reported NOT_APPLICABLE instead
-         * of evaluating 48 buckets.
+         * 2026-09-10 -- 4 distinct buckets re-quarantined across 12 runs, not
+         * 48 buckets. Zero S3 buckets reached inventory while 4 existed, so
+         * the s3_bucket_public posture check reported NOT_APPLICABLE rather
+         * than evaluating them.
          *
          * NULL is the correct answer and admission already documents it as
          * legitimate for exactly this case ("ScannedResource documents it as
@@ -115,8 +156,17 @@ export async function scanS3(ctx: ScannerContext): Promise<ScannedResource[]> {
       const locText = await locRes.text();
       const match = /<LocationConstraint[^>]*>([^<]*)<\/LocationConstraint>/.exec(locText);
       // An empty (or self-closing) LocationConstraint means us-east-1 — S3's
-      // long-standing quirk for buckets in the original/default region.
-      return match && match[1] ? match[1] : 'us-east-1';
+      // long-standing quirk for buckets in the original/default region. A
+      // present but unparseable value goes through the same acceptance check
+      // as every other path rather than being trusted because it arrived on a
+      // 200: that trust is what put the string "unknown" in this column.
+      if (!match || !match[1]) return 'us-east-1';
+      // "EU" is S3's documented legacy alias for eu-west-1, still returned for
+      // buckets created before the region got its modern name. It fails the
+      // region-format check, so without this a long-lived European bucket
+      // would silently land with no region at all.
+      if (match[1].trim() === 'EU') return 'eu-west-1';
+      return acceptRegion(match[1]);
     } catch (err) {
       console.error(`S3 GetBucketLocation threw for a bucket (recording it with no region): ${err instanceof Error ? err.message : 'unknown error'}`);
       return null;

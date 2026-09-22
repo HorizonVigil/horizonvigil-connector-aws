@@ -141,6 +141,16 @@ describe('S3 bucket region resolution', () => {
     expect(bucket.region).toBe('eu-central-1');
   });
 
+  it('maps S3s legacy EU constraint to eu-west-1 rather than dropping it', async () => {
+    // "EU" fails the region-format check, so without the explicit mapping a
+    // long-lived European bucket would silently land with no region at all.
+    serve(['my-bucket'], () => ok('<LocationConstraint>EU</LocationConstraint>'));
+
+    const [bucket] = bucketsOf(await scanS3({ creds, region: 'us-east-1' }));
+    expect(bucket.region).toBe('eu-west-1');
+    expect((await classifyRecord(bucket, ADMISSION)).kind).toBe('accepted');
+  });
+
   it('treats an empty LocationConstraint as us-east-1, S3s long-standing quirk', async () => {
     serve(['my-bucket'], () => ok('<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'));
 
@@ -158,6 +168,74 @@ describe('S3 bucket region resolution', () => {
 
     const [bucket] = bucketsOf(await scanS3({ creds, region: 'us-east-1' }));
     expect(bucket.region).toBeNull();
+  });
+
+  /**
+   * The root cause, measured in production 2026-09-22 rather than guessed at:
+   * this call returns HTTP 400, not 403 and not 301. A bucket outside
+   * us-east-1 reached through the legacy global endpoint and signed for
+   * us-east-1 is refused with AuthorizationHeaderMalformed -- and that refusal
+   * names the region we were trying to discover.
+   *
+   * This is the real production response for `elasticbeanstalk-ap-south-1-…`.
+   */
+  it('reads the region out of the 400 that refuses the request', async () => {
+    serve(['elasticbeanstalk-ap-south-1-354307071074'], () =>
+      Promise.resolve(new Response(
+        '<?xml version="1.0" encoding="UTF-8"?><Error><Code>AuthorizationHeaderMalformed</Code>'
+        + "<Message>The authorization header is malformed; the region 'us-east-1' is wrong; expecting 'ap-south-1'</Message>"
+        + '<Region>ap-south-1</Region></Error>',
+        { status: 400 },
+      )));
+
+    const [bucket] = bucketsOf(await scanS3({ creds, region: 'us-east-1' }));
+    expect(bucket.region).toBe('ap-south-1');
+  });
+
+  it('the region from a 400 still has to pass admission', async () => {
+    // A <Region> element containing junk must not become a region, or this is
+    // the same outage with a different source for the bad value.
+    serve(['my-bucket'], () =>
+      Promise.resolve(new Response('<Error><Region>not a region</Region></Error>', { status: 400 })));
+
+    const [bucket] = bucketsOf(await scanS3({ creds, region: 'us-east-1' }));
+    expect(bucket.region).toBeNull();
+    expect((await classifyRecord(bucket, ADMISSION)).kind).toBe('accepted');
+  });
+
+  it('prefers the header over the error body when both are present', async () => {
+    serve(['my-bucket'], () =>
+      Promise.resolve(new Response('<Error><Region>eu-west-3</Region></Error>', {
+        status: 400, headers: { 'x-amz-bucket-region': 'ap-south-1' },
+      })));
+
+    const [bucket] = bucketsOf(await scanS3({ creds, region: 'us-east-1' }));
+    expect(bucket.region).toBe('ap-south-1');
+  });
+
+  /**
+   * The structural guarantee, not just the fixed case. Whatever S3 returns and
+   * from whichever of its three locations, the scanner validates with the same
+   * predicate admission uses, so it cannot emit a region admission refuses.
+   */
+  it('no S3 response shape can produce a region that admission would quarantine', async () => {
+    const hostile = [
+      () => ok('<LocationConstraint>unknown</LocationConstraint>'),
+      () => fail(403, { 'x-amz-bucket-region': 'not a region' }),
+      () => fail(400, { 'x-amz-bucket-region': '  ' }),
+      () => Promise.resolve(new Response('<Error><Region>../../etc</Region></Error>', { status: 400 })),
+      () => ok('<LocationConstraint>   </LocationConstraint>'),
+    ];
+
+    for (const [i, location] of hostile.entries()) {
+      fetchMock.mockReset();
+      serve(['my-bucket'], location);
+
+      const [bucket] = bucketsOf(await scanS3({ creds, region: 'us-east-1' }));
+      const verdict = await classifyRecord(bucket, ADMISSION);
+
+      expect(verdict.kind, `case ${i}: region=${JSON.stringify(bucket.region)}`).toBe('accepted');
+    }
   });
 
   it('records the bucket when the location request fails at the transport level', async () => {
