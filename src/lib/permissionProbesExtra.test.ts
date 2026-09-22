@@ -84,6 +84,27 @@ describe('Inspector', () => {
     expect(stateFromCheck(await checkInspector(creds, REGION))).toBe('available');
   });
 
+  /**
+   * Measured 2026-09-22: BOTH production connections return AccessDenied here
+   * while carrying AdministratorAccess, in accounts belonging to no AWS
+   * Organization — so there is no policy gap and no SCP that could explain it.
+   * Amazon Inspector returns AccessDenied for this call in accounts where the
+   * service was never activated, which is an account state, not a permission.
+   *
+   * The probe cannot tell the two apart from the response. It must therefore
+   * not assert the one that is wrong here, or it sends someone to edit a
+   * policy that already grants everything.
+   */
+  it('does not send the customer to fix a policy that may already be correct', async () => {
+    fetchMock.mockImplementation(() => denied());
+    const r = await checkInspector(creds, REGION);
+
+    expect(r.detail).toMatch(/never been activated|whether Inspector is\s+enabled/i);
+    // The cheaper check is named first: activating Inspector is a console
+    // toggle, editing an IAM policy is not.
+    expect(r.detail.indexOf('activated')).toBeLessThan(r.detail.indexOf('IAM policy'));
+  });
+
   it('separates denial from disablement', async () => {
     fetchMock.mockImplementation(() => denied());
     expect(stateFromCheck(await checkInspector(creds, REGION))).toBe('permission_denied');
@@ -159,6 +180,34 @@ describe('AWS Health', () => {
   it('separates a real denial from an unsupported plan', async () => {
     fetchMock.mockImplementation(() => denied());
     expect(stateFromCheck(await checkAwsHealth(creds))).toBe('permission_denied');
+  });
+
+  /**
+   * The probe sent `maxResults: 1` from the day it was written. AWS Health
+   * requires >= 10, so EVERY call was rejected:
+   *
+   *   "1 validation error detected: Value '1' at 'maxResults' failed to
+   *    satisfy constraint: Member must have value greater than or equal to 10"
+   *
+   * It reported `error` for its entire life and never once tested the
+   * permission it exists to test — "our request was malformed" was
+   * indistinguishable from "AWS Health is unavailable".
+   *
+   * Found 2026-09-22, and only because the account was granted admin: while
+   * seven services were genuinely denied, one more failure looked like more of
+   * the same. Removing the real denials is what made this visible.
+   */
+  it('sends a maxResults AWS will actually accept', async () => {
+    let sentBody: Record<string, unknown> | null = null;
+    fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
+      sentBody = JSON.parse(String(init?.body ?? '{}'));
+      return json({ eventTypes: [] });
+    });
+
+    await checkAwsHealth(creds);
+
+    const maxResults = Number((sentBody as unknown as { maxResults?: number })?.maxResults);
+    expect(maxResults, 'AWS Health rejects anything below 10').toBeGreaterThanOrEqual(10);
   });
 });
 

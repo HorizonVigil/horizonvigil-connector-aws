@@ -59,7 +59,32 @@ export async function checkInspector(creds: AwsCreds, region: string): Promise<P
     });
 
     if (!res.ok) {
-      if (res.normalizedCode === 'PERMISSION_DENIED') return { ...base, status: 'denied', detail: 'inspector2:BatchGetAccountStatus was denied.' };
+      if (res.normalizedCode === 'PERMISSION_DENIED') {
+        /*
+         * This message must not send someone to fix a policy that is already
+         * correct.
+         *
+         * Measured 2026-09-22: both production connections return AccessDenied
+         * here while carrying AdministratorAccess, in accounts belonging to no
+         * AWS Organization -- so there is no policy gap and no SCP to explain
+         * it. Amazon Inspector returns AccessDenied for this call in accounts
+         * where the service has never been activated, which is an account
+         * state, not a permission.
+         *
+         * The probe cannot tell the two apart from the response, so it says
+         * so rather than asserting the one that happens to be wrong here.
+         * Naming the cheaper check first is the point: activating Inspector is
+         * a console toggle, editing an IAM policy is not.
+         */
+        return {
+          ...base,
+          status: 'denied',
+          detail:
+            'inspector2:BatchGetAccountStatus was denied. AWS returns this both when the role lacks the permission '
+            + 'and when Amazon Inspector has never been activated in this account — check whether Inspector is '
+            + 'enabled before changing the IAM policy.',
+        };
+      }
       if (res.normalizedCode === 'UNSUPPORTED_CAPABILITY') return { ...base, status: 'not_applicable', detail: 'Inspector is not available in this region.' };
       return { ...base, status: 'error', detail: res.errorMessage ?? res.normalizedCode ?? `HTTP ${res.status}` };
     }
@@ -132,7 +157,27 @@ export async function checkAwsHealth(creds: AwsCreds): Promise<PermissionCheckRe
   try {
     const res = await callJsonApi(creds, {
       service: 'health', region: 'us-east-1', host: 'health.us-east-1.amazonaws.com',
-      target: 'AWSHealth_20160804.DescribeEventTypes', body: { maxResults: 1 },
+      /*
+       * maxResults MUST be >= 10. This probe sent 1 from the day it was
+       * written, so AWS rejected every call with
+       *
+       *   "1 validation error detected: Value '1' at 'maxResults' failed to
+       *    satisfy constraint: Member must have value greater than or equal
+       *    to 10"
+       *
+       * and the probe reported `error` -- for its entire life. It never once
+       * tested the permission it exists to test, and "our request was
+       * malformed" was indistinguishable from "AWS Health is unavailable".
+       *
+       * Found 2026-09-22, only after the account was granted admin: while
+       * seven services were genuinely denied, one more failure in the list
+       * looked like more of the same. Removing the real denials is what made
+       * this visible.
+       *
+       * 10 is the documented minimum, and this probe wants the smallest legal
+       * page -- it checks access, it does not read events.
+       */
+      target: 'AWSHealth_20160804.DescribeEventTypes', body: { maxResults: 10 },
     });
 
     if (!res.ok) {
