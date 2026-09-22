@@ -1,5 +1,6 @@
 import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, getActiveScope, inFilter, guarded, okJson } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
+import { selectAllPages } from '../lib/pagedSelect';
 import { notCurrentlyExcludedFilter } from '../lib/exclusions';
 
 export const dashboardRoutes = new Hono<{ Bindings: Env }>();
@@ -106,12 +107,20 @@ dashboardRoutes.get('/dashboard', (c) =>
         order: 'started_at.desc',
         limit: 500,
       }),
-      db.select<{ connection_id: string; unblended_cost: string }[]>('cost_snapshots', {
+      /*
+       * Paged: these rows are SUMMED into month-to-date spend per connection.
+       * A `limit: 5000` read is capped at 1,000 by PostgREST, so past that the
+       * figure silently understates the customer's bill -- and a spend number
+       * that plateaus looks like a plateau, not a bug. See lib/pagedSelect.ts.
+       */
+      selectAllPages<{ connection_id: string; unblended_cost: string }>(db, 'cost_snapshots', {
         select: 'connection_id,unblended_cost',
         filters: { connection_id: inFilter(connectionIds), usage_date: `gte.${monthStartIso()}` },
-        limit: 5000,
+        order: 'connection_id.asc',
       }),
-      db.select<{ potential_monthly_savings: string }[]>('cost_recommendations', { select: 'potential_monthly_savings', filters: { connection_id: inFilter(connectionIds), status: 'eq.open', or: notCurrentlyExcludedFilter() }, limit: 5000 }),
+      // Paged for the same reason: these feed both `openRecommendations` and
+      // the advertised `potentialMonthlySavings`.
+      selectAllPages<{ potential_monthly_savings: string }>(db, 'cost_recommendations', { select: 'id,potential_monthly_savings', filters: { connection_id: inFilter(connectionIds), status: 'eq.open', or: notCurrentlyExcludedFilter() }, order: 'id.asc' }),
       db.select<{ id: string; action: string; target_id: string | null; created_at: string; profiles: { email: string } | null }[]>('audit_log', {
         select: 'id,action,target_id,created_at,profiles(email)',
         filters: { org_id: `eq.${orgId}`, action: 'ilike.aws_account.*' },
@@ -144,8 +153,10 @@ dashboardRoutes.get('/dashboard', (c) =>
 
     const resourceBreakdown = valueOf<{ entity_class: string | null; count: number }[]>(0, []);
     const recentRuns = valueOf<{ connection_id: string; status: string; started_at: string }[]>(1, []);
-    const costRows = valueOf<{ connection_id: string; unblended_cost: string }[]>(2, []);
-    const recommendationRows = valueOf<{ potential_monthly_savings: string }[]>(3, []);
+    const costPage = valueOf<{ rows: { connection_id: string; unblended_cost: string }[]; complete: boolean }>(2, { rows: [], complete: false });
+    const recommendationPage = valueOf<{ rows: { potential_monthly_savings: string }[]; complete: boolean }>(3, { rows: [], complete: false });
+    const costRows = costPage.rows;
+    const recommendationRows = recommendationPage.rows;
     const activityRows = valueOf<{ id: string; action: string; target_id: string | null; created_at: string; profiles: { email: string } | null }[]>(4, []);
     const alertRows = valueOf<{ id: string; alert_name: string; severity: string; connection_id: string | null; triggered_at: string }[]>(5, []);
 
@@ -227,7 +238,12 @@ dashboardRoutes.get('/dashboard', (c) =>
        * listed here: it is missing, not empty.
        */
       unavailableSections: unavailable,
-      complete: unavailable.length === 0,
+      /*
+       * Complete means BOTH: every section answered, and every paged read
+       * reached the end of its data. A sum over a truncated page is a wrong
+       * number, not a smaller one, so it must not be published as complete.
+       */
+      complete: unavailable.length === 0 && costPage.complete && recommendationPage.complete,
       totalAccounts: connections.length,
       healthyAccounts: healthy,
       failedAccounts: failed,

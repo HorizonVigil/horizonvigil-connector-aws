@@ -1,4 +1,5 @@
 import { type Db, type JobStatus, terminalStatusFor, assertTransition } from '@horizonvigil/shared-lib';
+import { selectAllPages } from './pagedSelect';
 
 /**
  * Durable collection runs — the server-owned replacement for browser
@@ -261,24 +262,19 @@ export async function checkpoint(
  * workers are writing, and so a row cannot be returned twice or skipped.
  */
 async function allStepOutcomes(db: Db, runId: string): Promise<{ status: 'succeeded' | 'failed' | 'skipped' | 'info' }[]> {
-  const PAGE_SIZE = 1000;
-  const all: { status: 'succeeded' | 'failed' | 'skipped' | 'info' }[] = [];
-
-  for (let offset = 0; ; offset += PAGE_SIZE) {
-    const page = await db.select<{ status: 'succeeded' | 'failed' | 'skipped' | 'info' }[]>('collection_run_steps', {
+  const { rows } = await selectAllPages<{ status: 'succeeded' | 'failed' | 'skipped' | 'info' }>(
+    db,
+    'collection_run_steps',
+    {
       select: 'status',
       filters: { run_id: `eq.${runId}` },
+      // Deterministic ordering, so paging cannot return one row twice and skip
+      // another. Without it PostgREST's row order is unspecified between
+      // requests -- which is also why WHICH 1,000 rows came back was luck.
       order: 'step_index.asc',
-      limit: PAGE_SIZE,
-      offset,
-    });
-
-    all.push(...page);
-
-    // A short page is the last page. An exactly-full one may not be, so it
-    // costs one more request to prove there is nothing after it.
-    if (page.length < PAGE_SIZE) return all;
-  }
+    },
+  );
+  return rows;
 }
 
 export async function finalizeRun(db: Db, run: CollectionRunRow, opts: { canceled?: boolean } = {}, now: number = Date.now()): Promise<JobStatus> {
