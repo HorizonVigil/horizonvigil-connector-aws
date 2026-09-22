@@ -133,6 +133,7 @@ import type { ScannedMetric } from '../lib/scanners/metricTypes';
 import { computeFinalizeResult } from '../lib/discoveryFinalize';
 import { resolveGeneration, type ExistingGeneration, type LifecycleState } from '../lib/generations';
 import { triggerRecommendationGeneration, triggerAlertEvaluation } from '../lib/postScanHooks';
+import { RegionCoverageLedger } from '../lib/regionalAvailability';
 
 export const discoveryRoutes = new Hono<{ Bindings: Env }>();
 
@@ -697,10 +698,23 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
    * builds COVERED_RESOURCE_TYPES, so a failure protects exactly what this
    * scanner would have been trusted to delete and nothing else.
    */
-  const degraded = new Set<string>();
+  /*
+   * AWS-P3. This used to mark every type a scanner owns as degraded on ANY
+   * terminal call failure -- including a service that simply has no endpoint
+   * in the region being scanned. Discovery fans out over 17 regions and most
+   * AWS services are not offered in all of them, so 41 resource types were
+   * degraded on every single run, inventory was never authoritative, and those
+   * types could never be reconciled for deletion.
+   *
+   * The ledger classifies each failure instead: absence of an endpoint is a
+   * coverage FACT (there is nothing there to read), while a denial, a throttle
+   * or a real error is a coverage GAP. Only gaps degrade.
+   * See lib/regionalAvailability.ts.
+   */
+  const coverage = new RegionCoverageLedger();
   const ownedTypes: readonly string[] = SCANNER_RESOURCE_TYPES[scannerName] ?? [];
   const onCallFailure = (f: AwsCallFailure) => {
-    for (const t of ownedTypes) degraded.add(t);
+    coverage.record(f, ownedTypes);
     console.warn(`[degraded] ${f.service}:${f.action} ${f.region} -> ${f.normalizedCode} after ${f.attempts} attempt(s); ${ownedTypes.length} resource type(s) protected from deletion this run`);
   };
 
@@ -745,14 +759,15 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
     }).catch(() => {});
     return { stepId, resourceCount: 0, created: 0, error: message, errorSeverity: classifyError(message) };
   }
-  const degradedResourceTypes = degraded.size > 0 ? [...degraded] : undefined;
+  const degradedMap = coverage.degradedTypes();
+  const degradedResourceTypes = degradedMap.size > 0 ? [...degradedMap.keys()] : undefined;
   // Returned even on the zero-resource path: an empty result caused by a
   // failed call is exactly the case finalize must not read as deletion.
   if (scanned.length === 0) {
     await recordProviderRequests(db, batch, calls).catch(() => {});
     await closeBatch(db, batch.id, {
       observed: 0, accepted: 0, quarantined: 0, rejected: 0,
-      errorCount: degraded.size,
+      errorCount: degradedMap.size,
       errorSummary: callsDropped > 0 ? `${callsDropped} provider request(s) not recorded (per-batch cap)` : null,
     }).catch(() => {});
     return { stepId, resourceCount: 0, created: 0, degradedResourceTypes };
@@ -925,7 +940,7 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
     accepted: admission.counts.accepted,
     quarantined: admission.counts.quarantined,
     rejected: admission.counts.rejected,
-    errorCount: degraded.size + lineageErrors,
+    errorCount: degradedMap.size + lineageErrors,
     // expected_count stays null: AWS list operations do not report how many
     // results exist before paging them, so `expected = observed` would be a
     // reconciliation that always passes and means nothing.
