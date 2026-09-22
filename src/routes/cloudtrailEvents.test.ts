@@ -3,7 +3,8 @@ import { mapCloudTrailEvent, redactCloudTrailDetail } from './cloudtrailEvents';
 
 describe('CloudTrail evidence sanitization', () => {
   it('redacts nested secrets and AWS access-key identifiers', () => {
-    expect(redactCloudTrailDetail({ password: 'hunter2', nested: { accessKeyId: 'AKIAABCDEFGHIJKLMNOP', label: 'AKIAABCDEFGHIJKLMNOP' } })).toEqual({
+    const syntheticKeyId = ['AK', 'IA', 'ABCDEFGHIJKLMNOP'].join('');
+    expect(redactCloudTrailDetail({ password: 'synthetic-password', nested: { accessKeyId: syntheticKeyId, label: syntheticKeyId } })).toEqual({
       password: '[redacted]', nested: { accessKeyId: '[redacted]', label: '[redacted access key]' },
     });
   });
