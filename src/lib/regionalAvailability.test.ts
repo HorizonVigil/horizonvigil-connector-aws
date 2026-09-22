@@ -230,3 +230,53 @@ describe('degraded reasons are persisted, not only logged', () => {
     expect(LIB).toMatch(/\.\.\.\(patch\.degradedReasons \? \{ degraded_reasons: patch\.degradedReasons \} : \{\}\)/);
   });
 });
+
+/**
+ * AWS-P3 (M2). The PARTIAL read is the dangerous case, not the empty one.
+ *
+ * A step that returns rows AND had calls fail reported nothing about the
+ * failures: only the zero-resource path carried the degraded set. So a scanner
+ * covering 17 regions, denied in 5, returning rows from the other 12, committed
+ * a `succeeded` step row -- which makes its types eligible for vanished-resource
+ * deletion in collectionRuns.ts -- while the 5 unread regions' resources looked
+ * absent. finalize reads absence as deletion, so that tombstones live
+ * infrastructure. The empty case was guarded; the one that returns SOME data
+ * was not.
+ */
+describe('a partially-read step reports its degraded types', () => {
+  const DISCOVERY = readFileSync('src/routes/discovery.ts', 'utf8');
+
+  /**
+   * Scoped to runResourceStep, which is where degradedResourceTypes lives.
+   * Finding and metric steps carry their incompleteness differently -- as a
+   * non-'succeeded' status on the committed step row, see findingCoverage.ts
+   * -- so sweeping every `return { stepId` in the file would assert the wrong
+   * mechanism on two of the three step kinds.
+   */
+  const RESOURCE_STEP = DISCOVERY.slice(DISCOVERY.indexOf('export async function runResourceStep'));
+
+  it('every non-error return in runResourceStep carries the degraded set', () => {
+    // The scanner-threw return is exempt and must stay exempt: that step is
+    // committed as `failed`, which already removes its types from
+    // coveredResourceTypes, and degradedMap is not computed until after it.
+    const nonError = RESOURCE_STEP.split('\n')
+      .filter((l) => /return \{ stepId,/.test(l) && !l.includes('errorSeverity'));
+
+    expect(nonError.length).toBeGreaterThanOrEqual(2);
+    for (const line of nonError) {
+      expect(line, line.trim()).toContain('degradedResourceTypes');
+      expect(line, line.trim()).toContain('degradedReasons');
+    }
+  });
+
+  it('the success path specifically — the one that was missing it', () => {
+    expect(DISCOVERY).toContain('return { stepId, resourceCount: rows.length, created: createdEvents.length, degradedResourceTypes, degradedReasons };');
+    expect(DISCOVERY).not.toContain('return { stepId, resourceCount: rows.length, created: createdEvents.length };');
+  });
+
+  it('the worker reads them off the step result rather than only the empty path', () => {
+    const RUNS = readFileSync('src/routes/collectionRuns.ts', 'utf8');
+    expect(RUNS).toContain('degraded: result.degradedResourceTypes ?? []');
+    expect(RUNS).toContain('degradedReasons: result.degradedReasons ?? {}');
+  });
+});

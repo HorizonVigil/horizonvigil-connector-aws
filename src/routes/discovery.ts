@@ -326,6 +326,32 @@ export const FINDING_SCANNERS: Record<string, FindingScannerFn> = {
 };
 
 /**
+ * Which `vulnerability_findings.finding_source` values each finding scanner
+ * can produce — the findings counterpart of SCANNER_RESOURCE_TYPES, and for
+ * the same reason.
+ *
+ * finalize marks an open finding RESOLVED when this run did not see it again.
+ * That is only true if the scanner that produces it actually ran and
+ * succeeded; otherwise "we could not read GuardDuty" is written to the
+ * database as "GuardDuty reports you are clean". Before this map the source
+ * list was a hardcoded literal inside finalize, applied unconditionally, so a
+ * denied, throttled or simply not-yet-executed finding scanner silently
+ * closed every one of its open findings.
+ *
+ * `iam_access_analyzer_unused` is listed here and was NOT in that literal --
+ * the drift a hardcoded list produces. Its findings could never be resolved at
+ * all, which is the opposite error: a fixed problem staying open forever.
+ */
+export const FINDING_SCANNER_SOURCES: Record<string, readonly string[]> = {
+  guardduty: ['guardduty'],
+  securityhub: ['security_hub'],
+  accessanalyzer: ['iam_access_analyzer', 'iam_access_analyzer_unused'],
+  inspector: ['inspector'],
+  awsconfig: ['aws_config'],
+  trustedadvisor: ['trusted_advisor'],
+};
+
+/**
  * Metric steps are a fourth kind, alongside REGIONAL/GLOBAL_SCANNERS and
  * FINDING_SCANNERS — they write to resource_metrics (a time-series table),
  * and unlike every other scanner they need to know which resources this
@@ -548,14 +574,44 @@ export async function runFindingStep(db: Db, orgId: string, userId: string | nul
   const resolved = await resolveCredentials(env, connection);
   if ('error' in resolved) return { stepId, resourceCount: 0, created: 0, error: resolved.error, errorSeverity: 'error' };
 
+  /**
+   * Finding scanners had NO failure sink at all: they were called with bare
+   * credentials, so a denied, throttled or unreachable call returned an empty
+   * list and left no trace anywhere. finalize then resolved every open finding
+   * from that source, because it could not tell "AWS says this is fixed" from
+   * "we never got to ask".
+   *
+   * Recorded on the STEP ROW rather than in memory, because the step and the
+   * finalize that consumes it routinely happen in different worker ticks. The
+   * severity is deliberately 'info', not 'error': nothing fatal happened, the
+   * run should still report SUCCEEDED, and a service the account has not
+   * enabled must not look like a broken connection. What it must do is stop
+   * the step counting as proof of absence -- which is exactly what a
+   * non-'succeeded' status does in collectionRuns.ts.
+   */
+  const callFailures: AwsCallFailure[] = [];
+  const onCallFailure = (f: AwsCallFailure) => { callFailures.push(f); };
+
   let scanned: ScannedFinding[];
   try {
-    scanned = await scanner({ creds: resolved.creds, region });
+    scanned = await scanner({ creds: { ...resolved.creds, onCallFailure }, region });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Scan failed';
     return { stepId, resourceCount: 0, created: 0, error: message, errorSeverity: classifyError(message) };
   }
-  if (scanned.length === 0) return { stepId, resourceCount: 0, created: 0 };
+
+  const coverage = new RegionCoverageLedger();
+  const sources = FINDING_SCANNER_SOURCES[scannerName] ?? [scannerName];
+  for (const f of callFailures) coverage.record(f, sources);
+  const degradedMap = coverage.degradedTypes();
+  // A service AWS does not offer in this region is not a coverage gap -- the
+  // ledger already makes that distinction, and treating it as one would keep
+  // every finding in a single-region account open forever.
+  const incomplete = degradedMap.size > 0
+    ? { error: [...degradedMap.values()][0], errorSeverity: 'info' as const }
+    : {};
+
+  if (scanned.length === 0) return { stepId, resourceCount: 0, created: 0, ...incomplete };
 
   const existing = await db.select<{ finding_source: string; aws_finding_id: string }[]>('vulnerability_findings', {
     select: 'finding_source,aws_finding_id',
@@ -584,7 +640,9 @@ export async function runFindingStep(db: Db, orgId: string, userId: string | nul
 
   await db.insert('vulnerability_findings?on_conflict=connection_id,finding_source,aws_finding_id', rows, 'resolution=merge-duplicates,return=minimal');
 
-  return { stepId, resourceCount: rows.length, created };
+  // Same reasoning as the empty path above, and the more dangerous case: a
+  // step that wrote SOME findings and failed other calls looks complete.
+  return { stepId, resourceCount: rows.length, created, ...incomplete };
 }
 
 /**
@@ -991,7 +1049,19 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
     }
   }
 
-  return { stepId, resourceCount: rows.length, created: createdEvents.length };
+  /*
+   * AWS-P3 (M2). The degraded set travels on the SUCCESS path too, not only on
+   * the zero-resource path above.
+   *
+   * A partial read is the dangerous case, not the empty one. A scanner that
+   * covers 17 regions, is denied in 5 of them and returns rows from the other
+   * 12 lands here -- and, before this, reported nothing at all about the 5.
+   * finalize then reads "this type was covered and these ids did not come
+   * back" as deletion and tombstones live infrastructure, which is the exact
+   * outcome degradedResourceTypes exists to prevent. The empty case was
+   * already guarded; the case that returns SOME data was not.
+   */
+  return { stepId, resourceCount: rows.length, created: createdEvents.length, degradedResourceTypes, degradedReasons };
 }
 
 /**
@@ -1048,7 +1118,14 @@ export interface FinalizeOutcome { totalResources: number; deleted: number; find
  * deleted resources whose region simply hadn't been re-checked yet this
  * cycle, not resources that had actually vanished from AWS.
  */
-export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], env: Env, coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES, totalSteps = 0, degradedResourceTypes: readonly string[] = [], provenScopes: ReadonlySet<string> | null = null): Promise<FinalizeOutcome> {
+export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], env: Env, coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES, totalSteps = 0, degradedResourceTypes: readonly string[] = [], provenScopes: ReadonlySet<string> | null = null,
+  /**
+   * Finding sources this run actually proved -- see the resolve call below.
+   * Defaults to NONE rather than to every source: a caller that does not know
+   * what it covered has not proved anything, and the cost of being wrong here
+   * is closing a real security finding nobody looked at.
+   */
+  coveredFindingSources: readonly string[] = []): Promise<FinalizeOutcome> {
   // `region` is selected for AWS-12: a resource in a region this run did not
   // successfully evaluate must not be tombstoned, however well its resource
   // type fared elsewhere.
@@ -1076,9 +1153,24 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   // AWS itself stopped returning (fixed, archived, or its resource gone)
   // is marked resolved rather than left open forever. Only 'open' rows are
   // touched, so a finding a user already suppressed stays suppressed.
-  const resolvedFindings = await db.update<{ id: string }[]>(
+  /*
+   * AWS-P3. Only sources a finding scanner actually PROVED this run.
+   *
+   * This filter used to be a hardcoded literal listing all six sources,
+   * applied on every finalize regardless of what ran. So a run whose GuardDuty
+   * step was denied, throttled, cancelled by the slice budget, or simply not
+   * in this run's plan still closed every open GuardDuty finding -- writing
+   * "we could not read this" into the database as "the customer is clean",
+   * which is the single worst form of that error the product can make, and it
+   * happens silently and irreversibly to security findings.
+   *
+   * An empty set resolves nothing, which is the safe direction: a finding that
+   * stays open one cycle too long is visible and self-correcting; one closed
+   * because nobody looked is neither.
+   */
+  const resolvedFindings = coveredFindingSources.length === 0 ? [] : await db.update<{ id: string }[]>(
     'vulnerability_findings',
-    { connection_id: `eq.${connection.id}`, status: 'eq.open', finding_source: 'in.(guardduty,security_hub,iam_access_analyzer,inspector,aws_config,trusted_advisor)', last_seen_at: `lt.${runStartedAt}` },
+    { connection_id: `eq.${connection.id}`, status: 'eq.open', finding_source: inFilter([...coveredFindingSources]), last_seen_at: `lt.${runStartedAt}` },
     { status: 'resolved', resolved_at: now },
   );
 

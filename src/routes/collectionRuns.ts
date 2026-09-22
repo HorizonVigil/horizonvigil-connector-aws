@@ -6,7 +6,7 @@ import {
 import type { Env } from '../env';
 import { regionsEstablishingAbsence } from '../lib/generations';
 import { GLOBAL_SCOPE } from '../lib/discoveryFinalize';
-import { loadConnection, regionsFor, runResourceStep, runFindingStep, runMetricStep, runFinalize, REGIONAL_SCANNERS, GLOBAL_SCANNERS, FINDING_SCANNERS, METRIC_STEP_NAME, SCANNER_RESOURCE_TYPES } from './discovery';
+import { loadConnection, regionsFor, runResourceStep, runFindingStep, runMetricStep, runFinalize, REGIONAL_SCANNERS, GLOBAL_SCANNERS, FINDING_SCANNERS, FINDING_SCANNER_SOURCES, METRIC_STEP_NAME, SCANNER_RESOURCE_TYPES } from './discovery';
 import { buildScanHealth, type StepRow } from '../lib/scanHealth';
 import {
   createOrGetActiveRun, claimRun, checkpoint, finalizeRun, toRunResponse, isLeaseExpired,
@@ -16,6 +16,7 @@ import { fetchCurManifest, parseCurBatch } from '../lib/curIngest';
 import { resolveCredentials } from './permissions';
 import { ingestCurFile, advanceCheckpoint, allFilesComplete, finalizeCurRun, type CurCheckpoint } from '../lib/curWorkflow';
 import { reconcileRunLineage } from '../lib/reconcileRunLineage';
+import { provenFindingSources } from '../lib/findingCoverage';
 
 export const collectionRunRoutes = new Hono<{ Bindings: Env }>();
 
@@ -483,6 +484,26 @@ collectionRunRoutes.post('/internal/advance-collection-runs', (c) =>
            */
           const stepSet = new Set(steps);
           const regions = regionsFor(connection);
+          /**
+           * AWS-P3. The same rule, applied to security findings, where it was
+           * missing entirely: finalize resolved open findings from a hardcoded
+           * list of six sources on EVERY run, whether or not the scanner that
+           * produces them had run at all.
+           *
+           * A source is proved only if every planned finding step for it
+           * committed with status 'succeeded' in this run. 'info' is
+           * deliberately excluded as well as 'failed': runFindingStep commits
+           * 'info' when an AWS call inside a step failed, which means that
+           * step read part of the picture and cannot prove the rest is gone.
+           */
+          const coveredFindingSources = provenFindingSources({
+            scanners: Object.keys(FINDING_SCANNERS),
+            regions,
+            plannedSteps: steps,
+            succeededStepIds: new Set(committedSteps.filter((s) => s.status === 'succeeded').map((s) => s.step_id)),
+            sourcesByScanner: FINDING_SCANNER_SOURCES,
+          });
+
           const coveredResourceTypes = [
             ...Object.keys(GLOBAL_SCANNERS)
               .filter((n) => stepSet.has(`global:${n}`) && !failedStepIds.has(`global:${n}`))
@@ -533,7 +554,7 @@ collectionRunRoutes.post('/internal/advance-collection-runs', (c) =>
           await runFinalize(
             db, run.org_id, run.requested_by, connection,
             run.started_at ?? run.queued_at, [], c.env, coveredResourceTypes,
-            steps.length, [...degraded], provenScopes,
+            steps.length, [...degraded], provenScopes, coveredFindingSources,
           );
 
           /**
