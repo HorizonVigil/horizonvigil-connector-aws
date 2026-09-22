@@ -8,7 +8,7 @@ export const cloudtrailEventsRoutes = new Hono<{ Bindings: Env }>();
 
 const LOOKUP_ATTRIBUTE_KEYS = new Set(['Username', 'EventName', 'ResourceName', 'ResourceType', 'EventSource', 'AccessKeyId', 'ReadOnly']);
 
-interface RawCloudTrailEvent {
+export interface RawCloudTrailEvent {
   EventId: string; EventName: string; EventTime: number; EventSource: string; Username?: string;
   Resources?: { ResourceType?: string; ResourceName?: string }[];
   CloudTrailEvent: string;
@@ -41,7 +41,23 @@ function redactKeyIds(value: string | null): string | null {
   return value === null ? null : value.replace(ACCESS_KEY_ID, '[redacted access key]');
 }
 
-function mapEvent(e: RawCloudTrailEvent) {
+const SENSITIVE_FIELD = /(password|passwd|secret|token|credential|authorization|private.?key|session.?key|access.?key)/i;
+
+/** Redacts credential-shaped values before CloudTrail detail reaches a UI or durable store. */
+export function redactCloudTrailDetail(value: unknown, depth = 0): unknown {
+  if (depth > 10) return '[truncated]';
+  if (typeof value === 'string') return redactKeyIds(value);
+  if (Array.isArray(value)) return value.slice(0, 200).map(item => redactCloudTrailDetail(item, depth + 1));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).slice(0, 300).map(([key, item]) => [
+      key,
+      SENSITIVE_FIELD.test(key) ? '[redacted]' : redactCloudTrailDetail(item, depth + 1),
+    ]));
+  }
+  return value;
+}
+
+export function mapCloudTrailEvent(e: RawCloudTrailEvent) {
   let detail: ParsedDetail = {};
   try { detail = JSON.parse(e.CloudTrailEvent) as ParsedDetail; } catch { /* leave detail empty if AWS ever returns a malformed string */ }
 
@@ -87,8 +103,8 @@ function mapEvent(e: RawCloudTrailEvent) {
     errorCode: detail.errorCode ?? null,
     errorMessage: detail.errorMessage ?? null,
     resources: (e.Resources ?? []).map((r) => ({ resourceType: r.ResourceType, resourceName: r.ResourceName })),
-    requestParameters: detail.requestParameters ?? null,
-    responseElements: detail.responseElements ?? null,
+    requestParameters: redactCloudTrailDetail(detail.requestParameters ?? null),
+    responseElements: redactCloudTrailDetail(detail.responseElements ?? null),
   };
 }
 
@@ -187,7 +203,7 @@ cloudtrailEventsRoutes.get('/accounts/:id/cloudtrail-events', (c) =>
     }
 
     const responseBody = result.body as { Events?: RawCloudTrailEvent[]; NextToken?: string };
-    let events = (responseBody.Events ?? []).map(mapEvent);
+    let events = (responseBody.Events ?? []).map(mapCloudTrailEvent);
 
     // The fallback path described above. `readOnly` is null when CloudTrail
     // did not state it; such an event is KEPT, because dropping an event we
