@@ -255,6 +255,32 @@ collectionRunRoutes.get('/accounts/:id/scan-health', (c) =>
       limit: 1,
     });
 
+    /**
+     * AWS-H4. What this run read from AWS and then refused.
+     *
+     * Quarantine was written correctly and exposed on its own authenticated
+     * endpoint, and nothing surfaced a count anywhere -- so 48 rows built up
+     * over 12 days, every one of them an S3 bucket that had been collected and
+     * discarded, while this endpoint answered COMPLETE. Reading it here is
+     * what makes silent inventory loss visible without anyone going looking
+     * for it.
+     *
+     * Scoped to this CONNECTION rather than this run: quarantine rows carry a
+     * connection, and a record refused on the previous run is still missing
+     * from the inventory the customer is looking at now. Bounded by the run's
+     * own start so a long-fixed problem does not haunt the page forever --
+     * with a floor, because a run that started seconds ago would otherwise
+     * report zero and read as clean.
+     */
+    const since = run.started_at ?? run.queued_at;
+    const [quarantineRows, quarantineTotal] = await db.selectWithCount<{ reason_code: string }[]>('quarantine_records', {
+      select: 'reason_code',
+      filters: { connection_id: `eq.${connectionId}`, quarantined_at: `gte.${since}` },
+      limit: 1000,
+    });
+    const byReasonMap = new Map<string, number>();
+    for (const r of quarantineRows) byReasonMap.set(r.reason_code, (byReasonMap.get(r.reason_code) ?? 0) + 1);
+
     const health = buildScanHealth(
       {
         status: run.status,
@@ -265,6 +291,13 @@ collectionRunRoutes.get('/accounts/:id/scan-health', (c) =>
       },
       failedSteps,
       { succeededSteps: succeededCount, failedSteps: failedCount },
+      {
+        // The exact count from Content-Range, not the length of a page that
+        // PostgREST may have capped at 1,000 -- the same trap this endpoint
+        // already documents for step rows.
+        total: quarantineTotal,
+        byReason: [...byReasonMap].map(([reasonCode, count]) => ({ reasonCode, count })),
+      },
     );
 
     return okJson({ ...health, runId: run.id, finishedAt: run.finished_at ?? null });

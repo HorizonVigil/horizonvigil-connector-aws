@@ -69,6 +69,30 @@ export interface ScanHealth {
   failures: ScannerFailure[];
   /** Resource types finalize refused to tombstone because coverage was degraded. */
   degradedResourceTypes: string[];
+  /**
+   * AWS-H4. Records this run READ FROM AWS and then refused admission.
+   *
+   * Quarantine was written correctly and exposed on an authenticated endpoint,
+   * and nothing surfaced a count anywhere. So it accumulated silently: 48 rows
+   * over 12 days, 100% `s3_bucket`, reason INVALID_REGION -- every S3 bucket
+   * in the account, collected and then discarded, while this very endpoint
+   * answered COMPLETE with `countIsAuthoritative: true`.
+   *
+   * A quarantined record is strictly worse than a failed step for the count's
+   * credibility: the resource WAS read, so nothing failed and no coverage was
+   * degraded, and it still did not reach inventory. Silent inventory loss is
+   * invisible by construction unless a number says otherwise.
+   */
+  quarantinedRecords: number;
+  /** The quarantine reasons seen, most frequent first. Reason codes, never payloads. */
+  quarantineReasons: { reasonCode: string; count: number }[];
+}
+
+/** What a run's admission pipeline refused, for buildScanHealth. */
+export interface QuarantineFacts {
+  total: number;
+  /** Reason codes with counts. Codes only -- a payload can carry customer data. */
+  byReason: { reasonCode: string; count: number }[];
 }
 
 /** `regional:ec2:us-east-1` -> { scanner: 'ec2', scope: 'us-east-1' } */
@@ -137,11 +161,14 @@ export function buildScanHealth(
   run: RunFacts | null,
   steps: readonly StepRow[],
   counts?: StepCounts,
+  quarantine?: QuarantineFacts,
 ): ScanHealth {
   const failures = groupFailures(steps);
   const degradedResourceTypes = [...(run?.degradedResourceTypes ?? [])].sort();
   const succeeded = counts ? counts.succeededSteps : steps.filter((s) => s.status === 'succeeded').length;
   const failed = counts ? counts.failedSteps : steps.filter((s) => s.status === 'failed').length;
+  const quarantined = quarantine?.total ?? 0;
+  const quarantineReasons = [...(quarantine?.byReason ?? [])].sort((a, b) => b.count - a.count);
 
   if (!run || run.status === null) {
     return {
@@ -149,6 +176,7 @@ export function buildScanHealth(
       countIsAuthoritative: false,
       summary: 'No collection run has finished for this account yet, so its inventory has not been established.',
       totalSteps: 0, succeededSteps: 0, failedSteps: 0, failures: [], degradedResourceTypes: [],
+      quarantinedRecords: 0, quarantineReasons: [],
     };
   }
 
@@ -158,6 +186,8 @@ export function buildScanHealth(
     failedSteps: failed,
     failures,
     degradedResourceTypes,
+    quarantinedRecords: quarantined,
+    quarantineReasons,
   };
 
   if (['QUEUED', 'RUNNING', 'WAITING_RETRY', 'PAUSED', 'PAUSING', 'CANCEL_REQUESTED'].includes(run.status)) {
@@ -218,6 +248,35 @@ export function buildScanHealth(
       // The load-bearing line. A partial scan's count is a FLOOR.
       countIsAuthoritative: false,
       summary: `Inventory is incomplete — ${where}. The resources shown are real, but this is not the whole estate.`,
+    };
+  }
+
+  /*
+   * AWS-H4. Records read from AWS and then refused admission.
+   *
+   * Checked LAST among the partial cases and BEFORE the complete one, because
+   * a failed step or a degraded type is the more actionable headline when both
+   * are present -- but a quarantined record must never be allowed to fall
+   * through to COMPLETE.
+   *
+   * This is the exact blind spot that hid C3. Every one of the 1,628 steps
+   * succeeded, nothing was degraded, and 4 S3 buckets were read and discarded
+   * on every run for 12 days while this function returned "All 1628 collection
+   * steps succeeded" with `countIsAuthoritative: true`. The estate was not
+   * fully represented, and the one number a customer reads said it was.
+   */
+  if (quarantined > 0) {
+    const top = quarantineReasons[0];
+    const because = top
+      ? ` The most common reason is ${top.reasonCode}${quarantineReasons.length > 1 ? `, with ${quarantineReasons.length - 1} other reason(s)` : ''}.`
+      : '';
+    return {
+      ...base,
+      completeness: 'PARTIAL',
+      countIsAuthoritative: false,
+      summary:
+        `${quarantined} record(s) were collected from AWS but refused admission, so they are missing from inventory `
+        + `even though every collection step succeeded.${because} The count below is a floor, not a total.`,
     };
   }
 

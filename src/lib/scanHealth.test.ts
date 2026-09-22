@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { buildScanHealth, groupFailures, parseStepId, type StepRow } from './scanHealth';
 
 /**
@@ -102,6 +103,91 @@ describe('buildScanHealth', () => {
     const h = buildScanHealth(run({ status: 'SUCCEEDED' }), ec2Failures);
     expect(h.completeness).toBe('PARTIAL');
     expect(h.countIsAuthoritative).toBe(false);
+  });
+
+  /**
+   * AWS-H4, and the exact production blind spot that hid C3 for 12 days.
+   *
+   * 1,628 steps succeeded, nothing was degraded, and 4 S3 buckets were read
+   * from AWS and discarded by admission on every run -- while this function
+   * answered "All 1628 collection steps succeeded" with an authoritative
+   * count. A record that was READ and then refused breaks no step and degrades
+   * no type, so it was invisible by construction.
+   */
+  it('a run that discarded records is NOT complete, however well its steps went', () => {
+    const h = buildScanHealth(
+      run(),
+      [step('global:s3', 'succeeded')],
+      { succeededSteps: 100, failedSteps: 0 },
+      { total: 4, byReason: [{ reasonCode: 'INVALID_REGION', count: 4 }] },
+    );
+
+    expect(h.completeness).toBe('PARTIAL');
+    expect(h.countIsAuthoritative).toBe(false);
+    expect(h.quarantinedRecords).toBe(4);
+    expect(h.summary).toContain('refused admission');
+    expect(h.summary).toContain('INVALID_REGION');
+    expect(h.summary).toContain('floor, not a total');
+  });
+
+  it('names the most common reason and says how many others there are', () => {
+    const h = buildScanHealth(
+      run(), [], { succeededSteps: 100, failedSteps: 0 },
+      {
+        total: 9,
+        byReason: [
+          { reasonCode: 'UNKNOWN_RESOURCE_TYPE', count: 2 },
+          { reasonCode: 'INVALID_REGION', count: 6 },
+          { reasonCode: 'ACCOUNT_MISMATCH', count: 1 },
+        ],
+      },
+    );
+
+    // Sorted by frequency, not by the order the caller happened to build them.
+    expect(h.quarantineReasons[0]).toEqual({ reasonCode: 'INVALID_REGION', count: 6 });
+    expect(h.summary).toContain('INVALID_REGION');
+    expect(h.summary).toContain('2 other reason(s)');
+  });
+
+  it('reports a failed step ahead of quarantine when both happened', () => {
+    // Both make the count non-authoritative; the failure is the more
+    // actionable headline, and the quarantine count is still on the object.
+    const h = buildScanHealth(
+      run({ status: 'PARTIALLY_SUCCEEDED', failedSteps: 4 }),
+      ec2Failures,
+      { succeededSteps: 96, failedSteps: 4 },
+      { total: 3, byReason: [{ reasonCode: 'INVALID_REGION', count: 3 }] },
+    );
+
+    expect(h.summary).toContain('ec2 failed in 4 regions');
+    expect(h.quarantinedRecords).toBe(3);
+    expect(h.countIsAuthoritative).toBe(false);
+  });
+
+  it('a clean run with zero quarantine still reports COMPLETE', () => {
+    // The guard must not make every run permanently partial.
+    const h = buildScanHealth(run(), [], { succeededSteps: 100, failedSteps: 0 }, { total: 0, byReason: [] });
+    expect(h.completeness).toBe('COMPLETE');
+    expect(h.countIsAuthoritative).toBe(true);
+    expect(h.quarantinedRecords).toBe(0);
+  });
+
+  /**
+   * The argument is optional so the older two- and three-argument call shapes
+   * still compile, and absent is treated as zero.
+   *
+   * That is a deliberate soft spot: "nobody measured" and "measured and found
+   * none" produce the same COMPLETE verdict here. It is acceptable only
+   * because there is exactly ONE production caller and it always measures --
+   * which is asserted below, against the route's source, rather than assumed.
+   * If a second caller ever appears without passing these facts, that
+   * assertion is what should be made to fail.
+   */
+  it('absent quarantine facts are treated as zero — see the wiring assertion below', () => {
+    const h = buildScanHealth(run(), []);
+    expect(h.completeness).toBe('COMPLETE');
+    expect(h.quarantinedRecords).toBe(0);
+    expect(h.quarantineReasons).toEqual([]);
   });
 
   it('a failed run reports the inventory as stale, not current', () => {
@@ -244,5 +330,36 @@ describe('degraded coverage downgrades the verdict', () => {
     const h = buildScanHealth(clean, [], { succeededSteps: 100, failedSteps: 0 });
     expect(h.completeness).toBe('COMPLETE');
     expect(h.countIsAuthoritative).toBe(true);
+  });
+});
+
+/**
+ * AWS-H4 wiring. A correct verdict the route never feeds is worth nothing --
+ * the lesson from the capability verdict and the region ledger, both of which
+ * passed their own tests while the route kept the broken behaviour.
+ *
+ * These assertions are what makes the optional fourth argument safe: they
+ * fail the moment the one production caller stops measuring.
+ */
+describe('the scan-health route measures quarantine', () => {
+  const ROUTE = readFileSync('src/routes/collectionRuns.ts', 'utf8');
+
+  it('reads quarantine records for the connection', () => {
+    expect(ROUTE).toContain("selectWithCount<{ reason_code: string }[]>('quarantine_records'");
+  });
+
+  it('passes them into buildScanHealth', () => {
+    expect(ROUTE).toContain('total: quarantineTotal');
+    expect(ROUTE).toContain('byReason:');
+  });
+
+  it('uses the exact count, not the length of a possibly-capped page', () => {
+    // The same PostgREST trap this endpoint already documents for step rows:
+    // a page capped at 1,000 read as a total is how an under-count hides.
+    expect(ROUTE).not.toMatch(/total:\s*quarantineRows\.length/);
+  });
+
+  it('bounds the window by the run rather than reporting all history', () => {
+    expect(ROUTE).toMatch(/quarantined_at: `gte\.\$\{since\}`/);
   });
 });
