@@ -2,6 +2,7 @@ import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, gu
 import type { Env } from '../env';
 import { callJsonApi } from '../lib/awsApi';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
+import { classifyProvenance, describeProvenance } from '../lib/changeProvenance';
 
 export const cloudtrailEventsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -43,6 +44,28 @@ function redactKeyIds(value: string | null): string | null {
 function mapEvent(e: RawCloudTrailEvent) {
   let detail: ParsedDetail = {};
   try { detail = JSON.parse(e.CloudTrailEvent) as ParsedDetail; } catch { /* leave detail empty if AWS ever returns a malformed string */ }
+
+  /*
+   * AWS-22.1. `invokedBy` was parsed and then dropped, which cost the feed its
+   * single strongest attribution signal: when an AWS service itself made the
+   * call -- Auto Scaling replacing an instance, CloudFormation rolling a stack
+   * -- it is named there and nowhere else. Without it, a change nobody made is
+   * indistinguishable from a change nobody can be found for.
+   */
+  const invokedBy = detail.userIdentity?.invokedBy ?? null;
+
+  /*
+   * Raw fields are kept AND classified. The classification is what a reviewer
+   * reads; the raw fields are what they check it against, which is the whole
+   * reason it is safe to offer a verdict at all.
+   */
+  const provenance = classifyProvenance({
+    userIdentityType: detail.userIdentity?.type ?? null,
+    invokedBy,
+    userAgent: detail.userAgent ?? null,
+    eventSource: e.EventSource,
+  });
+
   return {
     eventId: e.EventId,
     eventName: e.EventName,
@@ -51,6 +74,12 @@ function mapEvent(e: RawCloudTrailEvent) {
     username: redactKeyIds(e.Username ?? detail.userIdentity?.userName ?? null),
     userIdentityType: detail.userIdentity?.type ?? null,
     userIdentityArn: redactKeyIds(detail.userIdentity?.arn ?? detail.userIdentity?.sessionContext?.sessionIssuer?.arn ?? null),
+    invokedBy,
+    /** Who made the change, classified. See lib/changeProvenance.ts. */
+    provenance: {
+      ...provenance,
+      summary: describeProvenance(provenance),
+    },
     sourceIpAddress: detail.sourceIPAddress ?? null,
     userAgent: detail.userAgent ?? null,
     awsRegion: detail.awsRegion ?? null,
