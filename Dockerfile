@@ -45,7 +45,13 @@ RUN --mount=type=secret,id=gh_pat \
     fi; \
     npm ci --omit=dev; status=$?; rm -f ~/.netrc; exit $status
 COPY --from=build /app/dist ./dist
+# npm and git are installation tooling, not runtime dependencies. Removing
+# them shrinks the production attack surface and prevents vulnerabilities in
+# npm's bundled package manager libraries from shipping with the service.
+RUN apt-get purge -y --auto-remove git \
+    && rm -rf /var/lib/apt/lists/* /usr/local/lib/node_modules/npm \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx
 RUN useradd -r -u 10001 -g node appuser && chown -R appuser:node /app
 USER appuser
 EXPOSE 8080
-CMD ["npm", "run", "start"]
+CMD ["node", "dist/server.js"]
