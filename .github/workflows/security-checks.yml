@@ -1,6 +1,7 @@
 name: Security Checks
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, test]
   pull_request:
@@ -56,7 +57,7 @@ jobs:
           docker run --rm
           -v "$PWD:/repo"
           zricethezav/gitleaks:v8.30.0
-          detect --source=/repo --redact --no-banner
+          detect --source=/repo --config=/repo/.gitleaks.toml --redact --no-banner --verbose
 
       # Container scan only applies to services with a Dockerfile.
       - name: Check for a Dockerfile
