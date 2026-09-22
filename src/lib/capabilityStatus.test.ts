@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vitest';
-import { capabilityState, stateForCheck, buildCapabilityStatuses, CAPABILITY_PROBES } from './capabilityStatus';
+import { describe, it, expect, vi } from 'vitest';
+import { capabilityState, stateForCheck, buildCapabilityStatuses, writeCapabilityStatuses, CAPABILITY_PROBES, type CapabilityStatusRow } from './capabilityStatus';
 import type { PermissionCheckResult } from './permissionChecks';
+import type { Db } from '@horizonvigil/shared-lib';
 
 /**
  * §6.2: health must be capability-specific, and "unknown, not configured and
@@ -189,5 +190,88 @@ describe('last_success_at durability', () => {
 
     expect(source).toContain('previousSuccessAt');
     expect(source).toMatch(/select: 'capability,last_success_at'/);
+  });
+});
+
+/**
+ * The conflict target, and the class of bug it represents.
+ *
+ * `writeCapabilityStatuses` upserted with `resolution=merge-duplicates` and no
+ * `on_conflict`. PostgREST resolves against the PRIMARY KEY unless told
+ * otherwise; this table's primary key is a surrogate `id`, while the
+ * uniqueness that matters lives in a separate index on
+ * `(connection_id, capability)`. So every row got a fresh id, found no
+ * primary-key conflict, and was attempted as an INSERT that violated the
+ * unique index.
+ *
+ * The catch turned that into one console line, so the table froze on
+ * 2026-09-09 / 2026-09-15 and every capability state a customer saw was days
+ * stale. Measured 2026-09-22: a validation finished at 18:50:47 and the logs
+ * show `[capability-status] write failed` at 18:50:47.666 for both
+ * connections.
+ */
+describe('writeCapabilityStatuses targets the right conflict', () => {
+  const row = (capability: string): CapabilityStatusRow => ({
+    org_id: 'org-1',
+    connection_id: 'conn-1',
+    capability,
+    state: 'available',
+    reason_code: null,
+    source: 'permission_validation',
+    expected_scope: 1,
+    covered_scope: 1,
+    last_attempt_at: '2026-09-22T18:50:47.000Z',
+    last_success_at: '2026-09-22T18:50:47.000Z',
+    permission_snapshot_id: null,
+    updated_at: '2026-09-22T18:50:47.000Z',
+  });
+
+  function recordingDb() {
+    const calls: { table: string; prefer?: string }[] = [];
+    const db = {
+      insert: async (table: string, _rows: unknown, prefer?: string) => {
+        calls.push({ table, prefer });
+        return [];
+      },
+    } as unknown as Db;
+    return { db, calls };
+  }
+
+  it('names (connection_id, capability) as the conflict target', async () => {
+    const { db, calls } = recordingDb();
+
+    await writeCapabilityStatuses(db, [row('inventory')]);
+
+    expect(calls[0].table).toContain('on_conflict=connection_id,capability');
+  });
+
+  it('still asks PostgREST to merge rather than insert', async () => {
+    const { db, calls } = recordingDb();
+
+    await writeCapabilityStatuses(db, [row('inventory')]);
+
+    expect(calls[0].prefer).toContain('merge-duplicates');
+  });
+
+  it('writes nothing at all for an empty set', async () => {
+    const { db, calls } = recordingDb();
+    await writeCapabilityStatuses(db, []);
+    expect(calls).toEqual([]);
+  });
+
+  /**
+   * Still non-fatal: a telemetry row must never take down the validation that
+   * produced it. But the line must say how much was lost, so a silent freeze
+   * is at least countable.
+   */
+  it('a failed write does not fail the validation, and says how much was lost', async () => {
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((...args) => { errors.push(args.join(' ')); });
+    const db = { insert: async () => { throw new Error('duplicate key value'); } } as unknown as Db;
+
+    await expect(writeCapabilityStatuses(db, [row('inventory'), row('metrics')])).resolves.toBeUndefined();
+    expect(errors.join(' ')).toMatch(/2 row\(s\)/);
+
+    spy.mockRestore();
   });
 });

@@ -160,12 +160,45 @@ export function buildCapabilityStatuses(
   });
 }
 
-/** Upserts capability status after a validation run. Best-effort: a telemetry write must never fail the validation itself. */
+/**
+ * Upserts capability status after a validation run. Best-effort: a telemetry
+ * write must never fail the validation itself.
+ *
+ * THE CONFLICT TARGET IS LOAD-BEARING.
+ *
+ * This call had none, and every write it ever made failed. The table's PRIMARY
+ * KEY is a surrogate `id`; the uniqueness that matters is a separate index on
+ * `(connection_id, capability)`. PostgREST's `resolution=merge-duplicates`
+ * resolves against the PRIMARY KEY unless told otherwise, so each row got a
+ * fresh id, found no primary-key conflict to merge, and was attempted as an
+ * INSERT -- which then violated the unique index.
+ *
+ * The catch below turned that into one console line and a `void` return, so:
+ *
+ *   - `connector_capability_status` froze on 2026-09-09 and 2026-09-15
+ *   - every capability state a customer saw was days stale
+ *   - a validation that ran minutes ago left the table untouched and said
+ *     nothing
+ *
+ * Measured 2026-09-22: a validation completed at 18:50:47 and the logs show
+ * `[capability-status] write failed` at 18:50:47.666 for both connections.
+ * It was found only because the account was granted admin and the capability
+ * rows still did not move.
+ *
+ * Every other upsert in this codebase names its conflict target. This was the
+ * only one that did not.
+ */
 export async function writeCapabilityStatuses(db: Db, rows: CapabilityStatusRow[]): Promise<void> {
   if (rows.length === 0) return;
   try {
-    await db.insert('connector_capability_status', rows, 'resolution=merge-duplicates,return=minimal');
+    await db.insert('connector_capability_status?on_conflict=connection_id,capability', rows, 'resolution=merge-duplicates,return=minimal');
   } catch (err) {
-    console.error('[capability-status] write failed (validation itself is unaffected):', err instanceof Error ? err.message : err);
+    // Still non-fatal -- a capability row must not take down the validation
+    // that produced it -- but the line now says how much was lost, so a
+    // silent freeze is at least countable in the logs.
+    console.error(
+      `[capability-status] write failed for ${rows.length} row(s) (validation itself is unaffected):`,
+      err instanceof Error ? err.message : err,
+    );
   }
 }
