@@ -251,7 +251,21 @@ describe('the validation route actually uses the verdict', () => {
 
   it('derives the run status from the capability verdict', () => {
     expect(SOURCE).toContain('verdictFor(checks)');
-    expect(SOURCE).toMatch(/const overallStatus = verdict\.status/);
+    // The verdict is what decides the status. AWS-L2 later added one override
+    // ON TOP of it -- an account mismatch fails the run however well the
+    // permissions went -- so this pins "verdict.status decides it" rather than
+    // the exact expression it used to be, and the override is asserted below.
+    expect(SOURCE).toMatch(/const overallStatus = .*verdict\.status/);
+  });
+
+  /**
+   * AWS-L2, asserted here because this is the suite that owns how the run's
+   * status is decided. Every permission can be granted and the connection
+   * still collect nothing: if the credentials belong to a different account
+   * than the connection names, admission refuses every resource they read.
+   */
+  it('an account mismatch fails the run even when the verdict succeeded', () => {
+    expect(SOURCE).toContain("const overallStatus = accountMismatch ? 'failed' : verdict.status;");
   });
 
   it('no longer decides the whole run from the STS check alone', () => {
