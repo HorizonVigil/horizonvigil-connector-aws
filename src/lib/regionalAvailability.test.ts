@@ -192,3 +192,41 @@ describe('discovery uses the ledger', () => {
     expect(SOURCE).toContain('coverage.degradedTypes()');
   });
 });
+
+/**
+ * The reason must reach the database, not just the log.
+ *
+ * Production runs stored 41 bare type names with no reason recorded anywhere,
+ * so nothing could distinguish a service AWS does not offer in a region from
+ * an IAM denial — and those demand opposite responses from a customer.
+ */
+describe('degraded reasons are persisted, not only logged', () => {
+  const DISCOVERY = readFileSync('src/routes/discovery.ts', 'utf8');
+  const ROUTE = readFileSync('src/routes/collectionRuns.ts', 'utf8');
+  const LIB = readFileSync('src/lib/collectionRuns.ts', 'utf8');
+
+  it('discovery returns the reason alongside the type', () => {
+    expect(DISCOVERY).toContain('degradedReasons');
+    expect(DISCOVERY).toMatch(/Object\.fromEntries\(degradedMap\)/);
+  });
+
+  it('the worker accumulates reasons across slices', () => {
+    // A run spans many ticks; a reason recorded in slice 1 must survive to
+    // finalize in slice 14.
+    expect(ROUTE).toMatch(/const degradedReasons: Record<string, string> = \{ \.\.\.\(run\.degraded_reasons \?\? \{\}\) \}/);
+  });
+
+  it('keeps the first reason when a type degrades twice', () => {
+    expect(ROUTE).toMatch(/if \(!degradedReasons\[t\]\) degradedReasons\[t\] = why/);
+  });
+
+  it('checkpoint writes them to the run row', () => {
+    expect(LIB).toContain('degraded_reasons: patch.degradedReasons');
+  });
+
+  it('omits the column rather than writing null when there is nothing to say', () => {
+    // The column is NOT NULL with a '{}' default; writing undefined would
+    // violate it, and writing null would lose the default.
+    expect(LIB).toMatch(/\.\.\.\(patch\.degradedReasons \? \{ degraded_reasons: patch\.degradedReasons \} : \{\}\)/);
+  });
+});

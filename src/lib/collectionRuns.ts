@@ -39,6 +39,8 @@ export interface CollectionRunRow {
   attempt: number;
   next_attempt_at: string | null;
   degraded_resource_types: string[];
+  /** Why each degraded type degraded, keyed by resource type. */
+  degraded_reasons?: Record<string, string>;
   error_summary: string | null;
   correlation_id: string;
   queued_at: string;
@@ -210,7 +212,7 @@ export async function claimRun(db: Db, run: CollectionRunRow, leaseOwner: string
 export async function checkpoint(
   db: Db,
   runId: string,
-  patch: { stepCursor: number; completedSteps: number; failedSteps: number; degradedResourceTypes: string[] },
+  patch: { stepCursor: number; completedSteps: number; failedSteps: number; degradedResourceTypes: string[]; degradedReasons?: Record<string, string> },
   now: number = Date.now(),
 ): Promise<void> {
   await db.update(
@@ -221,6 +223,7 @@ export async function checkpoint(
       completed_steps: patch.completedSteps,
       failed_steps: patch.failedSteps,
       degraded_resource_types: patch.degradedResourceTypes,
+      ...(patch.degradedReasons ? { degraded_reasons: patch.degradedReasons } : {}),
       heartbeat_at: new Date(now).toISOString(),
       lease_owner: null,
       lease_expires_at: null,

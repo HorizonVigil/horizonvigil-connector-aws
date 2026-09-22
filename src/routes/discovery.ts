@@ -504,6 +504,8 @@ export interface StepResult {
    * otherwise a throttled Describe* reads as "everything was deleted".
    */
   degradedResourceTypes?: string[];
+  /** Why each degraded type degraded, keyed by resource type. */
+  degradedReasons?: Record<string, string>;
 }
 
 const EXPECTED_ACCOUNT_STATE_PATTERNS = [/needs a subscription for the service/i, /is not subscribed to/i, /opt.?in/i, /not.{0,20}(enabled|activated)/i];
@@ -761,6 +763,10 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
   }
   const degradedMap = coverage.degradedTypes();
   const degradedResourceTypes = degradedMap.size > 0 ? [...degradedMap.keys()] : undefined;
+  // The REASON travels with the type. Production runs stored 41 bare type
+  // names with no reason anywhere, so nothing could tell an absent service
+  // from an IAM denial -- and those need opposite responses.
+  const degradedReasons = degradedMap.size > 0 ? Object.fromEntries(degradedMap) : undefined;
   // Returned even on the zero-resource path: an empty result caused by a
   // failed call is exactly the case finalize must not read as deletion.
   if (scanned.length === 0) {
@@ -770,7 +776,7 @@ export async function runResourceStep(db: Db, orgId: string, userId: string | nu
       errorCount: degradedMap.size,
       errorSummary: callsDropped > 0 ? `${callsDropped} provider request(s) not recorded (per-batch cap)` : null,
     }).catch(() => {});
-    return { stepId, resourceCount: 0, created: 0, degradedResourceTypes };
+    return { stepId, resourceCount: 0, created: 0, degradedResourceTypes, degradedReasons };
   }
 
   const typeKeys = [...new Set(scanned.map((r) => r.resourceTypeKey))];

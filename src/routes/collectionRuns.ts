@@ -334,7 +334,7 @@ collectionRunRoutes.post('/collection-runs/:id/cancel', (c) =>
 );
 
 /** Runs one step and records its outcome as committed evidence. */
-async function executeStep(db: Db, env: Env, run: CollectionRunRow, stepId: string, index: number): Promise<{ failed: boolean; degraded: string[] }> {
+async function executeStep(db: Db, env: Env, run: CollectionRunRow, stepId: string, index: number): Promise<{ failed: boolean; degraded: string[]; degradedReasons: Record<string, string> }> {
   const startedAt = new Date().toISOString();
   // null userId: the worker runs under the service role with no requesting
   // user; the run was authorized when it was created.
@@ -363,7 +363,7 @@ async function executeStep(db: Db, env: Env, run: CollectionRunRow, stepId: stri
     // duplicate-key case keeps the run advancing.
   });
 
-  return { failed: status === 'failed', degraded: result.degradedResourceTypes ?? [] };
+  return { failed: status === 'failed', degraded: result.degradedResourceTypes ?? [], degradedReasons: result.degradedReasons ?? {} };
 }
 
 /**
@@ -432,17 +432,23 @@ collectionRunRoutes.post('/internal/advance-collection-runs', (c) =>
       const start = run.step_cursor;
       const end = Math.min(start + STEPS_PER_SLICE, steps.length);
       const degraded = new Set(run.degraded_resource_types ?? []);
+      const degradedReasons: Record<string, string> = { ...(run.degraded_reasons ?? {}) };
       let completed = run.completed_steps;
       let failed = run.failed_steps;
 
       for (let i = start; i < end; i++) {
         const outcome = await executeStep(db, c.env, run, steps[i], i);
         for (const t of outcome.degraded) degraded.add(t);
+        // First reason wins: a type degraded twice is degraded for the first
+        // cause a reader would act on.
+        for (const [t, why] of Object.entries(outcome.degradedReasons)) {
+          if (!degradedReasons[t]) degradedReasons[t] = why;
+        }
         completed += 1;
         if (outcome.failed) failed += 1;
       }
 
-      await checkpoint(db, run.id, { stepCursor: end, completedSteps: completed, failedSteps: failed, degradedResourceTypes: [...degraded] });
+      await checkpoint(db, run.id, { stepCursor: end, completedSteps: completed, failedSteps: failed, degradedResourceTypes: [...degraded], degradedReasons });
 
       if (end >= steps.length) {
         // Every planned step is done: close the run from its committed step
