@@ -169,6 +169,25 @@ export async function runConnectionValidation(
      */
     if (actor?.orgId) {
       const statusDb = env.SUPABASE_SERVICE_ROLE_KEY ? createDb(env, env.SUPABASE_SERVICE_ROLE_KEY) : db;
+
+      /*
+       * Read the existing last_success_at before writing. The write is an
+       * UPSERT, and it used to overwrite that column with null on every run
+       * where a capability was not currently available -- so "when did this
+       * last work?" was destroyed the moment it stopped working. Carrying it
+       * forward is what makes the timestamp durable, which is what staleness
+       * evaluation and recovery detection both read.
+       */
+      const existing = await statusDb
+        .select<{ capability: string; last_success_at: string | null }[]>('connector_capability_status', {
+          select: 'capability,last_success_at',
+          filters: { connection_id: `eq.${connection.id}`, org_id: `eq.${actor.orgId}` },
+          limit: 100,
+        })
+        .catch(() => [] as { capability: string; last_success_at: string | null }[]);
+
+      const previousSuccessAt = Object.fromEntries(existing.map((r) => [r.capability, r.last_success_at]));
+
       await writeCapabilityStatuses(
         statusDb,
         buildCapabilityStatuses({
@@ -177,6 +196,7 @@ export async function runConnectionValidation(
           checks,
           snapshotId: run.id,
           connectionStatus: overallStatus === 'succeeded' ? 'connected' : 'error',
+          previousSuccessAt,
         }),
       );
     }
@@ -187,7 +207,9 @@ export async function runConnectionValidation(
       connectionPatch.error_message = null;
     } else {
       connectionPatch.status = 'error';
-      connectionPatch.error_message = checks[0]?.detail ?? 'Validation failed';
+      // Same correction as the run row: name the required capabilities that
+      // failed, not whichever check happens to sit first in the array.
+      connectionPatch.error_message = verdict.summary;
     }
     await db.update('cloud_connections', { id: `eq.${connection.id}` }, connectionPatch, 'return=minimal');
 

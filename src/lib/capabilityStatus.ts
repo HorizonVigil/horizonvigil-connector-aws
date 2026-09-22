@@ -99,7 +99,25 @@ export interface CapabilityStatusRow {
 
 /** Builds one row per capability from a completed permission-validation snapshot. */
 export function buildCapabilityStatuses(
-  input: { orgId: string; connectionId: string; checks: PermissionCheckResult[]; snapshotId: string | null; connectionStatus: string },
+  input: {
+    orgId: string; connectionId: string; checks: PermissionCheckResult[];
+    snapshotId: string | null; connectionStatus: string;
+    /**
+     * `last_success_at` as it stands in the database, by capability.
+     *
+     * Required because this is written as an UPSERT: the previous value was
+     * being overwritten with null on every run where a capability was not
+     * currently available, so "when did this last work?" was destroyed the
+     * moment it stopped working. Measured in production 2026-09-22: 9 AWS
+     * capability rows carry a null last_success_at, including
+     * `billing_cost_explorer` on a connection where Cost Explorer demonstrably
+     * used to answer -- so nothing can now say whether it ever did.
+     *
+     * A last-success that is erased on first failure is not durable, and it is
+     * the exact field staleness evaluation and recovery detection read.
+     */
+    previousSuccessAt?: Record<string, string | null>;
+  },
   now: number = Date.now(),
 ): CapabilityStatusRow[] {
   const at = new Date(now).toISOString();
@@ -121,7 +139,13 @@ export function buildCapabilityStatuses(
       expected_scope: resolved.expected,
       covered_scope: resolved.covered,
       last_attempt_at: at,
-      last_success_at: resolved.state === 'available' ? at : null,
+      /*
+       * Advanced on success; otherwise the previous value is CARRIED FORWARD,
+       * never nulled. "Available now" and "last worked on the 15th" are
+       * different facts and the product needs both -- the second is what tells
+       * a customer whether a capability is newly broken or never configured.
+       */
+      last_success_at: resolved.state === 'available' ? at : (input.previousSuccessAt?.[capability] ?? null),
       permission_snapshot_id: input.snapshotId,
       updated_at: at,
     };

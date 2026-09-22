@@ -109,3 +109,85 @@ describe('buildCapabilityStatuses', () => {
     expect(rows.every((r) => r.permission_snapshot_id === 'run-1')).toBe(true);
   });
 });
+
+/**
+ * AWS-P2 — the last-success timestamp must survive a failure.
+ *
+ * `last_success_at` was written as `state === 'available' ? at : null` on an
+ * UPSERT, so the previous value was destroyed on every run where a capability
+ * was not currently available. Measured in production 2026-09-22: 9 AWS
+ * capability rows carry a null last_success_at, including
+ * `billing_cost_explorer` on a connection where Cost Explorer demonstrably
+ * used to answer -- so nothing can now say whether it ever did.
+ *
+ * "Available now" and "last worked on the 15th" are different facts. The
+ * second is what tells a customer whether a capability is newly broken or was
+ * never configured, and it is the field staleness evaluation reads.
+ */
+describe('last_success_at durability', () => {
+  const NOW = Date.parse('2026-09-22T10:00:00Z');
+  const PREVIOUS = '2026-09-15T12:43:04.794Z';
+
+  const build = (checks: PermissionCheckResult[], previousSuccessAt?: Record<string, string | null>) =>
+    buildCapabilityStatuses(
+      { orgId: 'org-1', connectionId: 'conn-1', checks, snapshotId: 'snap-1', connectionStatus: 'connected', previousSuccessAt },
+      NOW,
+    );
+
+  const row = (rows: ReturnType<typeof build>, capability: string) =>
+    rows.find((r) => r.capability === capability)!;
+
+  const granted = (service: string, label = service): PermissionCheckResult =>
+    ({ service, label, status: 'granted', detail: 'ok', verified: true });
+
+  const errored = (service: string, label = service): PermissionCheckResult =>
+    ({ service, label, status: 'error', detail: 'HTTP 500', verified: true });
+
+  it('advances the timestamp when the capability is available', () => {
+    const rows = build([granted('sts'), granted('iam')]);
+    const identity = row(rows, 'identity');
+    expect(identity.state).toBe('available');
+    expect(identity.last_success_at).toBe(new Date(NOW).toISOString());
+  });
+
+  it('CARRIES FORWARD the previous success when the capability is not available', () => {
+    const rows = build([errored('iam')], { identity: PREVIOUS });
+    const identity = row(rows, 'identity');
+
+    expect(identity.state).not.toBe('available');
+    expect(identity.last_success_at, 'the previous success was erased').toBe(PREVIOUS);
+  });
+
+  it('still records the attempt even while carrying the old success forward', () => {
+    // Otherwise "we tried and it is still broken" is indistinguishable from
+    // "nobody has looked since the 15th".
+    const rows = build([errored('iam')], { identity: PREVIOUS });
+    expect(row(rows, 'identity').last_attempt_at).toBe(new Date(NOW).toISOString());
+  });
+
+  it('is null only when the capability has genuinely never succeeded', () => {
+    const rows = build([errored('iam')], {});
+    expect(row(rows, 'identity').last_success_at).toBeNull();
+  });
+
+  it('does not resurrect a success for a disconnected connection', () => {
+    // A disconnected connection collects nothing, but its history is still
+    // history -- the previous success is preserved, the state is not.
+    const rows = buildCapabilityStatuses(
+      { orgId: 'o', connectionId: 'c', checks: [], snapshotId: null, connectionStatus: 'disconnected', previousSuccessAt: { identity: PREVIOUS } },
+      NOW,
+    );
+    const identity = row(rows, 'identity');
+    expect(identity.state).toBe('disconnected');
+    expect(identity.last_success_at).toBe(PREVIOUS);
+  });
+
+  it('is wired at the call site, not merely supported by the builder', async () => {
+    // A parameter nothing passes is the same as no parameter.
+    const { readFileSync } = await import('node:fs');
+    const source = readFileSync('src/routes/permissions.ts', 'utf8');
+
+    expect(source).toContain('previousSuccessAt');
+    expect(source).toMatch(/select: 'capability,last_success_at'/);
+  });
+});
