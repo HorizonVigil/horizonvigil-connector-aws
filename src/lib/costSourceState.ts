@@ -1,4 +1,5 @@
-import type { Db } from '@horizonvigil/shared-lib';
+import type { Db, AvailabilityState } from '@horizonvigil/shared-lib';
+import { writeCapabilityStatuses } from './capabilityStatus';
 
 /**
  * Phase 3c — the typed billing-source state.
@@ -128,6 +129,44 @@ export function stateForSuccess(opts: {
 }
 
 /**
+ * AWS-M3. Which capability each cost source IS.
+ *
+ * `cost_source_status` and `connector_capability_status` describe the same
+ * fact from two angles, and only one of them was being written by a sync.
+ * Production, 2026-09-22: a Cost Explorer sync succeeded at 13:01 and
+ * `billing_cost_explorer` still read `last_success 2026-09-15` — two tables
+ * disagreeing about one thing, with the capability row the one most surfaces
+ * read.
+ */
+const CAPABILITY_BY_SOURCE: Record<CostSourceType, string> = {
+  COST_EXPLORER: 'billing_cost_explorer',
+  CUR_DATA_EXPORT: 'billing_cur',
+};
+
+/**
+ * The cost-source vocabulary expressed in the §1.4 availability vocabulary.
+ *
+ * Deliberately explicit rather than a lowercase() of the source state: the two
+ * unions are similar enough that a mechanical conversion would look right and
+ * silently invent states (`WAITING_FOR_EXPORT`, `INGESTING` and `NOT_CONFIGURED`
+ * have no same-named member) — and a capability state nothing recognises is
+ * read as neither available nor broken.
+ */
+const AVAILABILITY_BY_COST_STATE: Record<CostSourceState, AvailabilityState> = {
+  NOT_CONFIGURED: 'not_configured',
+  VALIDATING: 'validating',
+  // Both mean the pipeline is working and the answer is not ready yet.
+  WAITING_FOR_EXPORT: 'validating',
+  INGESTING: 'validating',
+  AVAILABLE: 'available',
+  PARTIAL: 'partial',
+  STALE: 'stale',
+  PERMISSION_DENIED: 'permission_denied',
+  FAILED: 'failed',
+  UNSUPPORTED: 'unsupported',
+};
+
+/**
  * Records the outcome. One row per (connection, source), upserted.
  *
  * `last_success_at` is advanced ONLY on a state that actually represents
@@ -178,4 +217,42 @@ export async function recordCostSourceState(
       // status row is a visible gap; a sync that died writing one loses the
       // cost data too.
     });
+
+  /*
+   * AWS-M3. The same fact, in the table most surfaces actually read.
+   *
+   * These two tables describe one thing from two angles and a sync wrote only
+   * one of them, so `billing_cost_explorer` kept reporting a week-old
+   * `last_success` after a successful sync that morning. A customer looking at
+   * capability health was told a source was stale while the cost data in front
+   * of them was current.
+   *
+   * Written from the SAME outcome rather than recomputed, so the two cannot
+   * disagree about what just happened. `last_success_at` follows the identical
+   * rule as above — advanced only when the state represents usable data — and
+   * scope is 1/1 because a cost source is a single binary source per
+   * connection, not a set of regions to cover.
+   */
+  await writeCapabilityStatuses(db, [
+    {
+      org_id: ctx.orgId,
+      connection_id: ctx.connectionId,
+      capability: CAPABILITY_BY_SOURCE[ctx.sourceType],
+      state: AVAILABILITY_BY_COST_STATE[outcome.state],
+      reason_code: outcome.reasonCode ?? null,
+      source: 'cost_sync',
+      expected_scope: 1,
+      covered_scope: usable ? 1 : 0,
+      last_attempt_at: now,
+      // Omitted, not nulled, when this run produced nothing usable: these
+      // rows upsert with merge-duplicates, so writing null here would erase a
+      // real earlier success and report a source that worked yesterday as one
+      // that has never worked.
+      ...(usable ? { last_success_at: now } : {}),
+      // A cost sync is not a permission snapshot; claiming one would attach
+      // this row to evidence that does not describe it.
+      permission_snapshot_id: null,
+      updated_at: now,
+    },
+  ]);
 }

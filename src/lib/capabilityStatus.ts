@@ -92,7 +92,15 @@ export interface CapabilityStatusRow {
   expected_scope: number;
   covered_scope: number;
   last_attempt_at: string;
-  last_success_at: string | null;
+  /**
+   * OMIT this key to leave whatever is already stored.
+   *
+   * These rows are written with `resolution=merge-duplicates`, so an explicit
+   * `null` OVERWRITES a real previous success and makes a source that worked
+   * yesterday look like it has never worked at all. A caller that has nothing
+   * new to say about success must say nothing, not say null.
+   */
+  last_success_at?: string | null;
   permission_snapshot_id: string | null;
   updated_at: string;
 }
