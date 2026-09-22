@@ -211,7 +211,10 @@ collectionRunRoutes.get('/accounts/:id/scan-health', (c) =>
     // terminal runs would hide an in-flight one, and "a scan is running" is
     // itself a reason the count is not yet authoritative.
     const runs = await db.select<CollectionRunRow[]>('collection_runs', {
-      select: 'id,status,total_steps,completed_steps,failed_steps,degraded_resource_types,started_at,finished_at,queued_at',
+      // degraded_reasons is selected, not just degraded_resource_types: a type
+      // with no recorded reason has to be reported AS unexplained (AWS-M5),
+      // and that is only knowable by comparing the two.
+      select: 'id,status,total_steps,completed_steps,failed_steps,degraded_resource_types,degraded_reasons,started_at,finished_at,queued_at',
       filters: { connection_id: `eq.${connectionId}`, org_id: `eq.${orgId}`, capability: 'eq.inventory' },
       order: 'queued_at.desc',
       limit: 1,
@@ -288,6 +291,7 @@ collectionRunRoutes.get('/accounts/:id/scan-health', (c) =>
         completedSteps: run.completed_steps ?? 0,
         failedSteps: failedCount,
         degradedResourceTypes: run.degraded_resource_types ?? [],
+        degradedReasons: run.degraded_reasons ?? {},
       },
       failedSteps,
       { succeededSteps: succeededCount, failedSteps: failedCount },

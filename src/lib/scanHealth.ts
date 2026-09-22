@@ -69,6 +69,23 @@ export interface ScanHealth {
   failures: ScannerFailure[];
   /** Resource types finalize refused to tombstone because coverage was degraded. */
   degradedResourceTypes: string[];
+  /** Why each degraded type degraded, keyed by resource type. */
+  degradedReasons: Record<string, string>;
+  /**
+   * AWS-M5. Degraded types for which NO reason was recorded.
+   *
+   * A production run carried 39 degraded types and 30 reasons, and nothing
+   * anywhere marked the 9 difference. The `degraded_reasons` column's own
+   * comment warns about exactly this -- "Absence of a REASON is not absence of
+   * a problem -- readers must not treat an unexplained degraded type as
+   * benign" -- and then every reader did, because the two lists were served
+   * side by side with no statement about the gap between them.
+   *
+   * A type here is one the product knows was not fully read and cannot say
+   * why, which is a different and worse answer than either "denied" or
+   * "AWS does not offer it in that region".
+   */
+  unexplainedDegradedTypes: string[];
   /**
    * AWS-H4. Records this run READ FROM AWS and then refused admission.
    *
@@ -140,6 +157,12 @@ export interface RunFacts {
   completedSteps: number;
   failedSteps: number;
   degradedResourceTypes: readonly string[];
+  /**
+   * Why each degraded type degraded. A type present in degradedResourceTypes
+   * and absent here has NO recorded reason — which the column's own comment
+   * warns about: "Absence of a REASON is not absence of a problem."
+   */
+  degradedReasons?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -169,6 +192,8 @@ export function buildScanHealth(
   const failed = counts ? counts.failedSteps : steps.filter((s) => s.status === 'failed').length;
   const quarantined = quarantine?.total ?? 0;
   const quarantineReasons = [...(quarantine?.byReason ?? [])].sort((a, b) => b.count - a.count);
+  const degradedReasons = { ...(run?.degradedReasons ?? {}) };
+  const unexplainedDegradedTypes = degradedResourceTypes.filter((t) => !degradedReasons[t]);
 
   if (!run || run.status === null) {
     return {
@@ -176,6 +201,7 @@ export function buildScanHealth(
       countIsAuthoritative: false,
       summary: 'No collection run has finished for this account yet, so its inventory has not been established.',
       totalSteps: 0, succeededSteps: 0, failedSteps: 0, failures: [], degradedResourceTypes: [],
+      degradedReasons: {}, unexplainedDegradedTypes: [],
       quarantinedRecords: 0, quarantineReasons: [],
     };
   }
@@ -186,6 +212,8 @@ export function buildScanHealth(
     failedSteps: failed,
     failures,
     degradedResourceTypes,
+    degradedReasons,
+    unexplainedDegradedTypes,
     quarantinedRecords: quarantined,
     quarantineReasons,
   };
@@ -227,13 +255,26 @@ export function buildScanHealth(
   if (failed === 0 && degradedResourceTypes.length > 0) {
     const shown = degradedResourceTypes.slice(0, 3).join(', ');
     const more = degradedResourceTypes.length > 3 ? ` and ${degradedResourceTypes.length - 3} more` : '';
+    /*
+     * AWS-M5. An unexplained degraded type is named as unexplained.
+     *
+     * A production run carried 39 degraded types and 30 reasons. The nine
+     * without a reason rendered identically to the thirty with one, so
+     * "we could not read this and cannot say why" was presented as though it
+     * were as well-understood as "AWS does not offer this service here".
+     * The column's own comment warns against exactly that reading.
+     */
+    const unexplained = unexplainedDegradedTypes.length > 0
+      ? ` ${unexplainedDegradedTypes.length} of them have no recorded reason, so why they were not read is unknown.`
+      : '';
     return {
       ...base,
       completeness: 'PARTIAL',
       countIsAuthoritative: false,
       summary:
         `Every collection step succeeded, but ${degradedResourceTypes.length} resource type(s) were not fully read `
-        + `(${shown}${more}). Those resources were kept rather than marked deleted, and the count below is a floor, not a total.`,
+        + `(${shown}${more}). Those resources were kept rather than marked deleted, and the count below is a floor, not a total.`
+        + unexplained,
     };
   }
 

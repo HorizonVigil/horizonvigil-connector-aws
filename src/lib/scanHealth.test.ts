@@ -190,6 +190,68 @@ describe('buildScanHealth', () => {
     expect(h.quarantineReasons).toEqual([]);
   });
 
+  /**
+   * AWS-M5. A degraded type with no recorded reason is named as unexplained.
+   *
+   * A production run carried 39 degraded types and 30 reasons. The nine
+   * without a reason rendered identically to the thirty with one, so
+   * "we could not read this and cannot say why" was presented as though it
+   * were as well-understood as "AWS does not offer this service here". The
+   * degraded_reasons column's own comment warns against exactly that reading:
+   * "Absence of a REASON is not absence of a problem."
+   */
+  it('names how many degraded types have no recorded reason', () => {
+    const h = buildScanHealth(
+      run({
+        degradedResourceTypes: ['lambda_function', 'msk_cluster', 'fms_policy'],
+        degradedReasons: { lambda_function: 'lambda:ListFunctions was denied in us-east-1.' },
+      }),
+      [],
+      { succeededSteps: 100, failedSteps: 0 },
+    );
+
+    // Sorted, because degradedResourceTypes is sorted before the comparison.
+    expect(h.unexplainedDegradedTypes).toEqual(['fms_policy', 'msk_cluster']);
+    expect(h.summary).toContain('2 of them have no recorded reason');
+    expect(h.countIsAuthoritative).toBe(false);
+  });
+
+  it('says nothing about unexplained types when every one is explained', () => {
+    const h = buildScanHealth(
+      run({
+        degradedResourceTypes: ['lambda_function'],
+        degradedReasons: { lambda_function: 'lambda:ListFunctions was denied in us-east-1.' },
+      }),
+      [],
+      { succeededSteps: 100, failedSteps: 0 },
+    );
+
+    expect(h.unexplainedDegradedTypes).toEqual([]);
+    expect(h.summary).not.toContain('no recorded reason');
+  });
+
+  it('carries the reasons through so a reader can act on them', () => {
+    const h = buildScanHealth(
+      run({
+        degradedResourceTypes: ['lambda_function'],
+        degradedReasons: { lambda_function: 'lambda:ListFunctions was denied in us-east-1.' },
+      }),
+      [],
+    );
+    expect(h.degradedReasons.lambda_function).toContain('denied');
+  });
+
+  it('treats a run with reasons for types it never degraded as harmless', () => {
+    // Stale reasons for types no longer degraded must not invent degradation.
+    const h = buildScanHealth(
+      run({ degradedResourceTypes: [], degradedReasons: { gone_type: 'whatever' } }),
+      [],
+      { succeededSteps: 100, failedSteps: 0 },
+    );
+    expect(h.completeness).toBe('COMPLETE');
+    expect(h.unexplainedDegradedTypes).toEqual([]);
+  });
+
   it('a failed run reports the inventory as stale, not current', () => {
     const h = buildScanHealth(run({ status: 'FAILED' }), []);
     expect(h.completeness).toBe('FAILED');
