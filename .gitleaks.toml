@@ -20,4 +20,7 @@ regexes = [
   # test. It was never a credential; the test now constructs it from pieces,
   # but history scanning still visits that immutable commit.
   '''^AKIAABCDEFGHIJKLMNOP$''',
+  # AWS documentation's intentionally-public example key. It exists only in
+  # immutable test history and has never authenticated to an account.
+  '''^AKIAIOSFODNN7EXAMPLE$''',
 ]

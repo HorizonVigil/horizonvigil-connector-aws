@@ -92,7 +92,7 @@ export const AWS_CAPABILITIES: readonly AwsCapability[] = [
     // scanner's resource types (awsApi.ts creds sink), but there is no single
     // "resources" probe because coverage is per-service.
     probed: false,
-    requiredPermissions: ['ec2:Describe*', 'rds:Describe*', 's3:ListAllMyBuckets', 's3:GetBucket*', 'lambda:ListFunctions', 'elasticloadbalancing:Describe*', 'eks:ListClusters', 'dynamodb:ListTables'],
+    requiredPermissions: ['ec2:Describe*', 'rds:Describe*', 's3:ListAllMyBuckets', 's3:GetBucket*', 's3:GetAccountPublicAccessBlock', 'lambda:ListFunctions', 'elasticloadbalancing:Describe*', 'eks:ListClusters', 'dynamodb:ListTables'],
     dataStored: ['cloud_resources', 'resource_lifecycle_events'],
     uiConsumer: 'Asset Inventory, Overview',
     actionSupported: false,
