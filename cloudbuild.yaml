@@ -11,18 +11,33 @@
 #   gcloud builds submit --config=cloudbuild.yaml --region=us-central1 \
 #     --substitutions=_GIT_SHA=$(git rev-parse HEAD) .
 #
-# AWS-C2. This file used to build, push and deploy `:latest` and nothing else.
-# A mutable tag means the last writer wins and a running revision cannot be
+# ---------------------------------------------------------------------------
+# AWS-C2: PRODUCTION NEVER DEPLOYS A MUTABLE TAG
+# ---------------------------------------------------------------------------
+#
+# This file used to build, push and deploy `:latest` and nothing else. A
+# mutable tag means the last writer wins and a running revision cannot be
 # traced to a commit. That is not theoretical: during the 2026-09-22 audit,
 # revision 00213 was found serving digest 215eddfb… while the deploy of record
 # (00211) was 60ff89f2… -- a build nobody in that session ran had replaced
 # `:latest` at 13:35 UTC, silently reverting verified fixes. `degraded_reasons`
 # read 0 until a redeploy, then immediately populated.
 #
-# Every image is now ALSO tagged with an immutable identifier, and that is the
-# tag Cloud Run is pointed at, so `gcloud run revisions describe` resolves to
-# something findable in `git log`. `:latest` is still pushed, but only as a
-# moving alias for humans -- nothing deploys from it.
+# Four things make that unrepeatable, and a comment is none of them:
+#
+#   1. The deploy tag is VALIDATED before it is used. `assert_deployable`
+#      refuses anything that is not a 40-hex commit SHA or an explicit
+#      `build-<id>` fallback -- so `latest`, an empty string, or a
+#      half-substituted variable fail the build rather than reaching Cloud Run.
+#   2. The DIGEST is captured at push time and re-checked after the deploy, so
+#      "we deployed the tag we built" is verified against content, not assumed
+#      from a string.
+#   3. The serving revision is read back and its image compared to what was
+#      deployed. A deploy that silently did not take effect fails the build.
+#   4. `:latest` is still published as a convenience alias for humans, but
+#      nothing here can deploy it -- see (1). If that alias is ever a liability
+#      rather than a convenience, delete the two lines that push it; nothing
+#      else depends on it.
 steps:
   - name: 'gcr.io/cloud-builders/docker'
     id: build
@@ -36,9 +51,9 @@ steps:
         # The commit, when the caller supplied one (_GIT_SHA by hand,
         # COMMIT_SHA from a Cloud Build trigger). A manual build from a dirty
         # tree has no commit to name, so it falls back to the build id --
-        # which is still immutable and still traceable, just to a build rather
-        # than to a commit. What must never happen again is a deploy whose
-        # image tag is shared with any other build.
+        # still immutable and still traceable, just to a build rather than to
+        # a commit.
+        #
         # Single `$` = a Cloud Build substitution, resolved before the shell
         # ever runs. `$$` = a shell variable. Mixing them up is why the first
         # draft of this would have silently tagged every manual build
@@ -46,6 +61,19 @@ steps:
         TAG="${_GIT_SHA}"
         if [ -z "$$TAG" ]; then TAG="${COMMIT_SHA}"; fi
         if [ -z "$$TAG" ]; then TAG="build-${BUILD_ID}"; fi
+
+        # THE GUARD (requirement 7). Structurally refuses a mutable tag rather
+        # than trusting the lines above to have produced an immutable one.
+        case "$$TAG" in
+          latest|Latest|LATEST)
+            echo "REFUSING: '$$TAG' is a mutable tag and must never be deployed." >&2
+            exit 1 ;;
+        esac
+        if ! printf '%s' "$$TAG" | grep -Eq '^([0-9a-f]{40}|build-[A-Za-z0-9_-]+)$'; then
+          echo "REFUSING: deploy tag '$$TAG' is neither a 40-hex commit SHA nor a build-<id> fallback." >&2
+          exit 1
+        fi
+
         echo "$$TAG" > /workspace/image_tag
         echo "Building connector-aws:$$TAG"
 
@@ -63,9 +91,24 @@ steps:
       - |
         set -euo pipefail
         IMAGE=us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws
-        docker push "$$IMAGE:$$(cat /workspace/image_tag)"
+        TAG="$$(cat /workspace/image_tag)"
+
+        docker push "$$IMAGE:$$TAG"
+
+        # The digest of what was just pushed, recorded so the deploy can be
+        # verified against CONTENT rather than against a tag string. A tag can
+        # be moved; a digest cannot.
+        DIGEST="$$(docker image inspect "$$IMAGE:$$TAG" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
+        if [ -z "$$DIGEST" ]; then
+          echo "REFUSING: could not resolve a digest for $$IMAGE:$$TAG after push." >&2
+          exit 1
+        fi
+        echo "$$DIGEST" > /workspace/image_digest
+        echo "Pushed $$IMAGE:$$TAG @ $$DIGEST"
+
         # Pushed second and deliberately: if this one fails, the immutable tag
-        # is already published and the deploy below still succeeds.
+        # is already published and the deploy below still succeeds. Nothing
+        # deploys from this alias -- the guard in `build` makes that impossible.
         docker push "$$IMAGE:latest"
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     id: deploy
@@ -74,19 +117,64 @@ steps:
     # otherwise a later `gcloud run deploy` without these flags resets
     # max-instances to its service default and the account-wide
     # instance-limit guardrail silently stops applying.
+    #
+    # Environment variables are deliberately NOT passed here. `gcloud run
+    # deploy --image` without --set-env-vars preserves the service's existing
+    # environment; passing --set-env-vars would REPLACE the whole set and drop
+    # every secret this service holds (requirement 8).
     args:
       - '-c'
       - |
         set -euo pipefail
         IMAGE=us-central1-docker.pkg.dev/cloudops360/cloud-run-source-deploy/connector-aws
         TAG="$$(cat /workspace/image_tag)"
+        DIGEST="$$(cat /workspace/image_digest)"
+
+        # The guard again, at the point of use. The tag travels through a file
+        # between build steps, and a check that ran three steps ago does not
+        # protect the line that actually deploys.
+        case "$$TAG" in
+          latest|Latest|LATEST)
+            echo "REFUSING: refusing to deploy mutable tag '$$TAG'." >&2
+            exit 1 ;;
+        esac
+
         gcloud run deploy connector-aws \
           --image="$$IMAGE:$$TAG" \
           --region=us-central1 \
           --min-instances=0 \
           --max-instances=1 \
           --quiet
-        echo "Deployed connector-aws from $$IMAGE:$$TAG"
+
+        # ---- post-deploy verification (requirements 5, 9, 10) --------------
+        # A successful `gcloud run deploy` means the API accepted the request,
+        # not that the revision now serving traffic is the one just built.
+        SERVING_IMAGE="$$(gcloud run services describe connector-aws --region=us-central1 \
+          --format='value(spec.template.spec.containers[0].image)')"
+        SERVING_REV="$$(gcloud run services describe connector-aws --region=us-central1 \
+          --format='value(status.latestReadyRevisionName)')"
+
+        if [ "$$SERVING_IMAGE" != "$$IMAGE:$$TAG" ]; then
+          echo "FAILED: revision $$SERVING_REV serves '$$SERVING_IMAGE', expected '$$IMAGE:$$TAG'." >&2
+          exit 1
+        fi
+
+        # And that the tag still resolves to the content we built -- this is
+        # what would catch a concurrent build having moved the tag between our
+        # push and our deploy.
+        DEPLOYED_DIGEST="$$(gcloud artifacts docker images describe "$$IMAGE:$$TAG" \
+          --format='value(image_summary.digest)' 2>/dev/null || true)"
+        if [ -n "$$DEPLOYED_DIGEST" ] && [ "$$DEPLOYED_DIGEST" != "$$DIGEST" ]; then
+          echo "FAILED: $$IMAGE:$$TAG now resolves to $$DEPLOYED_DIGEST, but $$DIGEST was built here." >&2
+          echo "Another build moved the tag. This is exactly the AWS-C2 incident." >&2
+          exit 1
+        fi
+
+        echo "VERIFIED"
+        echo "  revision : $$SERVING_REV"
+        echo "  image    : $$SERVING_IMAGE"
+        echo "  digest   : $$DIGEST"
+        echo "  rollback : gcloud run services update-traffic connector-aws --region=us-central1 --to-revisions=<previous>=100"
 substitutions:
   # Empty by default so a trigger build falls through to COMMIT_SHA.
   _GIT_SHA: ''

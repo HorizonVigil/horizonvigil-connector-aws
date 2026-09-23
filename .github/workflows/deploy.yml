@@ -52,10 +52,37 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           DOCKER_BUILDKIT: "1"
         run: |
-          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.SERVICE }}:${{ github.sha }}"
+          # AWS-C2. `github.sha` is always the exact commit being built, so this
+          # path has never used a mutable tag -- but "has never" is not a
+          # control. The guard makes deploying one structurally impossible
+          # rather than relying on this line staying correct.
+          TAG="${{ github.sha }}"
+          case "$TAG" in
+            latest|Latest|LATEST)
+              echo "REFUSING: '$TAG' is a mutable tag and must never be deployed." >&2
+              exit 1 ;;
+          esac
+          if ! printf '%s' "$TAG" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "REFUSING: deploy tag '$TAG' is not a 40-hex commit SHA." >&2
+            exit 1
+          fi
+
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.SERVICE }}:$TAG"
           docker build --secret id=gh_pat,env=GH_PAT -t "$IMAGE" .
           docker push "$IMAGE"
+
+          # Digest of what was just pushed, so the deploy can be verified
+          # against CONTENT and not against a tag string. A tag can be moved;
+          # a digest cannot.
+          DIGEST="$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
+          if [ -z "$DIGEST" ]; then
+            echo "REFUSING: could not resolve a digest for $IMAGE after push." >&2
+            exit 1
+          fi
+
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          echo "Pushed $IMAGE @ $DIGEST"
 
       # --set-env-vars REPLACES the whole environment, so any variable not
       # listed on the deploy line is destroyed by the next deploy. That is the
@@ -111,7 +138,42 @@ jobs:
             --max-instances=1 \
             --memory=256Mi \
             --timeout=1800 \
-            --set-env-vars="^##^SUPABASE_URL=https://dvyoghaqeknyyrdujssi.supabase.co##SUPABASE_ANON_KEY=sb_publishable_gRal6V08wNzz0drb1F1QAw_Na-j9XoL##ALLOWED_ORIGIN=https://frontend-7yo5yw7xca-uc.a.run.app|https://frontend-153395452624.us-central1.run.app|https://horizonvigil.com|https://www.horizonvigil.com##DB_SCHEMA=public##AUTOMATION_API_URL=https://automation-7yo5yw7xca-uc.a.run.app##ENCRYPTION_KEY=${ENCRYPTION_KEY}##SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}##INTERNAL_SCAN_SECRET=${INTERNAL_SCAN_SECRET}##INTERNAL_COST_SYNC_SECRET=${INTERNAL_COST_SYNC_SECRET}##POST_SCAN_HOOK_SECRET=${POST_SCAN_HOOK_SECRET}##COST_OPTIMIZATION_API_URL=https://cost-7yo5yw7xca-uc.a.run.app"
+            --set-env-vars="^##^SUPABASE_URL=https://dvyoghaqeknyyrdujssi.supabase.co##SUPABASE_ANON_KEY=sb_publishable_gRal6V08wNzz0drb1F1QAw_Na-j9XoL##ALLOWED_ORIGIN=https://frontend-7yo5yw7xca-uc.a.run.app|https://frontend-153395452624.us-central1.run.app|https://horizonvigil.com|https://www.horizonvigil.com##DB_SCHEMA=public##AUTOMATION_API_URL=https://automation-7yo5yw7xca-uc.a.run.app##ENCRYPTION_KEY=${ENCRYPTION_KEY}##SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}##INTERNAL_SCAN_SECRET=${INTERNAL_SCAN_SECRET}##INTERNAL_COST_SYNC_SECRET=${INTERNAL_COST_SYNC_SECRET}##POST_SCAN_HOOK_SECRET=${POST_SCAN_HOOK_SECRET}##COST_OPTIMIZATION_API_URL=https://cost-7yo5yw7xca-uc.a.run.app##ALERTS_API_URL=https://observability-7yo5yw7xca-uc.a.run.app"
+
+      # AWS-C2 (requirements 5, 9, 10). A successful `gcloud run deploy` means
+      # the API accepted the request, not that the revision now serving traffic
+      # is the one just built. The 2026-09-22 incident was exactly a revision
+      # serving an image nobody in that session had deployed.
+      - name: Verify the deployed image is the one we built
+        run: |
+          SERVING_IMAGE="$(gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }}             --format='value(spec.template.spec.containers[0].image)')"
+          SERVING_REV="$(gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }}             --format='value(status.latestReadyRevisionName)')"
+
+          if [ "$SERVING_IMAGE" != "${{ env.IMAGE }}" ]; then
+            echo "FAILED: revision $SERVING_REV serves '$SERVING_IMAGE', expected '${{ env.IMAGE }}'." >&2
+            exit 1
+          fi
+          case "$SERVING_IMAGE" in
+            *:latest)
+              echo "FAILED: production is serving a mutable tag." >&2
+              exit 1 ;;
+          esac
+
+          # And that the tag still resolves to the content we built. This is
+          # what catches a concurrent build having moved the tag between our
+          # push and our deploy.
+          NOW_DIGEST="$(gcloud artifacts docker images describe "${{ env.IMAGE }}"             --format='value(image_summary.digest)' 2>/dev/null || true)"
+          if [ -n "$NOW_DIGEST" ] && [ "$NOW_DIGEST" != "${{ env.IMAGE_DIGEST }}" ]; then
+            echo "FAILED: ${{ env.IMAGE }} now resolves to $NOW_DIGEST, but ${{ env.IMAGE_DIGEST }} was built here." >&2
+            echo "Another build moved the tag. This is the AWS-C2 incident." >&2
+            exit 1
+          fi
+
+          echo "VERIFIED"
+          echo "  commit   : ${{ github.sha }}"
+          echo "  revision : $SERVING_REV"
+          echo "  image    : $SERVING_IMAGE"
+          echo "  digest   : ${{ env.IMAGE_DIGEST }}"
 
       - name: Show service URL
         run: gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }} --format='value(status.url)'
@@ -144,10 +206,37 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           DOCKER_BUILDKIT: "1"
         run: |
-          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.SERVICE }}:${{ github.sha }}"
+          # AWS-C2. `github.sha` is always the exact commit being built, so this
+          # path has never used a mutable tag -- but "has never" is not a
+          # control. The guard makes deploying one structurally impossible
+          # rather than relying on this line staying correct.
+          TAG="${{ github.sha }}"
+          case "$TAG" in
+            latest|Latest|LATEST)
+              echo "REFUSING: '$TAG' is a mutable tag and must never be deployed." >&2
+              exit 1 ;;
+          esac
+          if ! printf '%s' "$TAG" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "REFUSING: deploy tag '$TAG' is not a 40-hex commit SHA." >&2
+            exit 1
+          fi
+
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.SERVICE }}:$TAG"
           docker build --secret id=gh_pat,env=GH_PAT -t "$IMAGE" .
           docker push "$IMAGE"
+
+          # Digest of what was just pushed, so the deploy can be verified
+          # against CONTENT and not against a tag string. A tag can be moved;
+          # a digest cannot.
+          DIGEST="$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
+          if [ -z "$DIGEST" ]; then
+            echo "REFUSING: could not resolve a digest for $IMAGE after push." >&2
+            exit 1
+          fi
+
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          echo "Pushed $IMAGE @ $DIGEST"
 
       - name: Deploy to Cloud Run
         env:
