@@ -305,6 +305,39 @@ describe('AWS-I1 services are probed at all', () => {
   it('securityhub was already probed and stays probed', () => {
     expect(SOURCE).toContain("service: 'securityhub'");
   });
+
+  /**
+   * Running a probe is not the same as REPORTING it.
+   *
+   * The first version of this change appended the six calls to the
+   * `Promise.all([...])` without adding them to the destructuring pattern on
+   * the left. All six ran — six real AWS calls per validation — and every
+   * result was discarded. Validation looked identical to before, and the
+   * services stayed invisible.
+   *
+   * That is the same shape as every other defect in this codebase's history:
+   * the work happens, the answer is dropped, and nothing says so. Asserting
+   * the promise list is not enough; the results have to reach `checks`.
+   */
+  it.each(['lambdaFn', 'kafka', 'imageBuilder', 'macie', 'firewallManager', 'licenseManager'])(
+    '%s is destructured AND included in the returned checks',
+    (name) => {
+      const destructuring = SOURCE.slice(SOURCE.indexOf('const ['), SOURCE.indexOf('] = await Promise.all('));
+      expect(destructuring, `${name} is not destructured — its result is discarded`).toContain(name);
+
+      const checksArray = SOURCE.slice(SOURCE.indexOf('const checks = ['));
+      expect(checksArray.slice(0, 600), `${name} never reaches checks[]`).toContain(name);
+    },
+  );
+
+  it('every probe in the Promise.all has a name to receive it', () => {
+    const calls = (SOURCE.slice(SOURCE.indexOf('] = await Promise.all('), SOURCE.indexOf('const checks = ['))
+      .match(/check[A-Z]\w*\(creds/g) ?? []).length;
+    const names = SOURCE.slice(SOURCE.indexOf('const ['), SOURCE.indexOf('] = await Promise.all('))
+      .split(',').map((x) => x.trim()).filter((x) => x && !x.startsWith('/') && !x.startsWith('*')).length;
+    // stsResult is added to checks separately, so names == calls exactly.
+    expect(names, 'a probe result is being discarded').toBe(calls);
+  });
 });
 
 describe('the AWS-I1 probes behave correctly', () => {

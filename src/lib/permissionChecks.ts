@@ -214,6 +214,7 @@ export async function runFullValidation(creds: AwsCreds, region: string): Promis
     iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks, config,
     securityHub, computeOptimizer, trustedAdvisor,
     guardDuty, inspector, accessAnalyzer, ecs, health, cur,
+    lambdaFn, kafka, imageBuilder, macie, firewallManager, licenseManager,
   ] = await Promise.all([
     checkIam(creds),
     checkOrganizations(creds),
@@ -268,6 +269,7 @@ export async function runFullValidation(creds: AwsCreds, region: string): Promis
     stsResult, iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks, config,
     securityHub, computeOptimizer, trustedAdvisor,
     guardDuty, inspector, accessAnalyzer, ecs, health, cur,
+    lambdaFn, kafka, imageBuilder, macie, firewallManager, licenseManager,
   ].map((check) => ({ ...check, detail: redactAwsText(check.detail) }));
 
   return { identity, checks };
