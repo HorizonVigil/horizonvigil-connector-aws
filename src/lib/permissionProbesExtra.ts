@@ -271,7 +271,28 @@ async function probeRest(
     );
     if (res.ok) return { ...base, status: 'granted', detail: `Read access to ${opts.label} confirmed` };
     if (res.status === 403 || res.status === 401) {
-      return { ...base, status: 'denied', detail: `${opts.action} was denied.` };
+      /*
+       * Some of these services return AccessDenied when they have never been
+       * ACTIVATED in the account, not when the principal lacks the permission
+       * -- the same behaviour Inspector has. Measured 2026-09-23 against a
+       * principal holding AdministratorAccess (`*:*`), which cannot have a
+       * policy gap: lambda returned granted, while kafka, imagebuilder,
+       * macie2 and license-manager all returned AccessDenied.
+       *
+       * So for those, the message must not send someone to edit a policy that
+       * already allows everything. Lambda is excluded deliberately: it is
+       * available in every commercial region and has no activation step, so a
+       * denial there IS a policy gap and softening it would hide a real one.
+       */
+      const mayNeedActivation = opts.service !== 'lambda';
+      return {
+        ...base,
+        status: 'denied',
+        detail: mayNeedActivation
+          ? `${opts.action} was denied. AWS returns this both when the role lacks the permission and when `
+            + `${opts.label} has never been activated in this account — check whether it is enabled before changing the IAM policy.`
+          : `${opts.action} was denied.`,
+      };
     }
     if (res.status === 404) {
       return { ...base, status: 'not_applicable', detail: `${opts.label} is not available in this region.` };

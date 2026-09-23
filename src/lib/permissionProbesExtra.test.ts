@@ -383,6 +383,39 @@ describe('the AWS-I1 probes behave correctly', () => {
     expect((await checkFirewallManager(creds)).status).toBe('denied');
   });
 
+  /**
+   * Measured 2026-09-23 against a principal holding AdministratorAccess
+   * (`*:*`), which cannot have a policy gap: lambda returned GRANTED while
+   * kafka, imagebuilder, macie2 and license-manager all returned
+   * AccessDenied. Those services return AccessDenied when they have never
+   * been activated in the account — the same behaviour Inspector has.
+   *
+   * So their message must not send someone to edit a policy that already
+   * allows everything.
+   */
+  it('a denial that may be an activation state says so, cheaper check first', async () => {
+    fetchMock.mockImplementation(() => denied());
+    const r = await checkKafka(creds, REGION);
+
+    expect(r.status).toBe('denied');
+    expect(r.detail).toMatch(/never been activated/);
+    expect(r.detail.indexOf('activated')).toBeLessThan(r.detail.indexOf('IAM policy'));
+  });
+
+  /**
+   * Lambda is the exception and must stay one. It is available in every
+   * commercial region and has no activation step, so a denial there IS a
+   * policy gap — softening it would hide a real one.
+   */
+  it('Lambda is NOT softened — it has no activation state to hide behind', async () => {
+    fetchMock.mockImplementation(() => denied());
+    const r = await checkLambda(creds, REGION);
+
+    expect(r.status).toBe('denied');
+    expect(r.detail).toBe('lambda:ListFunctions was denied.');
+    expect(r.detail).not.toMatch(/activated/);
+  });
+
   it('reports a License Manager denial with the action that was refused', async () => {
     fetchMock.mockImplementation(() => denied());
     const r = await checkLicenseManager(creds, REGION);
