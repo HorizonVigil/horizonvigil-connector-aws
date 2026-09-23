@@ -1,4 +1,5 @@
-import { createAwsClient, safeFetch } from '../awsApi';
+import { createAwsClient } from '../awsApi';
+import { fetchJson, reportWalk, walkPages } from './restJson';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -15,7 +16,7 @@ interface AdditionalAuthProvider {
 }
 interface LogConfig { cloudWatchLogsRoleArn?: string; fieldLogLevel?: string; excludeVerboseContent?: boolean }
 
-interface GraphqlApi {
+export interface GraphqlApi {
   apiId?: string;
   apiType?: string; // "GRAPHQL" | "MERGED"
   name?: string;
@@ -39,84 +40,69 @@ interface GraphqlApi {
   uris?: Record<string, string>;
   tags?: Record<string, string>;
 }
-interface ListGraphqlApisResponse { graphqlApis?: GraphqlApi[]; nextToken?: string }
+
+/** API-security evidence for one GraphQL API. Facts, not verdicts. */
+export function graphqlApiMetadata(api: GraphqlApi) {
+  const additional = api.additionalAuthenticationProviders?.map((p) => p.authenticationType).filter((t): t is string => !!t) ?? [];
+  const allAuth = [api.authenticationType, ...additional].filter((t): t is string => !!t);
+  return {
+    arn: api.arn,
+    apiType: api.apiType,
+    authenticationType: api.authenticationType,
+    additionalAuthenticationTypes: additional,
+    // API keys are bearer secrets with no identity; worth knowing wherever used.
+    usesApiKeyAuth: allAuth.includes('API_KEY'),
+    xrayEnabled: api.xrayEnabled,
+    visibility: api.visibility,
+    isPrivate: api.visibility === 'PRIVATE',
+    wafWebAclArn: api.wafWebAclArn,
+    wafProtected: !!api.wafWebAclArn,
+    // Introspection defaults to ENABLED when the field is absent.
+    introspectionConfig: api.introspectionConfig,
+    introspectionEnabled: (api.introspectionConfig ?? 'ENABLED') === 'ENABLED',
+    queryDepthLimit: api.queryDepthLimit,
+    resolverCountLimit: api.resolverCountLimit,
+    logFieldLogLevel: api.logConfig?.fieldLogLevel,
+    loggingEnabled: !!api.logConfig?.fieldLogLevel && api.logConfig.fieldLogLevel !== 'NONE',
+    owner: api.owner,
+    ownerContact: api.ownerContact,
+    mergedApiExecutionRoleArn: api.mergedApiExecutionRoleArn,
+    uris: api.uris,
+    dns: api.dns,
+  };
+}
 
 /**
- * AWS AppSync (managed GraphQL APIs) -- REST-JSON, confirmed via AWS's own
- * AppSync API reference (API_ListGraphqlApis.html) and the AWS General
- * Reference service-endpoints page (appsync.html): control-plane calls like
- * ListGraphqlApis go to the regional `appsync.<region>.amazonaws.com` host,
- * which is distinct from the per-API data-plane host
- * (`<apiId>.appsync-api.<region>.amazonaws.com`) that actual GraphQL
- * query/mutation traffic uses -- this scanner only ever talks to the
- * control-plane host. GET /v1/apis (optionally `?maxResults=`, `nextToken`,
- * `apiType`, `owner`) returns `{ graphqlApis: [...], nextToken }`; each
- * GraphqlApi summary already carries apiId, name, arn, authenticationType,
- * xrayEnabled, visibility, wafWebAclArn, tags, and more directly -- no
- * separate GetGraphqlApi call is needed per API, same list-is-enough shape
- * as mq.ts's ListBrokers.
+ * AWS AppSync (managed GraphQL APIs) — REST-JSON against the control-plane
+ * host `appsync.<region>.amazonaws.com` (GET /v1/apis). Each summary already
+ * carries auth, visibility, WAF, introspection and logging, so no per-API
+ * call is needed.
  *
- * Only the first page (maxResults=25, the documented max) is fetched here --
- * acceptable for a first pass per the same reasoning as other list-only
- * scanners in this connector (mq.ts, apigateway.ts); a follow-up pass can add
- * the nextToken loop if accounts with >25 GraphQL APIs turn out to be
- * common.
- *
- * This resource type feeds this platform's API Security features (a
- * GraphQL API is a real attack surface -- open introspection, missing auth,
- * public visibility all matter there), so the field mapping here leans
- * toward preserving everything the list response already gives us
- * (authenticationType, additional auth providers, introspectionConfig,
- * visibility, wafWebAclArn, logConfig) rather than trimming to a minimal
- * set.
- *
- * UNVERIFIED against a real account's actual response shape until this runs
- * against a live connection and gets checked -- same disclosed-uncertainty
- * convention as inspector2.ts/mq.ts. The request shape (GET /v1/apis, query
- * params, host) and response field names above were checked against AWS's
- * published API reference rather than reconstructed from memory, but no live
- * AppSync API existed in any test account when this was written.
+ * Now paginated (maxResults=25 is the documented page maximum; the previous
+ * version stopped there, so API number 26 looked deleted). A list failure is
+ * reported rather than returned as []. An API without an id is recorded with
+ * an empty id -- which admission quarantines with a typed reason -- instead
+ * of the old `<region>:unknown` placeholder, which gave every such API the
+ * SAME identity.
  */
 export async function scanAppSync(ctx: ScannerContext): Promise<ScannedResource[]> {
   const client = createAwsClient(ctx.creds, 'appsync', ctx.region);
   const base = `https://appsync.${ctx.region}.amazonaws.com`;
-  const out: ScannedResource[] = [];
 
-  const res = await safeFetch(client, `${base}/v1/apis?maxResults=25`, { method: 'GET' });
-  const text = await res.text();
-  if (!res.ok) {
-    console.error(`AppSync ListGraphqlApis failed in ${ctx.region} (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);
-    return out;
-  }
+  const walk = await walkPages<GraphqlApi>(
+    (token) => fetchJson(client, `${base}/v1/apis?maxResults=25${token ? `&nextToken=${encodeURIComponent(token)}` : ''}`),
+    (b) => b.graphqlApis,
+    (b) => b.nextToken,
+  );
+  reportWalk(ctx, walk, 'appsync', 'ListGraphqlApis');
 
-  const apis = (text ? (JSON.parse(text) as ListGraphqlApisResponse) : {}).graphqlApis ?? [];
-  for (const api of apis) {
-    out.push({
-      resourceTypeKey: 'appsync_graphql_api',
-      resourceId: api.apiId ?? api.arn ?? `${ctx.region}:unknown`,
-      region: ctx.region,
-      resourceName: api.name,
-      tags: api.tags,
-      metadata: {
-        arn: api.arn,
-        apiType: api.apiType,
-        authenticationType: api.authenticationType,
-        additionalAuthenticationTypes: api.additionalAuthenticationProviders?.map((p) => p.authenticationType).filter((t): t is string => !!t),
-        xrayEnabled: api.xrayEnabled,
-        visibility: api.visibility,
-        wafWebAclArn: api.wafWebAclArn,
-        introspectionConfig: api.introspectionConfig,
-        queryDepthLimit: api.queryDepthLimit,
-        resolverCountLimit: api.resolverCountLimit,
-        logFieldLogLevel: api.logConfig?.fieldLogLevel,
-        owner: api.owner,
-        ownerContact: api.ownerContact,
-        mergedApiExecutionRoleArn: api.mergedApiExecutionRoleArn,
-        uris: api.uris,
-        dns: api.dns,
-      },
-    });
-  }
-
-  return out;
+  return walk.items.filter(Boolean).map((api) => ({
+    resourceTypeKey: 'appsync_graphql_api',
+    resourceId: api.apiId ?? '',
+    region: ctx.region,
+    resourceName: api.name,
+    tags: api.tags,
+    metadata: graphqlApiMetadata(api),
+    relationships: { wafWebAclArn: api.wafWebAclArn ?? null },
+  }));
 }

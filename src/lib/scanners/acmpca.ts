@@ -1,4 +1,4 @@
-import { callJsonApi } from '../awsApi';
+import { reportWalk, toIso, walkJsonRpc } from './restJson';
 import type { ScannedResource, ScannerContext } from './types';
 
 const TARGET_PREFIX = 'ACMPrivateCA';
@@ -13,64 +13,81 @@ interface CertificateAuthoritySubject {
 interface CertificateAuthorityConfiguration {
   KeyAlgorithm?: string; SigningAlgorithm?: string; Subject?: CertificateAuthoritySubject;
 }
-interface CertificateAuthority {
+interface RevocationConfiguration {
+  CrlConfiguration?: { Enabled?: boolean; ExpirationInDays?: number; S3BucketName?: string; S3ObjectAcl?: string };
+  OcspConfiguration?: { Enabled?: boolean };
+}
+export interface CertificateAuthority {
   Arn: string; OwnerAccount?: string; Type?: string; Status?: string;
   CertificateAuthorityConfiguration?: CertificateAuthorityConfiguration;
+  RevocationConfiguration?: RevocationConfiguration;
   CreatedAt?: number; LastStateChangeAt?: number; NotBefore?: number; NotAfter?: number;
+  RestorableUntil?: number;
   FailureReason?: string; UsageMode?: string; KeyStorageSecurityStandard?: string; Serial?: string;
-}
-interface ListCertificateAuthoritiesResponse {
-  CertificateAuthorities?: CertificateAuthority[]; NextToken?: string;
 }
 
 /**
- * ACM Private Certificate Authority (ACM PCA) — the private-CA management
- * service, a genuinely separate AWS API from regular ACM (acm.ts), sharing
- * only the "ACM" name prefix. Regular ACM (acm.ts) inventories issued
- * public/private *certificates*; this scanner inventories the private
- * *certificate authorities* themselves (host `acm-pca.<region>`, target
- * prefix `ACMPrivateCA`, its own service id for SigV4) — deliberately kept
- * as its own file rather than folded into acm.ts.
+ * Evidence for one private CA. Raw epoch values are kept under their
+ * original keys for existing consumers; *Iso keys are the normalized form.
+ */
+export function caMetadata(ca: CertificateAuthority) {
+  const crl = ca.RevocationConfiguration?.CrlConfiguration;
+  return {
+    type: ca.Type,
+    ownerAccount: ca.OwnerAccount,
+    keyAlgorithm: ca.CertificateAuthorityConfiguration?.KeyAlgorithm,
+    signingAlgorithm: ca.CertificateAuthorityConfiguration?.SigningAlgorithm,
+    subjectOrganization: ca.CertificateAuthorityConfiguration?.Subject?.Organization ?? null,
+    createdAt: ca.CreatedAt,
+    lastStateChangeAt: ca.LastStateChangeAt,
+    notBefore: ca.NotBefore,
+    notAfter: ca.NotAfter,
+    createdAtIso: toIso(ca.CreatedAt),
+    notBeforeIso: toIso(ca.NotBefore),
+    notAfterIso: toIso(ca.NotAfter),
+    restorableUntilIso: toIso(ca.RestorableUntil),
+    failureReason: ca.FailureReason,
+    usageMode: ca.UsageMode,
+    keyStorageSecurityStandard: ca.KeyStorageSecurityStandard,
+    serial: ca.Serial,
+    // Revocation: a CA whose issued certificates cannot be revoked is a gap.
+    crlEnabled: crl?.Enabled ?? false,
+    crlS3BucketName: crl?.S3BucketName ?? null,
+    // BUCKET_OWNER_FULL_CONTROL keeps the CRL bucket private; PUBLIC_READ exposes it.
+    crlS3ObjectAcl: crl?.S3ObjectAcl ?? null,
+    ocspEnabled: ca.RevocationConfiguration?.OcspConfiguration?.Enabled ?? false,
+  };
+}
+
+/**
+ * ACM Private Certificate Authority — a separate API from regular ACM
+ * (acm.ts): this inventories the private CAs themselves.
  *
- * ListCertificateAuthorities is a paginated operation (NextToken), but a
- * single page at MaxResults=100 is acceptable for a first pass per the
- * product's own scope for this scanner — most accounts have far fewer than
- * 100 private CAs.
- *
- * UNVERIFIED against a real account's actual response shape until this runs
- * against a live connection and gets checked -- same disclosed-uncertainty
- * convention as inspector2.ts (request/response shape here is taken from the
- * AWS API reference docs, not exercised against a live ACM PCA account).
+ * ListCertificateAuthorities is paginated (NextToken). The previous version
+ * read one page and treated a failure as "no CAs", both of which finalize
+ * reads as deletion. It now reads every page and reports an incomplete walk.
+ * Each summary already carries RevocationConfiguration, so revocation
+ * evidence costs no extra call.
  */
 export async function scanAcmPca(ctx: ScannerContext): Promise<ScannedResource[]> {
-  const endpoint = `acm-pca.${ctx.region}.amazonaws.com`;
-  const result = await callJsonApi(ctx.creds, {
-    service: 'acm-pca', region: ctx.region, host: endpoint,
+  const walk = await walkJsonRpc<CertificateAuthority>(ctx, {
+    service: 'acm-pca', host: `acm-pca.${ctx.region}.amazonaws.com`,
     target: `${TARGET_PREFIX}.ListCertificateAuthorities`, body: { MaxResults: 100 },
-  });
-  if (!result.ok) {
-    console.error(`ACM PCA ListCertificateAuthorities failed in ${ctx.region} (continuing without it): ${result.errorMessage ?? result.errorCode ?? result.status}`);
-    return [];
-  }
+  }, 'CertificateAuthorities');
+  reportWalk(ctx, walk, 'acm-pca', 'ListCertificateAuthorities');
 
-  const authorities = (result.body as ListCertificateAuthoritiesResponse).CertificateAuthorities ?? [];
-  return authorities.map((ca) => ({
-    resourceTypeKey: 'acm_pca', resourceId: ca.Arn, region: ctx.region,
-    resourceName: ca.CertificateAuthorityConfiguration?.Subject?.CommonName ?? ca.Arn,
-    state: ca.Status,
-    metadata: {
-      type: ca.Type,
-      ownerAccount: ca.OwnerAccount,
-      keyAlgorithm: ca.CertificateAuthorityConfiguration?.KeyAlgorithm,
-      signingAlgorithm: ca.CertificateAuthorityConfiguration?.SigningAlgorithm,
-      createdAt: ca.CreatedAt,
-      lastStateChangeAt: ca.LastStateChangeAt,
-      notBefore: ca.NotBefore,
-      notAfter: ca.NotAfter,
-      failureReason: ca.FailureReason,
-      usageMode: ca.UsageMode,
-      keyStorageSecurityStandard: ca.KeyStorageSecurityStandard,
-      serial: ca.Serial,
-    },
-  }));
+  const seen = new Set<string>();
+  const out: ScannedResource[] = [];
+  for (const ca of walk.items) {
+    if (!ca?.Arn || seen.has(ca.Arn)) continue;
+    seen.add(ca.Arn);
+    out.push({
+      resourceTypeKey: 'acm_pca', resourceId: ca.Arn, region: ctx.region,
+      resourceName: ca.CertificateAuthorityConfiguration?.Subject?.CommonName ?? ca.Arn,
+      state: ca.Status,
+      metadata: caMetadata(ca),
+      relationships: { crlS3BucketName: ca.RevocationConfiguration?.CrlConfiguration?.S3BucketName ?? null },
+    });
+  }
+  return out;
 }

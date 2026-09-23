@@ -3,11 +3,25 @@ import { incompleteSink, DEFAULT_MAX_PAGES, type PaginationTermination } from '.
 import { extractSection, extractListItems, field } from '../xmlList';
 import type { ScannedResource, ScannerContext } from './types';
 import { analyzePrincipalPolicies, parsePolicyDocument, ROLE_ANALYSIS_CAP, type PrincipalPolicyFetcher, type PrivilegeAnalysisResult } from '../iamPrivilegeAnalysis';
+import { accountIdFromArn, summarizePolicy, type PolicySummary } from './policyEvidence';
+import { mapWithConcurrency } from './scannerSupport';
 
 const VERSION = '2010-05-08';
 /** IAM is a global service with a single endpoint — always signed against us-east-1 regardless of which scan region a caller passes in, same convention AWS's own CLI/SDKs use for IAM/STS. */
 const REGION = 'us-east-1';
 const ENDPOINT = 'iam.amazonaws.com';
+
+/**
+ * Principals analysed at once. IAM's control-plane rate limit is low; this is
+ * enough to finish inside a Worker's wall-clock budget without throttling.
+ */
+const ANALYSIS_CONCURRENCY = 3;
+
+/** Service-linked roles are AWS-owned and not editable by the customer. */
+const SERVICE_LINKED_ROLE_PATH = '/aws-service-role/';
+
+/** The credential report's row for the account root user. */
+const ROOT_ACCOUNT_ROW = '<root_account>';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
 export const IAM_RESOURCE_TYPES = ['iam_user', 'iam_role', 'iam_policy', 'iam_group', 'iam_instance_profile', 'iam_oidc_provider', 'iam_saml_provider', 'iam_credential_report'] as const;
@@ -81,7 +95,12 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
   const call = async (
     action: string,
     params?: Record<string, string>,
-    options: { required?: boolean } = {},
+    /**
+     * `record: false` is for EXPECTED intermediate answers -- the credential
+     * report poll answers ReportInProgress until it is ready. Recording those
+     * as failed operations marked every healthy scan `partial`.
+     */
+    options: { required?: boolean; record?: boolean } = {},
   ): Promise<string> => {
     const result = await callQueryApi(ctx.creds, {
       service: 'iam',
@@ -104,14 +123,16 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
      * uses.
      */
     const retired = code === 'UNSUPPORTED_CAPABILITY';
-    operations.push({
-      action,
-      status: retired ? 'not_supported' : 'failed',
-      pages: 0,
-      resources: 0,
-      attempts: result.attempts ?? 1,
-      error: code,
-    });
+    if (options.record !== false) {
+      operations.push({
+        action,
+        status: retired ? 'not_supported' : 'failed',
+        pages: 0,
+        resources: 0,
+        attempts: result.attempts ?? 1,
+        error: code,
+      });
+    }
 
     /**
      * `required` is preserved, and it is load-bearing.
@@ -304,17 +325,34 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
       const roleId = field(r, 'RoleId');
       if (!roleId) continue;
       const roleName = field(r, 'RoleName') ?? undefined;
+      const arn = field(r, 'Arn');
+      const path = field(r, 'Path');
+      const serviceLinked = (path ?? '').startsWith(SERVICE_LINKED_ROLE_PATH);
+      /*
+       * WHO CAN ASSUME THIS ROLE. ListRoles already returns the trust policy
+       * (URL-encoded) for every role, so this costs no extra call. A role
+       * trusting "*" with no condition is assumable by anyone on AWS; one
+       * trusting another account without sts:ExternalId is the classic
+       * confused-deputy exposure. Evidence only -- posture decides severity.
+       */
+      const trust: PolicySummary = summarizePolicy(field(r, 'AssumeRolePolicyDocument'), accountIdFromArn(arn));
       const resource: ScannedResource = {
         resourceTypeKey: 'iam_role',
         resourceId: roleId,
         region: null,
         resourceName: roleName,
         metadata: {
-          arn: field(r, 'Arn'),
-          path: field(r, 'Path'),
+          arn,
+          path,
           createDate: field(r, 'CreateDate'),
           description: field(r, 'Description'),
           maxSessionDuration: field(r, 'MaxSessionDuration'),
+          serviceLinked,
+          trustPolicy: trust,
+          trustAllowsAnonymous: trust.allowsAnonymous,
+          trustExternalAccountIds: trust.externalAccountIds,
+          trustRequiresExternalId: trust.conditionKeys.includes('sts:externalid'),
+          trustRequiresMfa: trust.conditionKeys.includes('aws:multifactorauthpresent'),
         },
       };
       out.push(resource);
@@ -337,6 +375,8 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
           createDate: field(p, 'CreateDate'),
           updateDate: field(p, 'UpdateDate'),
           policyScope: 'Local',
+          isAttachable: field(p, 'IsAttachable') === null ? null : field(p, 'IsAttachable') === 'true',
+          permissionsBoundaryUsageCount: field(p, 'PermissionsBoundaryUsageCount'),
         },
       });
     }
@@ -411,38 +451,48 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
 
     // Real IAM policy-document analysis for the "is this identity
     // over-privileged" leg. The existing cap is retained, but coverage is
-    // explicit in metadata rather than silently looking complete.
-    const managedPolicyDocCache = new Map<string, ReturnType<typeof parsePolicyDocument>>();
+    // explicit in metadata rather than silently looking complete: every
+    // principal that was NOT analysed says why, so posture reports it
+    // NOT_ASSESSED instead of reading a missing privilegeLevel as "fine".
+    //
+    // Cached as PROMISES so concurrent principals that share a managed policy
+    // (AdministratorAccess, ReadOnlyAccess…) fetch it once, not once each.
+    const managedPolicyDocCache = new Map<string, Promise<ReturnType<typeof parsePolicyDocument>>>();
 
-    const fetchManagedPolicyDocument = async (policyArn: string) => {
-      if (managedPolicyDocCache.has(policyArn)) {
-        return managedPolicyDocCache.get(policyArn) ?? null;
-      }
-
-      try {
+    const fetchManagedPolicyDocument = (policyArn: string) => {
+      const cached = managedPolicyDocCache.get(policyArn);
+      if (cached) return cached;
+      const pending = (async () => {
         const policyXml = await call('GetPolicy', { PolicyArn: policyArn });
         const versionId = field(policyXml, 'DefaultVersionId');
-        if (!versionId) {
-          managedPolicyDocCache.set(policyArn, null);
-          return null;
-        }
-
+        if (!versionId) return null;
         const versionXml = await call('GetPolicyVersion', {
           PolicyArn: policyArn,
           VersionId: versionId,
         });
-        const doc = parsePolicyDocument(field(versionXml, 'Document'));
-        managedPolicyDocCache.set(policyArn, doc);
-        return doc;
-      } catch (err) {
-        managedPolicyDocCache.set(policyArn, null);
-        throw err;
-      }
+        return parsePolicyDocument(field(versionXml, 'Document'));
+      })();
+      // A failed fetch is not cached as a success: later principals retry it.
+      pending.catch(() => managedPolicyDocCache.delete(policyArn));
+      managedPolicyDocCache.set(policyArn, pending);
+      return pending;
     };
 
-    const analysisCount = Math.min(principalsToAnalyze.length, ROLE_ANALYSIS_CAP);
+    // Service-linked roles are AWS-owned and uneditable; analysing them spends
+    // the cap on findings nobody can act on.
+    const analysable = principalsToAnalyze.filter(({ resource }) => resource.metadata?.serviceLinked !== true);
+    for (const { resource } of principalsToAnalyze) {
+      if (resource.metadata?.serviceLinked === true) {
+        resource.metadata = { ...resource.metadata, privilegeAnalysisStatus: 'skipped', privilegeAnalysisSkipReason: 'service_linked_role' };
+      }
+    }
+    const toAnalyze = analysable.slice(0, ROLE_ANALYSIS_CAP);
+    for (const { resource } of analysable.slice(ROLE_ANALYSIS_CAP)) {
+      resource.metadata = { ...resource.metadata, privilegeAnalysisStatus: 'skipped', privilegeAnalysisSkipReason: 'analysis_cap' };
+    }
+    const analysisCount = toAnalyze.length;
 
-    for (const { resource, kind, name } of principalsToAnalyze.slice(0, ROLE_ANALYSIS_CAP)) {
+    await mapWithConcurrency(toAnalyze, ANALYSIS_CONCURRENCY, async ({ resource, kind, name }) => {
       const fetcher: PrincipalPolicyFetcher = {
         listAttachedPolicies: async () => {
           const xml = await call(`ListAttached${kind}Policies`, { [`${kind}Name`]: name });
@@ -483,7 +533,7 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
           privilegeAnalysisStatus: 'failed',
           privilegeAnalysisError: err instanceof Error ? err.message : String(err),
         };
-        continue;
+        return;
       }
 
       resource.metadata = {
@@ -494,13 +544,39 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
         inlinePolicies: result.inlinePolicyNames,
         privilegeAnalysisStatus: 'success',
       };
-    }
+    });
+
+    /*
+     * Account-level posture evidence (CIS 1.4 root access keys, 1.5 root MFA,
+     * 1.8–1.9 password policy). Both are single cheap calls and run alongside
+     * the credential report poll below.
+     */
+    const accountSummaryPromise = (async () => {
+      const summaryXml = await call('GetAccountSummary', undefined, { required: false });
+      return parseAccountSummary(summaryXml || null);
+    })();
+
+    const passwordPolicyPromise = (async (): Promise<PasswordPolicyEvidence> => {
+      const res = await callQueryApi(ctx.creds, {
+        service: 'iam', region: REGION, host: ENDPOINT, action: 'GetAccountPasswordPolicy', version: VERSION,
+      });
+      if (res.ok) return parsePasswordPolicy(res.body as string);
+      // NoSuchEntity is a real answer: the account has NO password policy,
+      // which is itself the finding. It is not missing evidence.
+      if (res.errorCode === 'NoSuchEntity' || res.normalizedCode === 'NOT_FOUND' || res.status === 404) {
+        return { ...EMPTY_PASSWORD_POLICY, collected: true, configured: false };
+      }
+      const code = res.normalizedCode ?? res.errorCode ?? res.errorMessage ?? String(res.status);
+      operations.push({ action: 'GetAccountPasswordPolicy', status: 'failed', pages: 0, resources: 0, attempts: res.attempts ?? 1, error: code });
+      return { ...EMPTY_PASSWORD_POLICY };
+    })();
 
     // Credential report: one account-wide resource. AWS generates it
     // asynchronously, so "not ready yet" is represented explicitly instead
     // of being confused with an account that has no IAM users.
     let credentialReportStatus: 'available' | 'not_ready' | 'failed' = 'available';
     let credentialReportError: string | undefined;
+    let reportEvidence: CredentialReportEvidence = { ...EMPTY_REPORT_EVIDENCE };
 
     try {
       /**
@@ -508,19 +584,19 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
        * report is not readable for a few seconds; GetCredentialReport reports
        * ReportInProgress until then.
        *
-       * This used to work by accident. The hand-rolled retry loop that
+       * This used to work by accident: the hand-rolled retry loop that
        * wrapped every IAM call retried with backoff, and that incidental
        * delay was long enough for the report to become ready. Removing that
-       * loop -- correct in itself, it duplicated `withRetry` -- removed the
-       * accidental poll with it, and credential-report acquisition silently
-       * started failing: identities kept being written, just without
-       * mfaActive, accessKeys or passwordEnabled, and `mfa_enabled` went NULL
+       * loop removed the accidental poll with it, and mfa_enabled went NULL
        * for every human in the estate.
        *
-       * Polling explicitly is what the API actually asks for, so this is now
-       * deliberate rather than a side effect. Bounded: a report that is still
-       * not ready after these attempts is reported `not_ready`, never
-       * confused with an account that has no IAM users.
+       * Polling explicitly is what the API asks for, so it is deliberate
+       * rather than a side effect. Bounded: a report still not ready after
+       * these attempts is reported `not_ready`, never confused with an
+       * account that has no IAM users. Intermediate "not ready" answers are
+       * not recorded as failed operations (`record: false`) -- they are the
+       * expected shape of an asynchronous API, and recording them marked
+       * every healthy scan `partial`.
        */
       await call('GenerateCredentialReport');
 
@@ -529,13 +605,17 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
       let content: string | null = null;
       for (const delay of REPORT_POLL_DELAYS_MS) {
         if (delay > 0) await new Promise<void>((r) => setTimeout(r, delay));
-        reportXml = await call('GetCredentialReport', undefined, { required: false });
+        reportXml = await call('GetCredentialReport', undefined, { required: false, record: false });
         content = field(reportXml, 'Content');
         if (content) break;
       }
 
       if (!content) {
         credentialReportStatus = 'not_ready';
+        operations.push({
+          action: 'GetCredentialReport', status: 'partial', pages: 0, resources: 0,
+          attempts: REPORT_POLL_DELAYS_MS.length, error: 'credential report not ready after polling',
+        });
       } else {
         const csv = decodeBase64Text(content);
         const rows = parseCsv(csv);
@@ -571,7 +651,12 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
             .map((r) => [r.resourceName as string, r]),
         );
 
-        for (const row of dataRows) {
+        // The root user is reported separately: it is not an IAM user, and
+        // counting it among "users" made totalUsers off by one.
+        const rootRow = userCol >= 0 ? dataRows.find((row) => row[userCol] === ROOT_ACCOUNT_ROW) : undefined;
+        const userRows = userCol >= 0 ? dataRows.filter((row) => row[userCol] !== ROOT_ACCOUNT_ROW) : dataRows;
+
+        for (const row of userRows) {
           if (
             mfaCol >= 0 &&
             pwEnabledCol >= 0 &&
@@ -616,19 +701,22 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
           };
         }
 
-        out.push({
-          resourceTypeKey: 'iam_credential_report',
-          resourceId: 'credential-report',
-          region: null,
-          resourceName: 'IAM Credential Report',
-          metadata: {
-            generatedTime: field(reportXml, 'GeneratedTime'),
-            totalUsers: dataRows.length,
-            usersWithoutMfa,
-            usersWithStaleAccessKeys: usersWithStaleKeys,
-            status: 'available',
-          },
-        });
+        reportEvidence = {
+          generatedTime: field(reportXml, 'GeneratedTime'),
+          totalUsers: userRows.length,
+          usersWithoutMfa,
+          usersWithStaleAccessKeys: usersWithStaleKeys,
+          root: rootRow
+            ? {
+              mfaActive: mfaCol >= 0 ? rootRow[mfaCol] === 'true' : null,
+              accessKey1Active: key1ActiveCol >= 0 ? rootRow[key1ActiveCol] === 'true' : null,
+              accessKey2Active: key2ActiveCol >= 0 ? rootRow[key2ActiveCol] === 'true' : null,
+              passwordLastUsed: nullIfNA(rootRow[pwLastUsedCol]),
+              accessKey1LastUsedDate: nullIfNA(rootRow[key1LastUsedCol]),
+              accessKey2LastUsedDate: nullIfNA(rootRow[key2LastUsedCol]),
+            }
+            : null,
+        };
       }
     } catch (err) {
       credentialReportStatus = 'failed';
@@ -636,11 +724,34 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
       recordOptionalFailure('CredentialReport', err);
     }
 
+    const [accountSummary, passwordPolicy] = await Promise.all([accountSummaryPromise, passwordPolicyPromise]);
+
+    /*
+     * The account-level row is written on EVERY run. It used to be written
+     * only when the report was available -- so a not-ready report made the
+     * row vanish, and finalize tombstoned it. Now an unavailable report is an
+     * explicit status with null counts (NOT_ASSESSED), never a deletion.
+     */
+    out.push({
+      resourceTypeKey: 'iam_credential_report',
+      resourceId: 'credential-report',
+      region: null,
+      resourceName: 'IAM Credential Report',
+      metadata: {
+        ...reportEvidence,
+        status: credentialReportStatus,
+        ...(credentialReportError ? { error: credentialReportError } : {}),
+        accountSummary,
+        passwordPolicy,
+      },
+    });
+
     const completedAt = new Date().toISOString();
     const diagnostics: IamScanDiagnostics = {
       scanner: 'iam',
       scanner_version: 'v1',
-      status: operations.some((operation) => operation.status === 'failed') ? 'partial' : 'success',
+      // A page-capped or malformed walk is as incomplete as a failed call.
+      status: operations.some((operation) => operation.status === 'failed' || operation.status === 'partial') ? 'partial' : 'success',
       startedAt,
       completedAt,
       operations,
@@ -653,9 +764,11 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
       ...diagnostics,
       principalAnalysis: {
         totalPrincipals: principalsToAnalyze.length,
+        eligiblePrincipals: analysable.length,
         analyzedPrincipals: analysisCount,
+        skippedServiceLinkedRoles: principalsToAnalyze.length - analysable.length,
         cap: ROLE_ANALYSIS_CAP,
-        capped: principalsToAnalyze.length > ROLE_ANALYSIS_CAP,
+        capped: analysable.length > ROLE_ANALYSIS_CAP,
       },
       credentialReport: {
         status: credentialReportStatus,
@@ -692,26 +805,31 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
   }
 }
 
-/** Decode AWS credential-report Content robustly for both browser and Node runtimes. */
-function decodeBase64Text(value: string): string {
-  try {
-    if (typeof atob === 'function') {
-      const binary = atob(value);
-      const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-      return new TextDecoder().decode(bytes);
-    }
-  } catch {
-    // Fall through to Buffer when running in Node.
+/**
+ * Decode AWS credential-report Content (base64 CSV). `atob` exists on Workers
+ * and on Node 16+. The previous version swallowed a decode error and then
+ * reported "No base64 decoder available", which misdirected every
+ * investigation of a malformed report.
+ */
+export function decodeBase64Text(value: string): string {
+  if (typeof atob !== 'function') {
+    throw new Error('No base64 decoder available in the current runtime');
   }
-
-  throw new Error('No base64 decoder available in the current runtime');
+  let binary: string;
+  try {
+    binary = atob(value.replace(/\s+/g, ''));
+  } catch (err) {
+    throw new Error(`Credential report content is not valid base64: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
 
 /**
  * Minimal RFC-4180-compatible CSV parser for AWS credential reports.
  * Handles quoted fields, escaped quotes, CRLF and commas/newlines inside quotes.
  */
-function parseCsv(input: string): string[][] {
+export function parseCsv(input: string): string[][] {
   const rows: string[][] = [];
   let row: string[] = [];
   let value = '';
@@ -757,13 +875,134 @@ function parseCsv(input: string): string[][] {
   return rows.filter((r) => r.some((v) => v.length > 0));
 }
 
-/** The credential report CSV uses the literal string "N/A" (and "not_supported" for password fields on roles/service-linked contexts) for fields that don't apply — normalized to null so downstream consumers don't have to special-case string sentinels. */
-function nullIfNA(value: string | undefined): string | null {
+/**
+ * The credential report CSV uses literal sentinels for fields that don't
+ * apply: "N/A", "not_supported" (password fields on the root row) and
+ * "no_information" (a password never used since AWS began tracking it).
+ * Normalized to null so downstream consumers don't have to special-case them.
+ */
+export function nullIfNA(value: string | undefined): string | null {
   if (!value) return null;
   const normalized = value.trim();
-  if (!normalized || normalized === 'N/A' || normalized === 'not_supported') return null;
+  if (!normalized || normalized === 'N/A' || normalized === 'not_supported' || normalized === 'no_information') return null;
   return normalized;
 }
+
+// ── Account-level evidence ──────────────────────────────────────────────────
+
+export interface AccountSummaryEvidence {
+  collected: boolean;
+  /** Root user has MFA (CIS 1.5). */
+  accountMfaEnabled: boolean | null;
+  /** Root user has access keys (CIS 1.4). */
+  accountAccessKeysPresent: boolean | null;
+  accountSigningCertificatesPresent: boolean | null;
+  users: number | null;
+  roles: number | null;
+  groups: number | null;
+  policies: number | null;
+  mfaDevices: number | null;
+  mfaDevicesInUse: number | null;
+}
+
+/** GetAccountSummary's <SummaryMap><entry><key/><value/></entry>… */
+export function parseAccountSummary(xml: string | null): AccountSummaryEvidence {
+  const empty: AccountSummaryEvidence = {
+    collected: false, accountMfaEnabled: null, accountAccessKeysPresent: null, accountSigningCertificatesPresent: null,
+    users: null, roles: null, groups: null, policies: null, mfaDevices: null, mfaDevicesInUse: null,
+  };
+  if (!xml) return empty;
+  const map = new Map<string, number>();
+  for (const entry of extractListItems(extractSection(xml, 'SummaryMap'), 'entry')) {
+    const key = field(entry, 'key');
+    const value = Number(field(entry, 'value'));
+    if (key && Number.isFinite(value)) map.set(key, value);
+  }
+  if (map.size === 0) return empty;
+  const flag = (k: string) => (map.has(k) ? (map.get(k) ?? 0) > 0 : null);
+  const num = (k: string) => map.get(k) ?? null;
+  return {
+    collected: true,
+    accountMfaEnabled: flag('AccountMFAEnabled'),
+    accountAccessKeysPresent: flag('AccountAccessKeysPresent'),
+    accountSigningCertificatesPresent: flag('AccountSigningCertificatesPresent'),
+    users: num('Users'), roles: num('Roles'), groups: num('Groups'), policies: num('Policies'),
+    mfaDevices: num('MFADevices'), mfaDevicesInUse: num('MFADevicesInUse'),
+  };
+}
+
+export interface PasswordPolicyEvidence {
+  /** false when the policy could not be read (NOT_ASSESSED). */
+  collected: boolean;
+  /** false when the account has no password policy at all. */
+  configured: boolean | null;
+  minimumPasswordLength: number | null;
+  requireSymbols: boolean | null;
+  requireNumbers: boolean | null;
+  requireUppercaseCharacters: boolean | null;
+  requireLowercaseCharacters: boolean | null;
+  allowUsersToChangePassword: boolean | null;
+  expirePasswords: boolean | null;
+  maxPasswordAge: number | null;
+  passwordReusePrevention: number | null;
+  hardExpiry: boolean | null;
+}
+
+export const EMPTY_PASSWORD_POLICY: PasswordPolicyEvidence = {
+  collected: false, configured: null, minimumPasswordLength: null, requireSymbols: null, requireNumbers: null,
+  requireUppercaseCharacters: null, requireLowercaseCharacters: null, allowUsersToChangePassword: null,
+  expirePasswords: null, maxPasswordAge: null, passwordReusePrevention: null, hardExpiry: null,
+};
+
+export function parsePasswordPolicy(xml: string): PasswordPolicyEvidence {
+  const section = extractSection(xml, 'PasswordPolicy') ?? xml;
+  const bool = (k: string): boolean | null => {
+    const v = field(section, k);
+    return v === null ? null : v === 'true';
+  };
+  const num = (k: string): number | null => {
+    const v = field(section, k);
+    const n = v === null ? NaN : Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  return {
+    collected: true,
+    configured: true,
+    minimumPasswordLength: num('MinimumPasswordLength'),
+    requireSymbols: bool('RequireSymbols'),
+    requireNumbers: bool('RequireNumbers'),
+    requireUppercaseCharacters: bool('RequireUppercaseCharacters'),
+    requireLowercaseCharacters: bool('RequireLowercaseCharacters'),
+    allowUsersToChangePassword: bool('AllowUsersToChangePassword'),
+    expirePasswords: bool('ExpirePasswords'),
+    maxPasswordAge: num('MaxPasswordAge'),
+    passwordReusePrevention: num('PasswordReusePrevention'),
+    hardExpiry: bool('HardExpiry'),
+  };
+}
+
+interface RootCredentialEvidence {
+  mfaActive: boolean | null;
+  accessKey1Active: boolean | null;
+  accessKey2Active: boolean | null;
+  passwordLastUsed: string | null;
+  accessKey1LastUsedDate: string | null;
+  accessKey2LastUsedDate: string | null;
+}
+
+interface CredentialReportEvidence {
+  generatedTime: string | null;
+  /** IAM users in the report, excluding the root row. Null when the report was unavailable. */
+  totalUsers: number | null;
+  usersWithoutMfa: number | null;
+  usersWithStaleAccessKeys: number | null;
+  /** The account root user (CIS 1.4 / 1.5 / 1.7). Null when unavailable. */
+  root: RootCredentialEvidence | null;
+}
+
+const EMPTY_REPORT_EVIDENCE: CredentialReportEvidence = {
+  generatedTime: null, totalUsers: null, usersWithoutMfa: null, usersWithStaleAccessKeys: null, root: null,
+};
 
 export interface CloudIdentityRow {
   connection_id: string; provider: 'aws'; identity_type: 'user' | 'role' | 'group';

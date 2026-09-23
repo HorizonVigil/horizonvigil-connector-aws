@@ -20,8 +20,11 @@ vi.mock('aws4fetch', () => ({
   },
 }));
 
-import { scanEc2 } from './ec2';
+import { EC2_ACTION_RESOURCE_TYPES, EC2_RESOURCE_TYPES, scanEc2 } from './ec2';
 import type { ScannedResource } from './types';
+
+type Failure = { action?: string; normalizedCode?: string };
+type Diagnostics = { status: string; operations: { action: string; pages: number; termination: string; resources: number }[] };
 
 const creds = { accessKeyId: 'AKIA_TEST', secretAccessKey: 'secret' };
 const ctx = { creds, region: 'eu-west-1' };
@@ -45,6 +48,14 @@ function denied() {
 
 const empty = (action: string) => ok(`<${action}Response/>`);
 
+/** Serves one canned body per action; every other Describe* comes back empty. */
+function serveActions(bodies: Record<string, string>): void {
+  fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
+    const { action } = request(init);
+    return bodies[action] !== undefined ? ok(bodies[action]) : empty(action);
+  });
+}
+
 /** Volumes split across two pages; every other Describe* comes back empty. */
 function serveTwoVolumePages(): void {
   fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
@@ -57,6 +68,11 @@ function serveTwoVolumePages(): void {
   });
 }
 
+const diagnosticsOf = (resources: ScannedResource[]) =>
+  (resources[0].metadata as { ec2ScanDiagnostics: Diagnostics }).ec2ScanDiagnostics;
+
+const ofType = (resources: ScannedResource[], type: string) => resources.filter((r) => r.resourceTypeKey === type);
+
 beforeEach(() => {
   fetchMock.mockReset();
 });
@@ -67,7 +83,7 @@ describe('scanEc2 pagination', () => {
 
     const resources = await scanEc2(ctx);
 
-    const volumes = resources.filter((r) => r.resourceTypeKey === 'ebs_volume').map((r) => r.resourceId);
+    const volumes = ofType(resources, 'ebs_volume').map((r) => r.resourceId);
     expect(volumes.sort()).toEqual(['vol-1', 'vol-2']);
   });
 
@@ -76,7 +92,7 @@ describe('scanEc2 pagination', () => {
 
     await scanEc2(ctx);
 
-    const volumeCalls = fetchMock.mock.calls.filter((c) => request(c[1] as RequestInit).action === 'DescribeVolumes');
+    const volumeCalls = fetchMock.mock.calls.filter((c: unknown[]) => request(c[1] as RequestInit).action === 'DescribeVolumes');
     expect(volumeCalls).toHaveLength(2);
     expect(request(volumeCalls[1][1] as RequestInit).token).toBe('page-2');
   });
@@ -84,13 +100,43 @@ describe('scanEc2 pagination', () => {
   it('reports per-operation pages and a success termination when nothing is truncated', async () => {
     serveTwoVolumePages();
 
-    const resources = await scanEc2(ctx);
+    const diagnostics = diagnosticsOf(await scanEc2(ctx));
 
-    const diagnostics = (resources[0].metadata as { ec2ScanDiagnostics: { status: string; operations: { action: string; pages: number; termination: string }[] } }).ec2ScanDiagnostics;
     const volumes = diagnostics.operations.find((o) => o.action === 'DescribeVolumes');
-    expect(volumes).toMatchObject({ pages: 2, termination: 'complete' });
+    expect(volumes).toMatchObject({ pages: 2, termination: 'complete', resources: 2 });
     expect(diagnostics.status).toBe('success');
   });
+
+  it('marks the scan partial and degrades coverage when a page is never reached', async () => {
+    // AWS keeps handing out tokens (a page cap is reached): the types this
+    // scanner covers must not be trusted to prove absence.
+    const failures: Failure[] = [];
+    fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
+      const { action, token } = request(init);
+      if (action === 'DescribeVolumes') {
+        const n = token === null ? 1 : Number(token);
+        return ok(`<DescribeVolumesResponse><volumeSet><item><volumeId>vol-${n}</volumeId></item></volumeSet><NextToken>${n + 1}</NextToken></DescribeVolumesResponse>`);
+      }
+      return empty(action);
+    });
+
+    const resources = await scanEc2({ creds: { ...creds, onCallFailure: (f: Failure) => failures.push(f) }, region: 'eu-west-1' });
+
+    expect(diagnosticsOf(resources).status).toBe('partial');
+    expect(failures.some((f) => f.normalizedCode === 'PAGINATION_TRUNCATED')).toBe(true);
+  });
+
+  it('records diagnostics in a fixed order, so identical scans produce identical evidence', async () => {
+    serveTwoVolumePages();
+    const first = diagnosticsOf(await scanEc2(ctx)).operations.map((o) => o.action);
+    serveTwoVolumePages();
+    const second = diagnosticsOf(await scanEc2(ctx)).operations.map((o) => o.action);
+
+    expect(first).toEqual(second);
+    expect(first[0]).toBe('DescribeInstances');
+    expect(first).toHaveLength(EC2_RESOURCE_TYPES.length);
+  });
+});
 
 describe('scanEc2 failure semantics', () => {
   it('keeps every other operation when one is AccessDenied', async () => {
@@ -109,14 +155,14 @@ describe('scanEc2 failure semantics', () => {
   });
 
   it('reports the denied operation through the shared degraded-coverage sink', async () => {
-    const failures: { action?: string; normalizedCode?: string }[] = [];
+    const failures: Failure[] = [];
     fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
       const { action } = request(init);
       if (action === 'DescribeElasticGpus') return denied();
       return empty(action);
     });
 
-    await scanEc2({ creds: { ...creds, onCallFailure: (f) => failures.push(f) }, region: 'eu-west-1' });
+    await scanEc2({ creds: { ...creds, onCallFailure: (f: Failure) => failures.push(f) }, region: 'eu-west-1' });
 
     // This is what stops finalize from reading the missing elastic_gpu rows as
     // deleted resources.
@@ -133,33 +179,21 @@ describe('scanEc2 failure semantics', () => {
       return empty(action);
     });
 
-    const resources = await scanEc2(ctx);
+    const diagnostics = diagnosticsOf(await scanEc2(ctx));
 
-    const diagnostics = (resources[0].metadata as { ec2ScanDiagnostics: { status: string; operations: { action: string; termination: string }[] } }).ec2ScanDiagnostics;
     expect(diagnostics.operations.find((o) => o.action === 'DescribeVpcs')?.termination).toBe('failed');
     expect(diagnostics.status).toBe('partial');
   });
-});
-  it('marks the scan partial and degrades coverage when a page is never reached', async () => {
-    // AWS keeps handing out tokens (a page cap is reached): the types this
-    // scanner covers must not be trusted to prove absence.
-    const failures: { normalizedCode?: string }[] = [];
-    fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
-      const { action, token } = request(init);
-      if (action === 'DescribeVolumes') {
-        const n = token === null ? 1 : Number(token);
-        return ok(`<DescribeVolumesResponse><volumeSet><item><volumeId>vol-${n}</volumeId></item></volumeSet><NextToken>${n + 1}</NextToken></DescribeVolumesResponse>`);
-      }
-      return empty(action);
-    });
 
-    const resources = await scanEc2({ creds: { ...creds, onCallFailure: (f) => failures.push(f) }, region: 'eu-west-1' });
-
-    const diagnostics = (resources[0].metadata as { ec2ScanDiagnostics: { status: string } }).ec2ScanDiagnostics;
-    expect(diagnostics.status).toBe('partial');
-    expect(failures.some((f) => f.normalizedCode === 'PAGINATION_TRUNCATED')).toBe(true);
+  it('maps every Describe* action to exactly one of its declared resource types', () => {
+    // discovery.ts uses this to degrade ONE type per failed action instead of
+    // all 34. A type with no action here could never be proven present.
+    const mapped = Object.values(EC2_ACTION_RESOURCE_TYPES).sort();
+    expect(mapped).toEqual([...EC2_RESOURCE_TYPES].sort());
+    expect(EC2_ACTION_RESOURCE_TYPES.DescribeElasticGpus).toBe('elastic_gpu');
   });
 });
+
 /**
  * AWS-16 / Blocker 6. The scanner used to store only `inboundRuleCount`, which
  * made open-ingress uncomputable across the whole estate. These assert the
@@ -175,13 +209,7 @@ describe('scanEc2 retains security-group rule evidence', () => {
     `<ipPermissionsEgress><item><ipProtocol>-1</ipProtocol><ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges></item></ipPermissionsEgress>` +
     `</item></securityGroupInfo></DescribeSecurityGroupsResponse>`;
 
-  const serveSg = (permissions: string) => {
-    fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
-      const { action } = request(init);
-      if (action === 'DescribeSecurityGroups') return ok(sgResponse(permissions));
-      return empty(action);
-    });
-  };
+  const serveSg = (permissions: string) => serveActions({ DescribeSecurityGroups: sgResponse(permissions) });
 
   const sgFrom = (resources: ScannedResource[]) =>
     resources.find((r) => r.resourceTypeKey === 'security_group');
@@ -234,5 +262,110 @@ describe('scanEc2 retains security-group rule evidence', () => {
 
     expect(inbound.every((r) => r.direction === 'ingress')).toBe(true);
     expect(outbound.every((r) => r.direction === 'egress')).toBe(true);
+  });
+});
+
+/**
+ * Posture evidence the product's headline checks depend on. Each of these was
+ * either never collected or (public IP) read from an element name EC2 does not
+ * use, so the check could not fire.
+ */
+describe('scanEc2 retains posture evidence', () => {
+  const instanceXml =
+    '<DescribeInstancesResponse><reservationSet><item><reservationId>r-1</reservationId><instancesSet><item>' +
+    '<instanceId>i-1</instanceId><imageId>ami-1</imageId><instanceState><code>16</code><name>running</name></instanceState>' +
+    '<dnsName>ec2-54-1-2-3.eu-west-1.compute.amazonaws.com</dnsName><keyName>ops</keyName><instanceType>t3.micro</instanceType>' +
+    '<placement><availabilityZone>eu-west-1a</availabilityZone></placement><monitoring><state>disabled</state></monitoring>' +
+    '<subnetId>subnet-1</subnetId><vpcId>vpc-1</vpcId><privateIpAddress>10.0.0.5</privateIpAddress><ipAddress>54.1.2.3</ipAddress>' +
+    '<groupSet><item><groupId>sg-1</groupId><groupName>web</groupName></item></groupSet>' +
+    '<blockDeviceMapping><item><deviceName>/dev/xvda</deviceName><ebs><volumeId>vol-9</volumeId></ebs></item></blockDeviceMapping>' +
+    '<iamInstanceProfile><arn>arn:aws:iam::111122223333:instance-profile/app</arn></iamInstanceProfile>' +
+    '<metadataOptions><httpTokens>optional</httpTokens><httpPutResponseHopLimit>1</httpPutResponseHopLimit><httpEndpoint>enabled</httpEndpoint></metadataOptions>' +
+    '</item></instancesSet></item></reservationSet></DescribeInstancesResponse>';
+
+  it('reads the public IP from <ipAddress>, the element EC2 actually returns', async () => {
+    serveActions({ DescribeInstances: instanceXml });
+
+    const [instance] = ofType(await scanEc2(ctx), 'ec2_instance');
+
+    expect(instance.metadata).toMatchObject({ publicIp: '54.1.2.3', privateIp: '10.0.0.5', publicDnsName: 'ec2-54-1-2-3.eu-west-1.compute.amazonaws.com' });
+  });
+
+  it('records IMDS configuration (IMDSv2 enforcement)', async () => {
+    serveActions({ DescribeInstances: instanceXml });
+
+    const [instance] = ofType(await scanEc2(ctx), 'ec2_instance');
+
+    expect(instance.metadata).toMatchObject({ imdsHttpTokens: 'optional', imdsHttpPutResponseHopLimit: 1, imdsHttpEndpoint: 'enabled' });
+  });
+
+  it('keeps instance relationships for the resource graph', async () => {
+    serveActions({ DescribeInstances: instanceXml });
+
+    const [instance] = ofType(await scanEc2(ctx), 'ec2_instance');
+
+    expect(instance.relationships).toMatchObject({
+      vpcId: 'vpc-1', subnetId: 'subnet-1', securityGroupIds: ['sg-1'], volumeIds: ['vol-9'],
+      instanceProfileArn: 'arn:aws:iam::111122223333:instance-profile/app',
+    });
+    expect(instance.state).toBe('running');
+  });
+
+  it('records whether a self-owned AMI is public', async () => {
+    serveActions({ DescribeImages: '<DescribeImagesResponse><imagesSet><item><imageId>ami-1</imageId><imageState>available</imageState><isPublic>true</isPublic></item></imagesSet></DescribeImagesResponse>' });
+
+    const [ami] = ofType(await scanEc2(ctx), 'ec2_ami');
+
+    expect(ami.metadata?.isPublic).toBe(true);
+  });
+
+  it('records whether a subnet auto-assigns public IPs', async () => {
+    serveActions({ DescribeSubnets: '<DescribeSubnetsResponse><subnetSet><item><subnetId>subnet-1</subnetId><vpcId>vpc-1</vpcId><mapPublicIpOnLaunch>true</mapPublicIpOnLaunch></item></subnetSet></DescribeSubnetsResponse>' });
+
+    const [subnet] = ofType(await scanEc2(ctx), 'subnet');
+
+    expect(subnet.metadata?.mapPublicIpOnLaunch).toBe(true);
+  });
+
+  it('keeps network ACL entries, not just a count', async () => {
+    serveActions({
+      DescribeNetworkAcls:
+        '<DescribeNetworkAclsResponse><networkAclSet><item><networkAclId>acl-1</networkAclId><vpcId>vpc-1</vpcId><default>true</default>' +
+        '<entrySet><item><ruleNumber>100</ruleNumber><protocol>6</protocol><ruleAction>allow</ruleAction><egress>false</egress>' +
+        '<cidrBlock>0.0.0.0/0</cidrBlock><portRange><from>22</from><to>22</to></portRange></item></entrySet>' +
+        '<associationSet><item><networkAclAssociationId>aclassoc-1</networkAclAssociationId><subnetId>subnet-1</subnetId></item></associationSet>' +
+        '</item></networkAclSet></DescribeNetworkAclsResponse>',
+    });
+
+    const [acl] = ofType(await scanEc2(ctx), 'network_acl');
+
+    expect(acl.metadata?.entryCount).toBe(1);
+    expect((acl.metadata?.entries as unknown[])[0]).toMatchObject({ ruleNumber: 100, protocol: 'tcp', ruleAction: 'allow', egress: false, cidrBlock: '0.0.0.0/0', fromPort: 22, toPort: 22 });
+    expect(acl.relationships?.subnetIds).toEqual(['subnet-1']);
+  });
+
+  it('keeps routes and flags an internet-gateway route', async () => {
+    serveActions({
+      DescribeRouteTables:
+        '<DescribeRouteTablesResponse><routeTableSet><item><routeTableId>rtb-1</routeTableId><vpcId>vpc-1</vpcId>' +
+        '<routeSet><item><destinationCidrBlock>10.0.0.0/16</destinationCidrBlock><gatewayId>local</gatewayId><state>active</state></item>' +
+        '<item><destinationCidrBlock>0.0.0.0/0</destinationCidrBlock><gatewayId>igw-1</gatewayId><state>active</state></item></routeSet>' +
+        '<associationSet><item><routeTableAssociationId>rtbassoc-1</routeTableAssociationId><subnetId>subnet-1</subnetId><main>false</main></item></associationSet>' +
+        '</item></routeTableSet></DescribeRouteTablesResponse>',
+    });
+
+    const [rt] = ofType(await scanEc2(ctx), 'route_table');
+
+    expect(rt.metadata).toMatchObject({ routeCount: 2, hasInternetGatewayRoute: true });
+    expect(rt.relationships?.subnetIds).toEqual(['subnet-1']);
+    expect(rt.isDefault).toBe(false);
+  });
+
+  it('marks an unassociated Elastic IP', async () => {
+    serveActions({ DescribeAddresses: '<DescribeAddressesResponse><addressesSet><item><publicIp>3.3.3.3</publicIp><allocationId>eipalloc-1</allocationId><domain>vpc</domain></item></addressesSet></DescribeAddressesResponse>' });
+
+    const [eip] = ofType(await scanEc2(ctx), 'elastic_ip');
+
+    expect(eip.metadata?.associated).toBe(false);
   });
 });
