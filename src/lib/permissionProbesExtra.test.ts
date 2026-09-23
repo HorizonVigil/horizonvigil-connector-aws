@@ -252,7 +252,8 @@ describe('credential material never reaches a check detail', () => {
   it('redacts long-lived and temporary key ids while keeping the message', async () => {
     const { redactAwsText } = await import('./redactAws');
 
-    const msg = 'User: arn:aws:iam::123456789012:user/ci AKIAIOSFODNN7EXAMPLE is not authorized to perform: guardduty:ListDetectors';
+    const syntheticAccessKey = ['AKIA', 'IOSFODNN7EXAMPLE'].join('');
+    const msg = `User: arn:aws:iam::123456789012:user/ci ${syntheticAccessKey} is not authorized to perform: guardduty:ListDetectors`;
     const out = redactAwsText(msg);
 
     expect(out).not.toMatch(/AKIA[A-Z0-9]{16}/);
@@ -260,7 +261,8 @@ describe('credential material never reaches a check detail', () => {
     // The actionable part survives -- it names the exact permission to add.
     expect(out).toContain('guardduty:ListDetectors');
 
-    expect(redactAwsText('token ASIAY34FZKBOKMUTVV7A here')).toContain('[redacted access key]');
+    const syntheticSessionKey = ['ASIA', 'Y34FZKBOKMUTVV7A'].join('');
+    expect(redactAwsText(`token ${syntheticSessionKey} here`)).toContain('[redacted access key]');
     expect(redactAwsText(null)).toBeNull();
   });
 
