@@ -77,71 +77,68 @@ describe('cloudbuild.yaml never deploys a mutable tag', () => {
 });
 
 describe('deploy.yml never deploys a mutable tag', () => {
-  it('builds from the commit SHA', () => {
-    expect(WORKFLOW_CODE).toContain('TAG="${{ github.sha }}"');
+  /**
+   * Production deploys from cloudbuild.yaml ONLY. `main` removed the
+   * production deploy job from GitHub Actions (the same "stop deploying from
+   * GitHub Actions" change already applied to admin, cost, resources and
+   * llm), so this workflow builds, tests, and deploys the separate TEST
+   * project — nothing else.
+   *
+   * That is asserted rather than assumed: if a production deploy job is ever
+   * added back here, it reintroduces a second production path that the
+   * cloudbuild guards do not cover, and this fails.
+   */
+  it('has no production deploy job — cloudbuild.yaml is the only prod path', () => {
+    // Scoped to the jobs block — `on:` has two-space keys too (`push:`).
+    const jobsBlock = WORKFLOW.slice(WORKFLOW.indexOf('\njobs:'));
+    const jobs = [...jobsBlock.matchAll(/^ {2}([a-z][a-z0-9-]*):$/gm)].map((m) => m[1]);
+    expect(jobs).toEqual(['build-and-test', 'deploy-test']);
+    expect(jobs).not.toContain('deploy');
   });
 
-  it('refuses anything that is not a 40-hex commit SHA', () => {
+  it('the one deploy it does perform is guarded too', () => {
+    expect(WORKFLOW_CODE).toContain('TAG="${{ github.sha }}"');
     expect(WORKFLOW_CODE).toMatch(/\^\[0-9a-f\]\{40\}\$/);
     expect(WORKFLOW_CODE).toMatch(/REFUSING/);
   });
 
   it('never references a :latest tag in an image or deploy line', () => {
-    expect(WORKFLOW_CODE).not.toMatch(/--image=[^\n]*:latest/);
+    expect(WORKFLOW_CODE).not.toMatch(/--image=\S*:latest/);
     expect(WORKFLOW_CODE).not.toMatch(/IMAGE="[^"]*:latest"/);
   });
 
-  it('captures the pushed digest', () => {
-    expect(WORKFLOW_CODE).toContain('IMAGE_DIGEST=');
-    expect(WORKFLOW_CODE).toMatch(/RepoDigests/);
-  });
-
-  it('verifies the serving revision and refuses a mutable one', () => {
-    expect(WORKFLOW_CODE).toContain('latestReadyRevisionName');
-    expect(WORKFLOW_CODE).toContain('production is serving a mutable tag');
-  });
-
-  it('fails the deploy if the tag moved between push and deploy', () => {
-    expect(WORKFLOW_CODE).toContain('Another build moved the tag');
+  it('every action is pinned to a commit SHA (AWS-L1)', () => {
+    // Re-applied after the merge: origin/main branched before L1 and its
+    // version had reverted to mutable tags.
+    const uses = [...WORKFLOW.matchAll(/uses: (\S+)/g)].map((m) => m[1]);
+    expect(uses.length).toBeGreaterThan(0);
+    for (const u of uses) expect(u, u).toMatch(/@[0-9a-f]{40}$/);
   });
 });
 
 /**
- * Requirement 8. This workflow sets the environment with `--set-env-vars`,
- * which REPLACES the whole set rather than merging — so a variable missing
- * from that payload is silently deleted on the next deploy.
+ * Requirement 8, after the merge.
  *
- * Measured 2026-09-22: `ALERTS_API_URL` was set on the live service to wire
- * the C1 alert-evaluation hook, and was absent from this payload. The next
- * Actions deploy would have wiped it and returned the hook to its "not
- * configured" 503 — failing silently, exactly the way the original C1 defect
- * did.
+ * The production deploy job that carried `--set-env-vars` is gone from this
+ * workflow, and cloudbuild.yaml deliberately passes NO `--set-env-vars` — so
+ * `gcloud run deploy --image` preserves the service's existing environment
+ * instead of replacing it. That is what keeps all twelve variables, including
+ * ALERTS_API_URL, alive across a deploy.
+ *
+ * Verified live on revision connector-aws-00226-5h9: 12/12 present and the C1
+ * hook still answering.
  */
-describe('the workflow preserves every variable the service needs', () => {
-  const payload = /--set-env-vars="\^##\^(.*?)"/s.exec(WORKFLOW)?.[1] ?? '';
-  const names = new Set(payload.split('##').filter((p) => p.includes('=')).map((p) => p.split('=')[0]));
-
-  /** Every variable connector-aws reads. Sourced from the live service, 2026-09-22. */
-  const REQUIRED = [
-    'SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY',
-    'ALLOWED_ORIGIN', 'DB_SCHEMA', 'ENCRYPTION_KEY',
-    'INTERNAL_SCAN_SECRET', 'INTERNAL_COST_SYNC_SECRET', 'POST_SCAN_HOOK_SECRET',
-    'AUTOMATION_API_URL', 'COST_OPTIMIZATION_API_URL', 'ALERTS_API_URL',
-  ];
-
-  it('sets a non-empty environment payload', () => {
-    expect(names.size).toBeGreaterThan(0);
+describe('a deploy preserves the environment rather than replacing it', () => {
+  it('cloudbuild does not rewrite the environment', () => {
+    expect(CLOUDBUILD_CODE).not.toContain('--set-env-vars');
   });
 
-  it.each(REQUIRED)('still sets %s', (name) => {
-    expect(names.has(name), `${name} would be WIPED by the next deploy`).toBe(true);
-  });
-
-  it('ALERTS_API_URL specifically — the one that was missing', () => {
-    // Without it the C1 alert hook reverts to 503 on the next deploy, and
-    // nothing would say so until someone went looking for an alert that
-    // never arrived.
-    expect(names.has('ALERTS_API_URL')).toBe(true);
-    expect(payload).toContain('ALERTS_API_URL=https://observability-');
+  it('the remaining workflow env payload targets the TEST project, not production', () => {
+    const payload = /--set-env-vars="([^"]*)"/.exec(WORKFLOW)?.[1] ?? '';
+    if (payload) {
+      // The production Supabase project must never be written by the
+      // test-environment deploy.
+      expect(payload).not.toContain('dvyoghaqeknyyrdujssi');
+    }
   });
 });

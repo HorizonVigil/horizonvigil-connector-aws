@@ -1,6 +1,7 @@
 name: Security Checks
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, test]
   pull_request:
@@ -13,6 +14,15 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 22 }
+
+      - name: Verify private dependency credential
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "::error::GH_PAT is not configured for the private @horizonvigil/shared-lib dependency"
+            exit 1
+          fi
 
       # package-lock resolves the private shared library to git+ssh. Rewrite
       # that transport to HTTPS and supply the repository-read token via netrc
@@ -43,9 +53,11 @@ jobs:
         run: npm audit --omit=dev --audit-level=high
 
       - name: Secret scan
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          docker run --rm
+          -v "$PWD:/repo"
+          zricethezav/gitleaks:v8.30.0
+          detect --source=/repo --config=/repo/.gitleaks.toml --redact --no-banner --verbose
 
       # Container scan only applies to services with a Dockerfile.
       - name: Check for a Dockerfile
@@ -54,7 +66,10 @@ jobs:
 
       - name: Build image for scanning
         if: steps.has-dockerfile.outputs.exists == 'true'
-        run: docker build -t local-scan-target:${{ github.sha }} .
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          DOCKER_BUILDKIT: "1"
+        run: docker build --secret id=gh_pat,env=GH_PAT -t local-scan-target:${{ github.sha }} .
 
       # scanners: vuln only -- secret detection is gitleaks' job (above).
       # Running both here flagged UI placeholder copy (a GCP-key JSON

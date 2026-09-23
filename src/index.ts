@@ -28,6 +28,8 @@ import { collectionRunRoutes } from './routes/collectionRuns';
 import { capabilityRoutes } from './routes/capabilities';
 import { lineageRoutes } from './routes/lineage';
 import { disconnectImpactRoutes } from './routes/disconnectImpact';
+import { internalChangeSyncRoutes } from './routes/internalChangeSync';
+import { evidenceRoutes } from './routes/evidence';
 
 // §14.6: publish this service's contract at /openapi.json, generated
 // from the routes registered below rather than hand-maintained.
@@ -82,6 +84,8 @@ app.route('/api/aws-accounts', capabilityRoutes);
 app.route('/api/aws-accounts', collectionRunRoutes);
 app.route('/api/aws-accounts', lineageRoutes);
 app.route('/api/aws-accounts', disconnectImpactRoutes);
+app.route('/api/aws-accounts', internalChangeSyncRoutes);
+app.route('/api/aws-accounts', evidenceRoutes);
 
 
 /**
@@ -134,5 +138,7 @@ app.route('/api/v1/aws', capabilityRoutes);
 app.route('/api/v1/aws', collectionRunRoutes);
 app.route('/api/v1/aws', lineageRoutes);
 app.route('/api/v1/aws', disconnectImpactRoutes);
+app.route('/api/v1/aws', internalChangeSyncRoutes);
+app.route('/api/v1/aws', evidenceRoutes);
 
 export default app;

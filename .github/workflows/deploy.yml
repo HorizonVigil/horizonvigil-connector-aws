@@ -1,4 +1,4 @@
-name: Deploy to Cloud Run
+name: Build and Test
 
 on:
   push:
@@ -18,6 +18,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 22 }
+      - name: Verify private dependency credential
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "::error::GH_PAT is not configured for the private @horizonvigil/shared-lib dependency"
+            exit 1
+          fi
       - name: Configure git for private shared-lib dependency
         run: |
           git config --local --unset-all http.https://github.com/.extraheader || true
@@ -28,155 +36,6 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
-
-  deploy:
-    needs: build-and-test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - id: auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
-
-      - run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
-
-      - name: Build and push image
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-          DOCKER_BUILDKIT: "1"
-        run: |
-          # AWS-C2. `github.sha` is always the exact commit being built, so this
-          # path has never used a mutable tag -- but "has never" is not a
-          # control. The guard makes deploying one structurally impossible
-          # rather than relying on this line staying correct.
-          TAG="${{ github.sha }}"
-          case "$TAG" in
-            latest|Latest|LATEST)
-              echo "REFUSING: '$TAG' is a mutable tag and must never be deployed." >&2
-              exit 1 ;;
-          esac
-          if ! printf '%s' "$TAG" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "REFUSING: deploy tag '$TAG' is not a 40-hex commit SHA." >&2
-            exit 1
-          fi
-
-          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.SERVICE }}:$TAG"
-          docker build --secret id=gh_pat,env=GH_PAT -t "$IMAGE" .
-          docker push "$IMAGE"
-
-          # Digest of what was just pushed, so the deploy can be verified
-          # against CONTENT and not against a tag string. A tag can be moved;
-          # a digest cannot.
-          DIGEST="$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
-          if [ -z "$DIGEST" ]; then
-            echo "REFUSING: could not resolve a digest for $IMAGE after push." >&2
-            exit 1
-          fi
-
-          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
-          echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
-          echo "Pushed $IMAGE @ $DIGEST"
-
-      # --set-env-vars REPLACES the whole environment, so any variable not
-      # listed on the deploy line is destroyed by the next deploy. That is the
-      # right, reproducible default -- but only if every required variable is
-      # actually listed AND actually has a value.
-      #
-      # On 2026-09-16 it was neither. INTERNAL_COST_SYNC_SECRET had been set by
-      # hand on the service and was never added here, so the next deploy wiped
-      # it. POST /internal/run-due-cost-syncs fails closed without it, and AWS
-      # cost collection then returned 503 in 3ms every day for six days. The
-      # only trace was a status code on a Cloud Scheduler job nobody watches:
-      # the connection still read `connected`, and the billing_cost_explorer
-      # capability still read `available` from its last success on 09-15.
-      #
-      # An empty GitHub secret expands to an empty string and fails-closed in
-      # exactly the same silent way, so absence is checked here rather than
-      # discovered a week later.
-      - name: Verify required deploy secrets are present
-        env:
-          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          INTERNAL_SCAN_SECRET: ${{ secrets.INTERNAL_SCAN_SECRET }}
-          INTERNAL_COST_SYNC_SECRET: ${{ secrets.INTERNAL_COST_SYNC_SECRET }}
-          POST_SCAN_HOOK_SECRET: ${{ secrets.POST_SCAN_HOOK_SECRET }}
-        run: |
-          missing=""
-          for name in ENCRYPTION_KEY SUPABASE_SERVICE_ROLE_KEY INTERNAL_SCAN_SECRET \
-                      INTERNAL_COST_SYNC_SECRET POST_SCAN_HOOK_SECRET; do
-            # Indirect expansion; never echo the value itself.
-            if [ -z "${!name}" ]; then missing="$missing $name"; fi
-          done
-          if [ -n "$missing" ]; then
-            echo "::error::Missing repository secret(s):$missing"
-            echo "Each one disables a scheduled job that fails closed and stays silent."
-            exit 1
-          fi
-          echo "All required deploy secrets are present."
-
-      - name: Deploy to Cloud Run
-        env:
-          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          INTERNAL_SCAN_SECRET: ${{ secrets.INTERNAL_SCAN_SECRET }}
-          INTERNAL_COST_SYNC_SECRET: ${{ secrets.INTERNAL_COST_SYNC_SECRET }}
-          POST_SCAN_HOOK_SECRET: ${{ secrets.POST_SCAN_HOOK_SECRET }}
-        run: |
-          gcloud run deploy ${{ env.SERVICE }} \
-            --image="${{ env.IMAGE }}" \
-            --region=${{ env.REGION }} \
-            --platform=managed \
-            --allow-unauthenticated \
-            --min-instances=0 \
-            --max-instances=1 \
-            --memory=256Mi \
-            --timeout=1800 \
-            --set-env-vars="^##^SUPABASE_URL=https://dvyoghaqeknyyrdujssi.supabase.co##SUPABASE_ANON_KEY=sb_publishable_gRal6V08wNzz0drb1F1QAw_Na-j9XoL##ALLOWED_ORIGIN=https://frontend-7yo5yw7xca-uc.a.run.app|https://frontend-153395452624.us-central1.run.app|https://horizonvigil.com|https://www.horizonvigil.com##DB_SCHEMA=public##AUTOMATION_API_URL=https://automation-7yo5yw7xca-uc.a.run.app##ENCRYPTION_KEY=${ENCRYPTION_KEY}##SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}##INTERNAL_SCAN_SECRET=${INTERNAL_SCAN_SECRET}##INTERNAL_COST_SYNC_SECRET=${INTERNAL_COST_SYNC_SECRET}##POST_SCAN_HOOK_SECRET=${POST_SCAN_HOOK_SECRET}##COST_OPTIMIZATION_API_URL=https://cost-7yo5yw7xca-uc.a.run.app##ALERTS_API_URL=https://observability-7yo5yw7xca-uc.a.run.app"
-
-      # AWS-C2 (requirements 5, 9, 10). A successful `gcloud run deploy` means
-      # the API accepted the request, not that the revision now serving traffic
-      # is the one just built. The 2026-09-22 incident was exactly a revision
-      # serving an image nobody in that session had deployed.
-      - name: Verify the deployed image is the one we built
-        run: |
-          SERVING_IMAGE="$(gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }}             --format='value(spec.template.spec.containers[0].image)')"
-          SERVING_REV="$(gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }}             --format='value(status.latestReadyRevisionName)')"
-
-          if [ "$SERVING_IMAGE" != "${{ env.IMAGE }}" ]; then
-            echo "FAILED: revision $SERVING_REV serves '$SERVING_IMAGE', expected '${{ env.IMAGE }}'." >&2
-            exit 1
-          fi
-          case "$SERVING_IMAGE" in
-            *:latest)
-              echo "FAILED: production is serving a mutable tag." >&2
-              exit 1 ;;
-          esac
-
-          # And that the tag still resolves to the content we built. This is
-          # what catches a concurrent build having moved the tag between our
-          # push and our deploy.
-          NOW_DIGEST="$(gcloud artifacts docker images describe "${{ env.IMAGE }}"             --format='value(image_summary.digest)' 2>/dev/null || true)"
-          if [ -n "$NOW_DIGEST" ] && [ "$NOW_DIGEST" != "${{ env.IMAGE_DIGEST }}" ]; then
-            echo "FAILED: ${{ env.IMAGE }} now resolves to $NOW_DIGEST, but ${{ env.IMAGE_DIGEST }} was built here." >&2
-            echo "Another build moved the tag. This is the AWS-C2 incident." >&2
-            exit 1
-          fi
-
-          echo "VERIFIED"
-          echo "  commit   : ${{ github.sha }}"
-          echo "  revision : $SERVING_REV"
-          echo "  image    : $SERVING_IMAGE"
-          echo "  digest   : ${{ env.IMAGE_DIGEST }}"
-
-      - name: Show service URL
-        run: gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }} --format='value(status.url)'
 
   # Genuinely separate test environment: its own GCP project
   # (cloudops360-test, own CPU quota) and its own Supabase project
@@ -206,10 +65,10 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           DOCKER_BUILDKIT: "1"
         run: |
-          # AWS-C2. `github.sha` is always the exact commit being built, so this
-          # path has never used a mutable tag -- but "has never" is not a
-          # control. The guard makes deploying one structurally impossible
-          # rather than relying on this line staying correct.
+          # AWS-C2. Production deploys from cloudbuild.yaml only; this job
+          # targets the separate test project. The guard is applied here anyway
+          # so that NO deploy path in this repo can reach a mutable tag, and so
+          # the rule does not depend on which job someone edits next.
           TAG="${{ github.sha }}"
           case "$TAG" in
             latest|Latest|LATEST)
@@ -224,19 +83,7 @@ jobs:
           IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.SERVICE }}:$TAG"
           docker build --secret id=gh_pat,env=GH_PAT -t "$IMAGE" .
           docker push "$IMAGE"
-
-          # Digest of what was just pushed, so the deploy can be verified
-          # against CONTENT and not against a tag string. A tag can be moved;
-          # a digest cannot.
-          DIGEST="$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
-          if [ -z "$DIGEST" ]; then
-            echo "REFUSING: could not resolve a digest for $IMAGE after push." >&2
-            exit 1
-          fi
-
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
-          echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
-          echo "Pushed $IMAGE @ $DIGEST"
 
       - name: Deploy to Cloud Run
         env:

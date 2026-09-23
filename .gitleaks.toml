@@ -12,4 +12,12 @@ regexes = [
   # and committed CI config, not a credential. The service_role key is the
   # actual secret and is never referenced in this repo.
   '''sb_publishable_[A-Za-z0-9_-]+''',
+  # Scanner taxonomy value. The default generic-api-key rule treats the
+  # resourceTypeKey property name as credential-like even though this is a
+  # fixed, non-secret AWS inventory identifier.
+  '''^ec2_capacity_reservation$''',
+  # Synthetic access-key-shaped value committed once in a redaction unit
+  # test. It was never a credential; the test now constructs it from pieces,
+  # but history scanning still visits that immutable commit.
+  '''^AKIAABCDEFGHIJKLMNOP$''',
 ]
