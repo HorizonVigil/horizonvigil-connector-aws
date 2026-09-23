@@ -98,8 +98,27 @@ async function listAll(client: ReturnType<typeof createAwsClient>, path: string,
     const res = await fetchText(client, url, { method: 'GET' });
     if (!res.ok) return { items, complete: false, firstPageFailed: page === 0, status: res.status, error: res.error ?? snippet(res.text) };
     const list = extractSection(res.text, listTag) ?? res.text;
-    // The list's own <Items> precedes any nested one, so this is the top-level list.
-    items.push(...extractListItems(extractSection(list, 'Items'), itemTag));
+    /*
+     * Read the item tag straight out of the list rather than narrowing to
+     * <Items> first.
+     *
+     * `extractSection` is NOT nesting-aware -- it slices to the first
+     * matching close tag -- and its own docstring is explicit that it is only
+     * safe for container tags "none of which recurse into themselves".
+     * CloudFront's <Items> recurses: a DistributionSummary contains
+     * <Aliases><Items>, <Origins><Items> and <CacheBehaviors><Items>. So
+     * narrowing to <Items> stopped at the FIRST </Items> -- the one closing
+     * Aliases -- truncating the summary mid-element, and extractListItems
+     * then found an opening <DistributionSummary> with no close at depth 0
+     * and returned nothing. Every distribution with an alias or a second
+     * origin vanished from inventory.
+     *
+     * `extractListItems` IS depth-aware for the tag it is given, so it finds
+     * exactly the top-level itemTag blocks. Both item tags CloudFront uses
+     * here appear only inside the list's own Items, so dropping the narrowing
+     * loses no safety.
+     */
+    items.push(...extractListItems(list, itemTag));
     const truncated = field(withoutSections(list, ['Items']), 'IsTruncated') === 'true';
     const next = field(withoutSections(list, ['Items']), 'NextMarker');
     if (!truncated || !next) return { items, complete: true, firstPageFailed: false };

@@ -222,7 +222,7 @@ export function trailMetadata(trail: Trail, status: TrailStatus | null, selector
  */
 export async function scanCloudTrail(ctx: ScannerContext): Promise<ScannedResource[]> {
   const endpoint = `cloudtrail.${ctx.region}.amazonaws.com`;
-  const call = (action: string, body: unknown) =>
+  const call = (action: string, body: Record<string, unknown>) =>
     callJsonApi(ctx.creds, { service: 'cloudtrail', region: ctx.region, host: endpoint, target: `${TARGET_PREFIX}.${action}`, body });
 
   const result = await call('DescribeTrails', { includeShadowTrails: true });

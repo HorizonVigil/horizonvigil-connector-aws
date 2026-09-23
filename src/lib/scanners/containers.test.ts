@@ -5,14 +5,60 @@ const callJsonApiMock = vi.fn();
 const callQueryApiMock = vi.fn();
 const fetchMock = vi.fn();
 const k8sFetchMock = vi.fn();
+/*
+ * eksWorkloads.ts's `eksGet` signs with AwsV4Signer, not AwsClient. A mock
+ * exporting only AwsClient leaves AwsV4Signer undefined, `new AwsV4Signer(...)`
+ * throws, and eksGet's own try/catch swallows it into `{ ok: false }` -- so
+ * listClusterNames returns null and every EKS-workload test sees an empty
+ * scan. The failure looks like "no data" rather than "missing mock export",
+ * which is what made six tests fail for one reason.
+ *
+ * `sign()` returns real Headers because headersToObject calls .forEach on it.
+ */
 vi.mock('aws4fetch', () => ({
   AwsClient: class {
     fetch(url: string, init?: RequestInit) {
       return fetchMock(url, init);
     }
   },
+  AwsV4Signer: class {
+    private readonly url: string;
+    private readonly method: string;
+    constructor(opts: { url: string; method?: string }) {
+      this.url = opts.url;
+      this.method = opts.method ?? 'GET';
+    }
+    sign() {
+      return Promise.resolve({
+        url: this.url,
+        method: this.method,
+        headers: new Headers({ authorization: 'AWS4-HMAC-SHA256 Credential=AKIA_TEST/test' }),
+      });
+    }
+  },
 }));
-vi.mock('undici', () => ({ fetch: (url: string, init?: unknown) => k8sFetchMock(String(url), init) }));
+/*
+ * eksWorkloads.ts imports BOTH `fetch` and `Agent` from undici. A mock that
+ * supplies only `fetch` leaves `Agent` undefined, so `new Agent(...)` throws
+ * and every test in this describe dies before it reaches its assertion --
+ * which reads as seven separate failures rather than one missing export.
+ *
+ * The fake records each instance on `globalThis.__undiciAgents` so the tests
+ * can assert one agent per cluster AND that each one was closed: an agent
+ * left open holds a socket pool for the life of the process.
+ */
+vi.mock('undici', () => ({
+  fetch: (url: string, init?: unknown) => k8sFetchMock(String(url), init),
+  Agent: class {
+    closed = false;
+    opts: Record<string, unknown>;
+    constructor(opts: Record<string, unknown>) {
+      this.opts = opts;
+      ((globalThis as { __undiciAgents?: unknown[] }).__undiciAgents ??= []).push(this);
+    }
+    close() { this.closed = true; return Promise.resolve(); }
+  },
+}));
 vi.mock('../awsApi', async (importOriginal: () => Promise<Record<string, unknown>>) => ({
   ...(await importOriginal()),
   callJsonApi: (...args: unknown[]) => callJsonApiMock(...args),

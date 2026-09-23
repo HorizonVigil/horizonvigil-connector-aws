@@ -77,7 +77,22 @@ describe('API Gateway', () => {
     const failures: Failure[] = [];
     fetchMock.mockImplementation(() => json({}, 403));
     await scanApiGateway({ creds: { ...creds, onCallFailure: (f: Failure) => failures.push(f) }, region: 'eu-west-1' });
-    expect(failures.map((f) => f.action).sort()).toEqual(['GetApis', 'GetRestApis']);
+    /*
+     * Both named actions must be reported -- that is what makes the failure
+     * actionable, and what reportWalk exists for.
+     *
+     * They are not the ONLY entries, and asserting that they were is what
+     * failed here. A raw-client 403 is reported TWICE by design: once by
+     * safeFetch itself as `/<redacted:N>` (awsApi.ts's universal
+     * degraded-coverage net, which covers every scanner using the raw client
+     * without any of them being edited, and redacts the path because S3 puts
+     * bucket and object names there), and once by this scanner's reportWalk
+     * under the real API action. The redacted entry is deliberate breadth;
+     * the named one is the detail.
+     */
+    const actions = failures.map((f) => f.action);
+    expect(actions).toContain('GetRestApis');
+    expect(actions).toContain('GetApis');
   });
 });
 
