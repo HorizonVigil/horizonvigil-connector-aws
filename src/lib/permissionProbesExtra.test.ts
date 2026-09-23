@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 
 const fetchMock = vi.fn();
 vi.mock('aws4fetch', () => ({
@@ -11,6 +12,7 @@ vi.mock('aws4fetch', () => ({
 
 import {
   checkGuardDuty, checkInspector, checkAccessAnalyzer, checkEcs, checkAwsHealth, checkCur,
+  checkLambda, checkKafka, checkFirewallManager, checkLicenseManager,
 } from './permissionProbesExtra';
 import { stateFromCheck } from './capabilityMatrix';
 
@@ -273,5 +275,85 @@ describe('credential material never reaches a check detail', () => {
     // Both return paths -- the normal one and the early STS failure.
     expect(source).toContain('redactAwsText(check.detail)');
     expect(source).toContain('redactAwsText(stsResult.detail)');
+  });
+});
+
+/**
+ * AWS-I1. The seven services the IAM-drift finding named.
+ *
+ * Six of them were not probed AT ALL. So when the deployed roles were missing
+ * these permissions, validation reported a clean run while every one of their
+ * scanners was refused — and their ABSENCE from the denied list read as
+ * success. That is exactly how the 2026-09-23 AdministratorAccess grant
+ * appeared to fix seven services that were, in fact, still denied at the
+ * scanner: six of them were never being asked about.
+ */
+describe('AWS-I1 services are probed at all', () => {
+  const SOURCE = readFileSync('src/lib/permissionChecks.ts', 'utf8');
+
+  it.each([
+    ['lambda', 'checkLambda'],
+    ['kafka', 'checkKafka'],
+    ['imagebuilder', 'checkImageBuilder'],
+    ['macie2', 'checkMacie'],
+    ['fms', 'checkFirewallManager'],
+    ['license-manager', 'checkLicenseManager'],
+  ])('%s is probed by runFullValidation', (_svc, fn) => {
+    expect(SOURCE).toContain(`${fn}(creds`);
+  });
+
+  it('securityhub was already probed and stays probed', () => {
+    expect(SOURCE).toContain("service: 'securityhub'");
+  });
+});
+
+describe('the AWS-I1 probes behave correctly', () => {
+  /**
+   * Lambda is available in every commercial region and has no "enable"
+   * step, so a 403 here is a real policy gap and must never be softened
+   * into an enablement state.
+   */
+  it('reports a Lambda 403 as DENIED, never as not-applicable', async () => {
+    fetchMock.mockImplementation(() => denied());
+    const r = await checkLambda(creds, REGION);
+    expect(r.status).toBe('denied');
+    expect(r.detail).toContain('lambda:ListFunctions');
+    expect(stateFromCheck(r)).toBe('permission_denied');
+  });
+
+  it('reports a Lambda success as granted', async () => {
+    fetchMock.mockImplementation(() => json({ Functions: [] }));
+    expect(stateFromCheck(await checkLambda(creds, REGION))).toBe('available');
+  });
+
+  it('reads a 404 as the service being absent from the region, not denied', async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(new Response('{}', { status: 404 })));
+    const r = await checkKafka(creds, REGION);
+    expect(r.status).toBe('not_applicable');
+  });
+
+  /**
+   * Firewall Manager answers only for the account designated as the FMS
+   * administrator. That is an account state, not a policy gap, and telling
+   * someone to edit an IAM policy for it sends them to fix the wrong thing.
+   */
+  it('separates "not the FMS admin account" from a denial', async () => {
+    fetchMock.mockImplementation(() =>
+      json({ __type: 'InvalidOperationException', message: 'The account is not associated as the FMS administrator' }, 400));
+    const r = await checkFirewallManager(creds);
+    expect(r.status).toBe('not_applicable');
+    expect(r.detail).toMatch(/administrator account/i);
+  });
+
+  it('still reports a real FMS denial as denied', async () => {
+    fetchMock.mockImplementation(() => denied());
+    expect((await checkFirewallManager(creds)).status).toBe('denied');
+  });
+
+  it('reports a License Manager denial with the action that was refused', async () => {
+    fetchMock.mockImplementation(() => denied());
+    const r = await checkLicenseManager(creds, REGION);
+    expect(r.status).toBe('denied');
+    expect(r.detail).toContain('license-manager:ListLicenseConfigurations');
   });
 });

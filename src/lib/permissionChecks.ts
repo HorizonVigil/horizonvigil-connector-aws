@@ -1,5 +1,8 @@
 import { callQueryApi, callJsonApi, createAwsClient, extractXmlField, safeFetch, type AwsCreds } from './awsApi';
-import { checkGuardDuty, checkInspector, checkAccessAnalyzer, checkEcs, checkAwsHealth, checkCur } from './permissionProbesExtra';
+import {
+  checkGuardDuty, checkInspector, checkAccessAnalyzer, checkEcs, checkAwsHealth, checkCur,
+  checkLambda, checkKafka, checkImageBuilder, checkMacie, checkFirewallManager, checkLicenseManager,
+} from './permissionProbesExtra';
 import { redactAwsText } from './redactAws';
 
 export type CheckStatus = 'granted' | 'denied' | 'error' | 'not_applicable';
@@ -229,6 +232,24 @@ export async function runFullValidation(creds: AwsCreds, region: string): Promis
     checkEcs(creds, region),
     checkAwsHealth(creds),
     checkCur(creds),
+    /*
+     * AWS-I1. The services the IAM-drift finding named.
+     *
+     * Six of these were not probed at all, so when the deployed roles were
+     * missing their permissions, validation reported a clean run while every
+     * one of their scanners was refused. Their ABSENCE from the denied list
+     * was then read as success -- which is exactly how the 2026-09-23 admin
+     * grant appeared to fix seven services that were still, in fact, denied.
+     *
+     * Each calls the same endpoint its scanner calls, so a pass here means
+     * that scanner can actually read.
+     */
+    checkLambda(creds, region),
+    checkKafka(creds, region),
+    checkImageBuilder(creds, region),
+    checkMacie(creds, region),
+    checkFirewallManager(creds),
+    checkLicenseManager(creds, region),
   ]);
 
   /*

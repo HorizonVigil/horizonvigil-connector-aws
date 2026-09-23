@@ -230,3 +230,127 @@ export async function checkCur(creds: AwsCreds): Promise<PermissionCheckResult> 
     return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
   }
 }
+
+/**
+ * AWS-I1. The seven services named in the IAM-drift finding.
+ *
+ * WHY THESE EXIST
+ *
+ * Six of the seven were not probed by permission validation AT ALL — only
+ * securityhub was. So when the deployed roles were missing these permissions,
+ * validation reported a clean bill of health while every one of their
+ * scanners was being refused, and the only trace was a `degraded_reasons`
+ * entry buried in a collection run.
+ *
+ * It is worse than a gap in coverage: it makes the finding unverifiable by
+ * the product. Asked "did re-applying the policy fix it?", validation could
+ * not answer, and the absence of these services from its denied list read as
+ * success. That misreading is exactly what happened on 2026-09-23 — admin was
+ * attached, six services silently stayed denied, and nothing in the
+ * validation output said so.
+ *
+ * Each probe calls the SAME endpoint its scanner calls, so a probe that
+ * passes means that scanner can actually read. A probe that used a different
+ * action would be answering a different question.
+ */
+
+/** One service's read access, probed through the endpoint its scanner uses. */
+async function probeRest(
+  creds: AwsCreds,
+  opts: { service: string; label: string; awsService: string; url: string; method?: 'GET' | 'POST'; action: string },
+): Promise<PermissionCheckResult> {
+  const base = { service: opts.service, label: opts.label, verified: false };
+  try {
+    const client = createAwsClient(creds, opts.awsService, opts.url.split('.')[1] ?? 'us-east-1');
+    const res = await safeFetch(
+      client,
+      opts.url,
+      opts.method === 'POST'
+        ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) }
+        : { method: 'GET' },
+    );
+    if (res.ok) return { ...base, status: 'granted', detail: `Read access to ${opts.label} confirmed` };
+    if (res.status === 403 || res.status === 401) {
+      return { ...base, status: 'denied', detail: `${opts.action} was denied.` };
+    }
+    if (res.status === 404) {
+      return { ...base, status: 'not_applicable', detail: `${opts.label} is not available in this region.` };
+    }
+    return { ...base, status: 'error', detail: `${opts.action} returned HTTP ${res.status}.` };
+  } catch (err) {
+    return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
+  }
+}
+
+/** Lambda. Always available in every commercial region — a denial here is a real policy gap, never an enablement state. */
+export async function checkLambda(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  return probeRest(creds, {
+    service: 'lambda', label: 'Lambda', awsService: 'lambda',
+    url: `https://lambda.${region}.amazonaws.com/2015-03-31/functions/?MaxItems=1`,
+    action: 'lambda:ListFunctions',
+  });
+}
+
+/** MSK (Kafka). */
+export async function checkKafka(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  return probeRest(creds, {
+    service: 'kafka', label: 'MSK (Kafka)', awsService: 'kafka',
+    url: `https://kafka.${region}.amazonaws.com/v1/clusters/v2?MaxResults=1`,
+    action: 'kafka:ListClustersV2',
+  });
+}
+
+/** EC2 Image Builder. */
+export async function checkImageBuilder(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  return probeRest(creds, {
+    service: 'imagebuilder', label: 'EC2 Image Builder', awsService: 'imagebuilder',
+    url: `https://imagebuilder.${region}.amazonaws.com/listImagePipelines`, method: 'POST',
+    action: 'imagebuilder:ListImagePipelines',
+  });
+}
+
+/** Macie. */
+export async function checkMacie(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  return probeRest(creds, {
+    service: 'macie2', label: 'Macie', awsService: 'macie2',
+    url: `https://macie2.${region}.amazonaws.com/jobs/list`, method: 'POST',
+    action: 'macie2:ListClassificationJobs',
+  });
+}
+
+/** Firewall Manager. JSON-protocol, and only answers in us-east-1. */
+export async function checkFirewallManager(creds: AwsCreds): Promise<PermissionCheckResult> {
+  const base = { service: 'fms', label: 'Firewall Manager', verified: false };
+  try {
+    const res = await callJsonApi(creds, {
+      service: 'fms', region: 'us-east-1', host: 'fms.us-east-1.amazonaws.com',
+      target: 'AWSFMS_20180101.ListPolicies', body: { MaxResults: 1 },
+    });
+    if (res.ok) return { ...base, status: 'granted', detail: 'Read access to Firewall Manager confirmed' };
+    if (res.normalizedCode === 'PERMISSION_DENIED') return { ...base, status: 'denied', detail: 'fms:ListPolicies was denied.' };
+    // FMS answers only for an account designated as the FMS administrator.
+    // That is an account state, not a policy gap.
+    if (/not.*(admin|associated)/i.test(`${res.errorCode ?? ''} ${res.errorMessage ?? ''}`)) {
+      return { ...base, status: 'not_applicable', detail: 'This account is not a Firewall Manager administrator account.' };
+    }
+    return { ...base, status: 'error', detail: res.errorMessage ?? res.normalizedCode ?? `HTTP ${res.status}` };
+  } catch (err) {
+    return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
+  }
+}
+
+/** License Manager. JSON-protocol, regional. */
+export async function checkLicenseManager(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  const base = { service: 'license_manager', label: 'License Manager', verified: false };
+  try {
+    const res = await callJsonApi(creds, {
+      service: 'license-manager', region, host: `license-manager.${region}.amazonaws.com`,
+      target: 'AWSLicenseManager.ListLicenseConfigurations', body: { MaxResults: 1 },
+    });
+    if (res.ok) return { ...base, status: 'granted', detail: 'Read access to License Manager confirmed' };
+    if (res.normalizedCode === 'PERMISSION_DENIED') return { ...base, status: 'denied', detail: 'license-manager:ListLicenseConfigurations was denied.' };
+    return { ...base, status: 'error', detail: res.errorMessage ?? res.normalizedCode ?? `HTTP ${res.status}` };
+  } catch (err) {
+    return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
+  }
+}
