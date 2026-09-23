@@ -1,5 +1,7 @@
-import { callJsonApi, callQueryApi } from '../awsApi';
+import { callQueryApi } from '../awsApi';
 import { field } from '../xmlList';
+import { reportWalk, toIso, walkJsonRpc } from './restJson';
+import { reportListingFailure } from './scannerSupport';
 import type { ScannedResource, ScannerContext } from './types';
 
 const TARGET_PREFIX = 'AWSBudgetServiceGateway';
@@ -13,57 +15,74 @@ interface Budget {
   BudgetName: string; BudgetType?: string; TimeUnit?: string;
   BudgetLimit?: BudgetAmount; CalculatedSpend?: { ActualSpend?: BudgetAmount; ForecastedSpend?: BudgetAmount };
   LastUpdatedTime?: number;
+  TimePeriod?: { Start?: number; End?: number };
+}
+
+const amountText = (a: BudgetAmount | undefined) => (a ? `${a.Amount} ${a.Unit}` : null);
+const amountNumber = (a: BudgetAmount | undefined): number | null => {
+  const n = a?.Amount === undefined ? NaN : Number(a.Amount);
+  return Number.isFinite(n) ? n : null;
+};
+
+/** Evidence for one budget. The *Text keys keep the previous string format. */
+export function budgetMetadata(b: Budget) {
+  const limit = amountNumber(b.BudgetLimit);
+  const forecast = amountNumber(b.CalculatedSpend?.ForecastedSpend);
+  return {
+    budgetType: b.BudgetType, timeUnit: b.TimeUnit,
+    limit: amountText(b.BudgetLimit),
+    actualSpend: amountText(b.CalculatedSpend?.ActualSpend),
+    forecastedSpend: amountText(b.CalculatedSpend?.ForecastedSpend),
+    limitAmount: limit,
+    actualSpendAmount: amountNumber(b.CalculatedSpend?.ActualSpend),
+    forecastedSpendAmount: forecast,
+    currency: b.BudgetLimit?.Unit ?? null,
+    forecastExceedsLimit: limit !== null && forecast !== null ? forecast > limit : null,
+    lastUpdatedTime: b.LastUpdatedTime,
+    lastUpdatedIso: toIso(b.LastUpdatedTime),
+  };
 }
 
 /**
- * AWS Budgets is account-wide and global (no region concept at all) --
- * registered as a GLOBAL_SCANNERS entry in discovery.ts, same as
- * ce.ts/iam.ts. DescribeBudgets requires the caller's own AWS account id
- * (AccountId) as an explicit body param -- resolved via STS
- * GetCallerIdentity, same account-ID-via-STS pattern s3control.ts already
- * uses, rather than widening ScannerContext (which would touch every one
- * of the other 96 scanners' call sites for a need only these two have).
+ * AWS Budgets — account-wide and global (a GLOBAL_SCANNERS entry, like
+ * ce.ts/iam.ts). DescribeBudgets needs the account id, resolved via STS
+ * GetCallerIdentity (same pattern as s3control.ts).
  *
- * UNVERIFIED against a real account's actual Budgets response shape until
- * this runs against a live connection and gets checked -- same disclosed-
- * uncertainty convention as inspectorFindings.ts.
+ * What changed: an unresolved account id, or a failed/partial
+ * DescribeBudgets walk, is now REPORTED rather than returning [] or a short
+ * list -- both of which finalize read as "budgets deleted". Amounts are also
+ * kept as numbers (the old strings are unchanged) so posture can compare
+ * forecast against limit.
+ *
+ * Note: CalculatedSpend changes as money is spent, so budget rows change on
+ * most scans by nature; that is the data, not churn to suppress.
  */
 export async function scanBudgets(ctx: ScannerContext): Promise<ScannedResource[]> {
-  const out: ScannedResource[] = [];
-
   const stsResult = await callQueryApi(ctx.creds, { service: 'sts', region: 'us-east-1', host: 'sts.amazonaws.com', action: 'GetCallerIdentity', version: '2011-06-15' });
   const accountId = stsResult.ok ? field(stsResult.body as string, 'Account') : null;
   if (!accountId) {
     console.error('Budgets scan skipped: could not resolve account ID via STS GetCallerIdentity.');
-    return out;
+    reportListingFailure(ctx, { service: 'budgets', action: 'DescribeBudgets', region: 'us-east-1' });
+    return [];
   }
 
-  let nextToken: string | undefined;
+  const walk = await walkJsonRpc<Budget>(ctx, {
+    service: 'budgets', region: 'us-east-1', host: HOST, target: `${TARGET_PREFIX}.DescribeBudgets`,
+    body: { AccountId: accountId, MaxResults: 100 },
+  }, 'Budgets');
+  reportWalk(ctx, walk, 'budgets', 'DescribeBudgets', 'us-east-1');
 
-  do {
-    const res = await callJsonApi(ctx.creds, {
-      service: 'budgets', region: 'us-east-1', host: HOST, target: `${TARGET_PREFIX}.DescribeBudgets`,
-      body: { AccountId: accountId, MaxResults: 100, ...(nextToken ? { NextToken: nextToken } : {}) },
+  const out: ScannedResource[] = [];
+  const seen = new Set<string>();
+  for (const b of walk.items) {
+    if (!b?.BudgetName) continue;
+    const id = `${accountId}:${b.BudgetName}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      resourceTypeKey: 'budgets_budget', resourceId: id, region: null, resourceName: b.BudgetName,
+      metadata: budgetMetadata(b),
     });
-    if (!res.ok) {
-      console.error(`Budgets DescribeBudgets failed (continuing without it): ${res.errorMessage ?? res.errorCode ?? res.status}`);
-      break;
-    }
-    const body = res.body as { Budgets?: Budget[]; NextToken?: string };
-    for (const b of body.Budgets ?? []) {
-      out.push({
-        resourceTypeKey: 'budgets_budget', resourceId: `${accountId}:${b.BudgetName}`, region: null, resourceName: b.BudgetName,
-        metadata: {
-          budgetType: b.BudgetType, timeUnit: b.TimeUnit,
-          limit: b.BudgetLimit ? `${b.BudgetLimit.Amount} ${b.BudgetLimit.Unit}` : null,
-          actualSpend: b.CalculatedSpend?.ActualSpend ? `${b.CalculatedSpend.ActualSpend.Amount} ${b.CalculatedSpend.ActualSpend.Unit}` : null,
-          forecastedSpend: b.CalculatedSpend?.ForecastedSpend ? `${b.CalculatedSpend.ForecastedSpend.Amount} ${b.CalculatedSpend.ForecastedSpend.Unit}` : null,
-          lastUpdatedTime: b.LastUpdatedTime,
-        },
-      });
-    }
-    nextToken = body.NextToken;
-  } while (nextToken);
-
+  }
   return out;
 }

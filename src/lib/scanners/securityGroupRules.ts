@@ -94,6 +94,16 @@ function intOrNull(raw: string | null): number | null {
   return Number.isInteger(n) ? n : null;
 }
 
+/**
+ * Trimmed value, or null when absent/blank. Source identifiers are compared
+ * verbatim downstream (`0.0.0.0/0` is the world-open check), so stray
+ * whitespace must never make an open rule compare as closed.
+ */
+function clean(raw: string | null): string | null {
+  const v = raw?.trim();
+  return v ? v : null;
+}
+
 function identityFor(direction: string, protocol: string, fromPort: number | null, toPort: number | null, source: RuleSource): string {
   const s =
     source.kind === 'ipv4' ? `ipv4:${source.cidr}`
@@ -127,25 +137,25 @@ export function parsePermissions(sectionXml: string | null, direction: 'ingress'
     const sources: { source: RuleSource; description: string | null }[] = [];
 
     for (const r of extractListItems(extractSection(perm, 'ipRanges'))) {
-      const cidr = field(r, 'cidrIp');
+      const cidr = clean(field(r, 'cidrIp'));
       if (cidr) sources.push({ source: { kind: 'ipv4', cidr }, description: field(r, 'description') });
     }
 
     for (const r of extractListItems(extractSection(perm, 'ipv6Ranges'))) {
-      const cidr = field(r, 'cidrIpv6');
+      const cidr = clean(field(r, 'cidrIpv6'));
       if (cidr) sources.push({ source: { kind: 'ipv6', cidr }, description: field(r, 'description') });
     }
 
     for (const r of extractListItems(extractSection(perm, 'prefixListIds'))) {
-      const id = field(r, 'prefixListId');
+      const id = clean(field(r, 'prefixListId'));
       if (id) sources.push({ source: { kind: 'prefixList', prefixListId: id }, description: field(r, 'description') });
     }
 
     for (const g of extractListItems(extractSection(perm, 'groups'))) {
-      const groupId = field(g, 'groupId');
+      const groupId = clean(field(g, 'groupId'));
       if (groupId) {
         sources.push({
-          source: { kind: 'securityGroup', groupId, userId: field(g, 'userId') },
+          source: { kind: 'securityGroup', groupId, userId: clean(field(g, 'userId')) },
           description: field(g, 'description'),
         });
       }

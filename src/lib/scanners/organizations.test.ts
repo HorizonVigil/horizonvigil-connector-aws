@@ -1,5 +1,12 @@
-import { describe, it, expect } from 'vitest';
-import { flattenOrgTree, type OrgTreeNode } from './organizations';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
+
+const callJsonApiMock = vi.fn();
+vi.mock('../awsApi', async (importOriginal: () => Promise<Record<string, unknown>>) => ({
+  ...(await importOriginal()),
+  callJsonApi: (...args: unknown[]) => callJsonApiMock(...args),
+}));
+
+import { flattenOrgTree, listOrganizationAccounts, listOrganizationTree, scanOrganizations, type OrgTreeNode } from './organizations';
 
 /**
  * AWS-01 — OU hierarchy.
@@ -137,5 +144,101 @@ describe('flattenOrgTree', () => {
       accounts: [acct('444444444444', 'old', 'SUSPENDED')], children: [],
     }];
     expect(flattenOrgTree(susp).find((n) => n.id === '444444444444')!.status).toBe('SUSPENDED');
+  });
+});
+
+/**
+ * Scanner-level behaviour, driven through a mocked Organizations API.
+ *
+ * Organizations pages at 20 items by default. Every list call used to read
+ * page one only, so the 21st account (or OU, or SCP) was silently dropped and
+ * then tombstoned.
+ */
+type JsonReq = { target: string; body: Record<string, unknown> };
+type Failure = { normalizedCode?: string };
+
+const ok = (body: unknown) => Promise.resolve({ ok: true, status: 200, body });
+const denied = () => Promise.resolve({ ok: false, status: 400, body: null, errorCode: 'AWSOrganizationsNotInUseException' });
+const creds = { accessKeyId: 'AKIA_TEST', secretAccessKey: 'secret' };
+const account = (n: number) => ({ Id: String(100000000000 + n), Name: `acct-${n}`, Email: `a${n}@example.test`, State: 'ACTIVE' });
+
+/** 25 accounts over two pages, all directly under the root; one SCP. */
+function serveOrg(opts: { failOuWalk?: boolean } = {}) {
+  const all = Array.from({ length: 25 }, (_, i) => account(i));
+  const page = (items: unknown[], key: string, token: unknown) => (token === 'p2'
+    ? ok({ [key]: items.slice(20) })
+    : ok({ [key]: items.slice(0, 20), NextToken: 'p2' }));
+  callJsonApiMock.mockImplementation((_c: unknown, req: JsonReq) => {
+    const op = req.target.split('.').pop();
+    switch (op) {
+      case 'ListAccounts': return page(all, 'Accounts', req.body.NextToken);
+      case 'DescribeOrganization': return ok({ Organization: { Id: 'o-1', FeatureSet: 'ALL', MasterAccountId: all[0].Id } });
+      case 'ListRoots': return ok({ Roots: [{ Id: 'r-1', Name: 'Root' }] });
+      case 'ListAccountsForParent': return page(all, 'Accounts', req.body.NextToken);
+      case 'ListOrganizationalUnitsForParent': return opts.failOuWalk ? denied() : ok({ OrganizationalUnits: [] });
+      case 'ListPolicies': return ok({ Policies: req.body.Filter === 'SERVICE_CONTROL_POLICY' ? [{ Id: 'p-1', Name: 'deny-leave' }] : [] });
+      case 'ListTargetsForPolicy': return ok({ Targets: [{ TargetId: 'r-1', Type: 'ROOT' }] });
+      default: return denied();
+    }
+  });
+}
+
+beforeEach(() => { callJsonApiMock.mockReset(); });
+
+describe('scanOrganizations', () => {
+  it('reads every page of accounts (Organizations pages at 20)', async () => {
+    serveOrg();
+    const out = await scanOrganizations({ creds, region: 'us-east-1' });
+    expect(out.filter((r) => r.resourceTypeKey === 'organizations_account')).toHaveLength(25);
+  });
+
+  it('emits each account ONCE, enriched with its parent', async () => {
+    serveOrg();
+    const out = await scanOrganizations({ creds, region: 'us-east-1' });
+    const ids = out.filter((r) => r.resourceTypeKey === 'organizations_account').map((r) => r.resourceId);
+    expect(new Set(ids).size).toBe(ids.length);
+    const first = out.find((r) => r.resourceId === account(0).Id);
+    expect(first?.relationships?.parentId).toBe('r-1');
+    expect(first?.metadata).toMatchObject({ isManagementAccount: true, depth: 1 });
+  });
+
+  it('records the org feature set on the root and SCP attachment targets', async () => {
+    serveOrg();
+    const out = await scanOrganizations({ creds, region: 'us-east-1' });
+    expect(out.find((r) => r.resourceId === 'r-1')?.metadata).toMatchObject({ featureSet: 'ALL', organizationId: 'o-1' });
+    const scp = out.find((r) => r.resourceTypeKey === 'organizations_scp');
+    expect(scp?.relationships?.targetIds).toEqual(['r-1']);
+    expect(scp?.metadata).toMatchObject({ targetsCollected: true, targetCount: 1 });
+  });
+
+  it('REPORTS a partial OU walk so missing OUs are not tombstoned', async () => {
+    const failures: Failure[] = [];
+    serveOrg({ failOuWalk: true });
+    await scanOrganizations({ creds: { ...creds, onCallFailure: (f: Failure) => failures.push(f) }, region: 'us-east-1' });
+    expect(failures.some((f) => f.normalizedCode === 'PAGINATION_TRUNCATED')).toBe(true);
+  });
+
+  it('returns nothing for a member account (not an error)', async () => {
+    callJsonApiMock.mockImplementation(() => denied());
+    expect(await scanOrganizations({ creds, region: 'us-east-1' })).toEqual([]);
+  });
+});
+
+describe('listOrganizationTree / listOrganizationAccounts', () => {
+  it('flags an incomplete tree instead of returning a quietly short one', async () => {
+    serveOrg({ failOuWalk: true });
+    const tree = await listOrganizationTree(creds);
+    expect(tree.ok).toBe(true);
+    if (tree.ok) expect(tree.complete).toBe(false);
+  });
+
+  it('bulk import reads every page', async () => {
+    serveOrg();
+    const res = await listOrganizationAccounts(creds);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.accounts).toHaveLength(25);
+      expect(res.accounts[0].Status).toBe('ACTIVE');
+    }
   });
 });

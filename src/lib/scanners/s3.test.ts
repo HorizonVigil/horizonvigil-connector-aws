@@ -27,7 +27,7 @@ vi.mock('aws4fetch', () => ({
   },
 }));
 
-import { scanS3 } from './s3';
+import { locationUrl, scanS3 } from './s3';
 import { classifyRecord, type AdmissionContext } from '../admission';
 import type { ScannedResource } from './types';
 
@@ -295,5 +295,110 @@ describe('S3 bucket cap', () => {
   it('still returns the buckets it did read', async () => {
     serve(many(60), located);
     expect(bucketsOf(await scanS3({ creds, region: 'us-east-1' }))).toHaveLength(45);
+  });
+});
+
+/**
+ * Production-hardening contract: region from ListBuckets itself, pagination,
+ * dotted bucket names, reported listing failures, and regional access points.
+ */
+describe('S3 production hardening', () => {
+  const ACCOUNT = '111122223333';
+  const stsOk = () => ok(`<GetCallerIdentityResponse><GetCallerIdentityResult><Account>${ACCOUNT}</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`);
+  const listWithRegions = (entries: [string, string][], token?: string) =>
+    `<ListAllMyBucketsResult><Buckets>${entries
+      .map(([n, r]) => `<Bucket><Name>${n}</Name><CreationDate>2026-01-01T00:00:00Z</CreationDate><BucketRegion>${r}</BucketRegion></Bucket>`)
+      .join('')}</Buckets>${token ? `<ContinuationToken>${token}</ContinuationToken>` : ''}</ListAllMyBucketsResult>`;
+
+  it('uses <BucketRegion> from ListBuckets and makes no per-bucket location calls', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (isLocationCall(url)) throw new Error('location lookup should not be needed');
+      return ok(listWithRegions([['a', 'eu-west-1'], ['b', 'ap-south-1']]));
+    });
+
+    const out = bucketsOf(await scanS3({ creds, region: 'us-east-1' }));
+
+    expect(out.map((r) => r.region)).toEqual(['eu-west-1', 'ap-south-1']);
+    expect(fetchMock.mock.calls.some((c: unknown[]) => isLocationCall(String(c[0])))).toBe(false);
+  });
+
+  it('asks ListBuckets for a page size (which is what makes S3 return BucketRegion)', async () => {
+    serve(['a'], () => ok('<LocationConstraint>eu-west-1</LocationConstraint>'));
+    await scanS3({ creds, region: 'us-east-1' });
+    expect(fetchMock.mock.calls.some((c: unknown[]) => String(c[0]).includes('max-buckets='))).toBe(true);
+  });
+
+  it('follows the ListBuckets continuation token', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('continuation-token=t2')) return ok(listWithRegions([['b', 'eu-west-2']]));
+      return ok(listWithRegions([['a', 'eu-west-1']], 't2'));
+    });
+
+    const out = bucketsOf(await scanS3({ creds, region: 'us-east-1' }));
+    expect(out.map((r) => r.resourceId)).toEqual(['a', 'b']);
+  });
+
+  it('uses path-style GetBucketLocation for dotted bucket names (virtual-hosted breaks TLS)', () => {
+    expect(locationUrl('my.dotted.bucket')).toBe('https://s3.amazonaws.com/my.dotted.bucket?location');
+    expect(locationUrl('plain-bucket')).toBe('https://plain-bucket.s3.amazonaws.com/?location');
+  });
+
+  it('REPORTS a failed ListBuckets so existing buckets are not tombstoned', async () => {
+    const failures: { action: string; normalizedCode: string }[] = [];
+    fetchMock.mockImplementation(() => fail(403));
+
+    const out = await scanS3({ creds: { ...creds, onCallFailure: (f: { action: string; normalizedCode: string }) => failures.push(f) }, region: 'us-east-1' });
+
+    expect(bucketsOf(out)).toEqual([]);
+    expect(failures.some((f) => f.action === 'ListBuckets' && f.normalizedCode === 'PERMISSION_DENIED')).toBe(true);
+  });
+
+  it('lists access points in every bucket region, not only us-east-1', async () => {
+    const apRegionsAsked: string[] = [];
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('sts.amazonaws.com')) return stsOk();
+      const ap = /s3-control\.([a-z0-9-]+)\.amazonaws\.com\/v20180820\/accesspoint/.exec(url);
+      if (ap) {
+        apRegionsAsked.push(ap[1]);
+        return ok(`<ListAccessPointsResult><AccessPointList><AccessPoint><Name>ap-${ap[1]}</Name><Bucket>b</Bucket>` +
+          `<AccessPointArn>arn:aws:s3:${ap[1]}:${ACCOUNT}:accesspoint/ap-${ap[1]}</AccessPointArn><NetworkOrigin>Internet</NetworkOrigin></AccessPoint></AccessPointList></ListAccessPointsResult>`);
+      }
+      if (url.includes('/mrap/instances')) return ok('<ListMultiRegionAccessPointsResult><AccessPoints/></ListMultiRegionAccessPointsResult>');
+      return ok(listWithRegions([['a', 'eu-west-1']]));
+    });
+
+    const out = await scanS3({ creds, region: 'us-east-1' });
+    const aps = out.filter((r) => r.resourceTypeKey === 's3_access_point');
+
+    expect(apRegionsAsked.sort()).toEqual(['eu-west-1', 'us-east-1']);
+    expect(aps.find((r) => r.region === 'eu-west-1')?.resourceName).toBe('ap-eu-west-1');
+  });
+
+  it('reads Multi-Region Access Points from the <AccessPoint> wire shape', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('sts.amazonaws.com')) return stsOk();
+      if (url.includes('/accesspoint')) return ok('<ListAccessPointsResult><AccessPointList/></ListAccessPointsResult>');
+      if (url.includes('/mrap/instances')) {
+        return ok('<ListMultiRegionAccessPointsResult><AccessPoints><AccessPoint><Name>global-ap</Name><Alias>x.mrap</Alias><Status>READY</Status></AccessPoint></AccessPoints></ListMultiRegionAccessPointsResult>');
+      }
+      return ok(listWithRegions([['a', 'us-east-1']]));
+    });
+
+    const out = await scanS3({ creds, region: 'us-east-1' });
+    expect(out.filter((r) => r.resourceTypeKey === 's3_multi_region_access_point').map((r) => r.resourceId)).toEqual(['global-ap']);
+  });
+
+  it('degrades access-point coverage when some bucket regions are unknown', async () => {
+    const failures: { action: string; normalizedCode: string }[] = [];
+    fetchMock.mockImplementation((url: string) => {
+      if (url.includes('sts.amazonaws.com')) return stsOk();
+      if (url.includes('/accesspoint')) return ok('<ListAccessPointsResult><AccessPointList/></ListAccessPointsResult>');
+      if (url.includes('/mrap/instances')) return ok('<ListMultiRegionAccessPointsResult><AccessPoints/></ListMultiRegionAccessPointsResult>');
+      if (isLocationCall(url)) return fail(500);
+      return ok(listResponse(['mystery']));
+    });
+
+    await scanS3({ creds: { ...creds, onCallFailure: (f: { action: string; normalizedCode: string }) => failures.push(f) }, region: 'us-east-1' });
+    expect(failures.some((f) => f.action === 'ListAccessPoints')).toBe(true);
   });
 });

@@ -147,4 +147,15 @@ describe('parsePermissions', () => {
     expect(rules).toHaveLength(2);
     expect(rules[1].protocol).toBe('udp');
   });
+
+  it('trims whitespace around sources so an open rule cannot compare as closed', () => {
+    const { rules } = parsePermissions(perms(permission('tcp', 22, 22, ipv4(' 0.0.0.0/0 '))), 'ingress');
+    expect(rules[0].source).toEqual({ kind: 'ipv4', cidr: '0.0.0.0/0' });
+  });
+
+  it('treats a whitespace-only source as no source (unparsed), not as a rule', () => {
+    const { rules, unparsedCount } = parsePermissions(perms(permission('tcp', 22, 22, ipv4('   '))), 'ingress');
+    expect(rules).toHaveLength(0);
+    expect(unparsedCount).toBe(1);
+  });
 });
