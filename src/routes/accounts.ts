@@ -428,6 +428,19 @@ accountsRoutes.post('/accounts/:id/credentials/rollback', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
     await requirePermittedConnection(db, orgId, auth.userId, c.req.param('id'), getActiveScope(c.req.raw, orgId));
+    /*
+     * AWS-I3. Rollback had NO rate limit, while rotation (line ~340) has one.
+     * The 2026-09-22 audit described the API path as enforcing "permission,
+     * permitted-connection, rate limit and audit log" -- true of rotation, not
+     * of this route.
+     *
+     * It matters because rollback SWAPS THE LIVE CREDENTIAL. An authorised but
+     * careless or malicious editor could flip a connection between credential
+     * versions repeatedly, and every flip is a real write to
+     * cloud_connections plus two to credential_versions. Same budget as
+     * rotation: these are the same class of operation on the same object.
+     */
+    await enforceRateLimit(db, `aws-account:rollback-credentials:${orgId}`, 30, 3600);
 
     const result = await rollbackToPrevious(db, c.req.param('id'));
     if (!result.ok) return c.json({ ok: false, code: result.code, error: result.message }, 409);
