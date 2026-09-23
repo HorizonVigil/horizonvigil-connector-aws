@@ -3,7 +3,28 @@ import { extractListItems, extractSection, field } from '../xmlList';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
-export const S3CONTROL_RESOURCE_TYPES = ['s3_batch_job'] as const;
+export const S3CONTROL_RESOURCE_TYPES = ['s3_batch_job', 's3_account_public_access_block'] as const;
+
+function xmlBool(xml: string, fieldName: string): boolean | null {
+  const value = new RegExp(`<${fieldName}>(true|false)</${fieldName}>`, 'i').exec(xml)?.[1];
+  return value ? value.toLowerCase() === 'true' : null;
+}
+
+export function accountPublicAccessBlockResource(accountId: string, xml: string, configured = true): ScannedResource {
+  return {
+    resourceTypeKey: 's3_account_public_access_block',
+    resourceId: accountId,
+    region: null,
+    resourceName: 'S3 account public access block',
+    metadata: {
+      configured,
+      blockPublicAcls: configured ? xmlBool(xml, 'BlockPublicAcls') : false,
+      ignorePublicAcls: configured ? xmlBool(xml, 'IgnorePublicAcls') : false,
+      blockPublicPolicy: configured ? xmlBool(xml, 'BlockPublicPolicy') : false,
+      restrictPublicBuckets: configured ? xmlBool(xml, 'RestrictPublicBuckets') : false,
+    },
+  };
+}
 
 /**
  * S3 Batch Operations jobs — same account-ID-via-STS + x-amz-account-id
@@ -20,23 +41,36 @@ export async function scanS3Control(ctx: ScannerContext): Promise<ScannedResourc
   }
 
   const client = createAwsClient(ctx.creds, 's3', 'us-east-1');
-  const res = await safeFetch(client, 'https://s3-control.us-east-1.amazonaws.com/v20180820/jobs', {
-    method: 'GET', headers: { 'x-amz-account-id': accountId },
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    console.error(`S3 Control ListJobs failed (continuing without it): HTTP ${res.status} ${text.slice(0, 200)}`);
-    return [];
+  const headers = { 'x-amz-account-id': accountId };
+  const [jobsRes, publicAccessRes] = await Promise.all([
+    safeFetch(client, 'https://s3-control.us-east-1.amazonaws.com/v20180820/jobs', { method: 'GET', headers }),
+    safeFetch(client, 'https://s3-control.us-east-1.amazonaws.com/v20180820/configuration/publicAccessBlock', { method: 'GET', headers }),
+  ]);
+  const jobsText = await jobsRes.text();
+  const out: ScannedResource[] = [];
+  if (!jobsRes.ok) {
+    console.error(`S3 Control ListJobs failed (continuing without it): HTTP ${jobsRes.status} ${jobsText.slice(0, 200)}`);
+  } else {
+    for (const job of extractListItems(extractSection(jobsText, 'Jobs'), 'JobListDescriptor')) {
+      const jobId = field(job, 'JobId');
+      if (!jobId) continue;
+      out.push({
+        resourceTypeKey: 's3_batch_job', resourceId: jobId, region: 'us-east-1',
+        state: field(job, 'Status') ?? undefined, metadata: { operation: field(job, 'Operation'), description: field(job, 'Description'), creationTime: field(job, 'CreationTime') },
+      });
+    }
   }
 
-  const out: ScannedResource[] = [];
-  for (const job of extractListItems(extractSection(text, 'Jobs'), 'JobListDescriptor')) {
-    const jobId = field(job, 'JobId');
-    if (!jobId) continue;
-    out.push({
-      resourceTypeKey: 's3_batch_job', resourceId: jobId, region: 'us-east-1',
-      state: field(job, 'Status') ?? undefined, metadata: { operation: field(job, 'Operation'), description: field(job, 'Description'), creationTime: field(job, 'CreationTime') },
-    });
+  const publicAccessText = await publicAccessRes.text();
+  if (publicAccessRes.ok) {
+    out.push(accountPublicAccessBlockResource(accountId, publicAccessText));
+  } else if (publicAccessRes.status === 404 || /NoSuchPublicAccessBlockConfiguration/i.test(publicAccessText)) {
+    // Absence is a real, unsafe configuration state, not missing evidence.
+    out.push(accountPublicAccessBlockResource(accountId, '', false));
+  } else {
+    // Permission or transport failures remain missing evidence. Do not turn
+    // them into a clean or failed posture verdict.
+    console.error(`S3 Control GetPublicAccessBlock failed (continuing without it): HTTP ${publicAccessRes.status} ${publicAccessText.slice(0, 200)}`);
   }
   return out;
 }
