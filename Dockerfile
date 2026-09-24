@@ -36,7 +36,7 @@ RUN npm run build
 FROM node:22-slim
 WORKDIR /app
 ENV NODE_ENV=production
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && update-ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && update-ca-certificates && rm -rf /var/lib/apt/lists/* && npm install -g npm@12.1.0
 COPY package.json package-lock.json ./
 RUN --mount=type=secret,id=gh_pat \
     git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"; \
