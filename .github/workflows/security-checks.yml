@@ -57,8 +57,14 @@ jobs:
 
       - name: Build image for scanning
         if: steps.has-dockerfile.outputs.exists == 'true'
-        run: docker build -t local-scan-target:${{ github.sha }} .
-
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::GH_PAT secret is required to build images that install private HorizonVigil dependencies."
+            exit 1
+          fi
+          DOCKER_BUILDKIT=1 docker build --secret id=gh_pat,env=GH_PAT -t local-scan-target:${{ github.sha }} .
       # scanners: vuln only -- secret detection is gitleaks' job (above).
       # Running both here flagged UI placeholder copy (a GCP-key JSON
       # example in an account-connect form) as a "leaked" credential
