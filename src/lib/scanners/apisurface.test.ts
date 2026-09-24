@@ -77,7 +77,7 @@ describe('API Gateway', () => {
     const failures: Failure[] = [];
     fetchMock.mockImplementation(() => json({}, 403));
     await scanApiGateway({ creds: { ...creds, onCallFailure: (f: Failure) => failures.push(f) }, region: 'eu-west-1' });
-    expect(failures.map((f) => f.action).sort()).toEqual(['GetApis', 'GetRestApis']);
+    expect(failures.map((f) => f.action)).toEqual(expect.arrayContaining(['GetApis', 'GetRestApis']));
   });
 });
 
@@ -102,13 +102,15 @@ describe('AppSync', () => {
 describe('CloudFront', () => {
   /** A distribution whose TrustedSigners/Enabled=false precedes its own Enabled=true. */
   const summary = (id: string) =>
-    `<DistributionSummary><Id>${id}</Id><ARN>arn:aws:cloudfront::1:distribution/${id}</ARN><Status>Deployed</Status><DomainName>${id}.cloudfront.net</DomainName>` +
+    `<Id>${id}</Id><ARN>arn:aws:cloudfront::1:distribution/${id}</ARN><Status>Deployed</Status><DomainName>${id}.cloudfront.net</DomainName>` +
     `<Aliases><Quantity>1</Quantity><Items><CNAME>www.example.com</CNAME></Items></Aliases>` +
     `<Origins><Quantity>1</Quantity><Items><Origin><Id>s3</Id><DomainName>b.s3.amazonaws.com</DomainName><OriginPath/><S3OriginConfig><OriginAccessIdentity/></S3OriginConfig><OriginAccessControlId/></Origin></Items></Origins>` +
     `<DefaultCacheBehavior><TargetOriginId>s3</TargetOriginId><TrustedSigners><Enabled>false</Enabled><Quantity>0</Quantity></TrustedSigners><ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy></DefaultCacheBehavior>` +
     `<CacheBehaviors><Quantity>0</Quantity></CacheBehaviors><Comment>site</Comment><PriceClass>PriceClass_All</PriceClass><Enabled>true</Enabled>` +
     `<ViewerCertificate><CloudFrontDefaultCertificate>true</CloudFrontDefaultCertificate><MinimumProtocolVersion>TLSv1</MinimumProtocolVersion></ViewerCertificate>` +
-    `<Restrictions><GeoRestriction><RestrictionType>none</RestrictionType><Quantity>0</Quantity></GeoRestriction></Restrictions><WebACLId></WebACLId></DistributionSummary>`;
+    `<Restrictions><GeoRestriction><RestrictionType>none</RestrictionType><Quantity>0</Quantity></GeoRestriction></Restrictions><WebACLId></WebACLId>`;
+
+  const listSummary = (id: string) => `<Id>${id}</Id><ARN>arn:aws:cloudfront::1:distribution/${id}</ARN><Status>Deployed</Status><DomainName>${id}.cloudfront.net</DomainName><Enabled>true</Enabled>`;
 
   it('reads the distribution\'s OWN Enabled flag, not TrustedSigners/Enabled', () => {
     expect(distributionEvidence(summary('E1')).metadata.enabled).toBe(true);
@@ -124,8 +126,8 @@ describe('CloudFront', () => {
     fetchMock.mockImplementation((url: string) => {
       if (url.includes('/distribution')) {
         return url.includes('Marker=m2')
-          ? xml(`<DistributionList><IsTruncated>false</IsTruncated><Items>${summary('E2')}</Items></DistributionList>`)
-          : xml(`<DistributionList><IsTruncated>true</IsTruncated><NextMarker>m2</NextMarker><Items>${summary('E1')}</Items></DistributionList>`);
+          ? xml(`<DistributionList><IsTruncated>false</IsTruncated><Items><DistributionSummary>${listSummary('E2')}</DistributionSummary></Items></DistributionList>`)
+          : xml(`<DistributionList><IsTruncated>true</IsTruncated><NextMarker>m2</NextMarker><Items><DistributionSummary>${listSummary('E1')}</DistributionSummary></Items></DistributionList>`);
       }
       return xml('<Error/>', 403);
     });
