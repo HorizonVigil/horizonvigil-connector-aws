@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
-      - name: Configure git for private GitHub dependencies
+      - name: Install dependencies
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
@@ -36,9 +36,12 @@ jobs:
             exit 1
           fi
           git config --local --unset-all http.https://github.com/.extraheader || true
-          git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "ssh://git@github.com/"
-          git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "git@github.com:"
-      - run: npm install
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0=url.https://x-access-token:${GH_PAT}@github.com/.insteadOf
+          export GIT_CONFIG_VALUE_0=ssh://git@github.com/
+          export GIT_CONFIG_KEY_1=url.https://x-access-token:${GH_PAT}@github.com/.insteadOf
+          export GIT_CONFIG_VALUE_1=git@github.com:
+          npm install
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
