@@ -1,6 +1,8 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit, checkCloudAccountLimit } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireMenuPermissionWithAbac, writeAuditLog, guarded, okJson, errJson, parsePagination, paginatedEnvelope, HttpError, enforceRateLimit, checkCloudAccountLimit, getOrgConnectionIds, getActiveScope, inFilter, requirePermittedConnection, strongEtag, versionParts, requirePrecondition } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '../lib/crypto';
+import { validateCandidate, activateCandidate, rollbackToPrevious } from '../lib/credentialRotation';
+import { isConnectionPurgeEnabled, purgeDisabledResponse, isAssumeRoleEnabled, assumeRoleDisabledResponse } from '../lib/capabilities';
 
 export const accountsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -17,7 +19,21 @@ accountsRoutes.get('/accounts', (c) =>
 
     const url = new URL(c.req.url);
     const pagination = parsePagination(url);
-    const filters: Record<string, string> = { org_id: `eq.${orgId}`, provider: 'eq.aws' };
+    // The account list is a permitted-set read, not just an org read.
+    //
+    // Filtering on org_id alone made this endpoint bypass BOTH controls that
+    // are supposed to bound it: resource grants (Phase 0.7 -- a user with no
+    // grants gets no connections from getOrgConnectionIds, yet still saw every
+    // account in the org here) and the active folder/project scope (Phase 1 --
+    // selecting a folder left the full global account list on screen, which is
+    // one of the specific symptoms the 2026-09-08 audits reported).
+    //
+    // getOrgConnectionIds already applies org membership, grants and scope, so
+    // intersecting on `id` is the whole fix. inFilter([]) yields a filter that
+    // matches nothing, so "no permitted accounts" renders as an empty list
+    // rather than falling open to the org.
+    const permittedIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
+    const filters: Record<string, string> = { id: inFilter(permittedIds), org_id: `eq.${orgId}`, provider: 'eq.aws' };
     const status = url.searchParams.get('status');
     const environment = url.searchParams.get('environment');
     const method = url.searchParams.get('connectionMethod');
@@ -61,9 +77,17 @@ accountsRoutes.get('/accounts/:id', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // Same permitted-set check as the list route above: org membership alone
+    // let any member fetch any connection in the org by id, regardless of
+    // resource grants. 404 rather than 403 so the response doesn't confirm
+    // that an id the caller may not see exists.
+    const id = c.req.param('id');
+    const permittedIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
+    if (!permittedIds.includes(id)) return errJson(404, 'Account not found');
+
     const rows = await db.select('cloud_connections', {
       select: LIST_SELECT,
-      filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
+      filters: { id: `eq.${id}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     const account = (rows as unknown[])[0];
     if (!account) return errJson(404, 'Account not found');
@@ -107,8 +131,31 @@ accountsRoutes.post('/accounts', (c) =>
     const body = (await c.req.json().catch(() => ({}))) as ConnectBody;
     if (!body.connectionName) return errJson(400, 'connectionName is required');
     if (!body.awsAccountId || !/^\d{12}$/.test(body.awsAccountId)) return errJson(400, 'awsAccountId must be a 12-digit AWS account id');
+    /*
+     * AWS-L2. `000000000000` passes the 12-digit test and is not an account.
+     *
+     * Production carries the consequence: 10 ACCOUNT_MISMATCH quarantine
+     * records from 2026-09-10 reading "Resource belongs to AWS account
+     * 604179600483, but this connection is bound to 000000000000." A
+     * connection collected a real estate under the placeholder and every
+     * resource it read was refused admission -- a scan that ran to completion
+     * and produced nothing but quarantine rows.
+     *
+     * Rejected here as well as caught at validation, because the cheapest
+     * place to stop this is before the connection exists.
+     */
+    if (/^0{12}$/.test(body.awsAccountId)) {
+      return errJson(400, '000000000000 is not an AWS account id. Enter the 12-digit id of the account these credentials belong to.');
+    }
     if (body.connectionMethod !== 'access_key' && body.connectionMethod !== 'cross_account_role') {
       return errJson(400, "connectionMethod must be 'access_key' or 'cross_account_role'");
+    }
+    // AWS-P0-02: the cross-account role path is not certified (the product's
+    // own UI says live sts:AssumeRole scanning is not wired up). Refuse it
+    // here rather than only in the wizard, so a direct API call cannot create
+    // a connection that can never collect.
+    if (body.connectionMethod === 'cross_account_role' && !isAssumeRoleEnabled(c.env)) {
+      return assumeRoleDisabledResponse();
     }
 
     const insert: Record<string, unknown> = {
@@ -139,6 +186,42 @@ accountsRoutes.post('/accounts', (c) =>
       if (!body.roleArn || !/^arn:aws:iam::\d{12}:role\//.test(body.roleArn)) return errJson(400, 'roleArn must be a valid IAM role ARN');
       insert.role_arn = body.roleArn;
       insert.external_id = body.externalId || crypto.randomUUID();
+    }
+
+    /**
+     * Duplicate connections are a DOMAIN conflict, not a database error.
+     *
+     * 2026-09-08 AWS connector audit, AWS-P0-03: the create flow used to let
+     * the unique-constraint failure reach the browser, which matched on the
+     * raw constraint name (`cloud_connections_org_id_aws_account_id_key`) and
+     * then called updateAccountCredentials/updateAccountRole -- so a second
+     * "Add account" submit silently ROTATED the credentials of an existing
+     * connection. Creating and rotating are different operations with
+     * different blast radius, and one must never become the other.
+     *
+     * Disconnect is a soft status flip rather than a row delete, so a
+     * disconnected account still occupies the (org_id, aws_account_id) key.
+     * That case is reported explicitly, because "already connected" would be
+     * confusing for a connection the user deliberately disconnected.
+     */
+    const existingRows = await db.select<{ id: string; connection_name: string; status: string }[]>('cloud_connections', {
+      select: 'id,connection_name,status',
+      filters: { org_id: `eq.${orgId}`, provider: 'eq.aws', aws_account_id: `eq.${body.awsAccountId}` },
+    });
+    const existing = existingRows[0];
+    if (existing) {
+      return c.json(
+        {
+          ok: false,
+          code: 'connection_already_exists',
+          error:
+            existing.status === 'disconnected'
+              ? `AWS account ${body.awsAccountId} already has a disconnected connection in this organization. Reconnect it instead of creating a new one.`
+              : `AWS account ${body.awsAccountId} is already connected to this organization.`,
+          existingConnection: { id: existing.id, name: existing.connection_name, status: existing.status },
+        },
+        409,
+      );
     }
 
     const [created] = await db.insert<Record<string, unknown>[]>('cloud_connections', insert);
@@ -183,12 +266,31 @@ accountsRoutes.put('/accounts/:id', (c) =>
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);
 
-    const [existing] = await db.select<{ environment: string }[]>('cloud_connections', {
-      select: 'environment',
+    const [existing] = await db.select<{ id: string; environment: string; updated_at: string | null }[]>('cloud_connections', {
+      select: 'id,environment,updated_at',
       filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     if (!existing) return errJson(404, 'Account not found');
     await requireMenuPermissionWithAbac(db, auth.userId, orgId, 'cloud', 'write', { environment: existing.environment, provider: 'aws' });
+
+    /**
+     * §14.4 optimistic concurrency.
+     *
+     * The failure this prevents is quiet, which is why it needs a mechanism
+     * rather than care: two people open this connection's settings, one
+     * changes the scan regions and the other the schedule, and the second
+     * save overwrites the first with a payload built from stale data.
+     * Nothing errors and nothing is logged; the first person finds their
+     * change missing days later and reasonably concludes we lost it.
+     *
+     * `required: false` while the client is migrated. A caller that sends
+     * no If-Match keeps working exactly as before; a caller that sends a
+     * STALE one is refused either way, so opting out of the requirement
+     * does not opt out of the check. The ETag is returned on every response
+     * below so clients can adopt it before it is enforced.
+     */
+    const etag = await strongEtag(versionParts(existing));
+    requirePrecondition(c.req.header('If-Match'), etag, { required: false });
 
     const body = (await c.req.json().catch(() => ({}))) as UpdateBody;
     const patch: Record<string, unknown> = {};
@@ -206,7 +308,11 @@ accountsRoutes.put('/accounts/:id', (c) =>
 
     await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.updated', targetType: 'cloud_connection', targetId: c.req.param('id'), metadata: patch });
     const { credentials_encrypted: _omit, ...safe } = rows[0];
-    return okJson(safe);
+    // The NEW version, so the client can chain a second edit without
+    // re-reading -- and so a client that just adopted If-Match has
+    // somewhere to get its first value.
+    const newEtag = await strongEtag(versionParts(safe as { id?: unknown; updated_at?: unknown }));
+    return okJson(safe, 200, { ETag: newEtag });
   }),
 );
 
@@ -233,8 +339,8 @@ accountsRoutes.put('/accounts/:id/credentials', (c) =>
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
     await enforceRateLimit(db, `aws-account:rotate-credentials:${orgId}`, 30, 3600);
 
-    const rows = await db.select<{ id: string; connection_method: string }[]>('cloud_connections', {
-      select: 'id,connection_method',
+    const rows = await db.select<{ id: string; connection_method: string; aws_account_id: string; credentials_encrypted: unknown }[]>('cloud_connections', {
+      select: 'id,connection_method,aws_account_id,credentials_encrypted',
       filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     const account = rows[0];
@@ -247,27 +353,51 @@ accountsRoutes.put('/accounts/:id/credentials', (c) =>
     if (!body.accessKeyId || !looksLikeValidAccessKeyId(body.accessKeyId)) return errJson(400, 'accessKeyId does not look like a valid AWS access key id');
     if (!body.secretAccessKey || body.secretAccessKey.length < 20) return errJson(400, 'secretAccessKey is required');
 
-    const credentials_encrypted = await encryptCredentials(c.env.ENCRYPTION_KEY, {
-      accessKeyId: body.accessKeyId,
-      secretAccessKey: body.secretAccessKey,
+    /**
+     * Validate BEFORE activating (§5, AWS-P0-03).
+     *
+     * This used to encrypt the new keys straight over the live credential,
+     * set the connection to `pending`, and rely on a later validation to
+     * notice a problem. A typo therefore took a working connection down, and
+     * the credential that worked had already been destroyed -- nothing to
+     * roll back to.
+     *
+     * Now: prove the candidate, archive the outgoing secret, then swap. A
+     * failed candidate never touches the live connection, so the worst
+     * outcome of a bad paste is an error message.
+     */
+    const candidate = { accessKeyId: body.accessKeyId, secretAccessKey: body.secretAccessKey };
+    const validation = await validateCandidate(c.env, candidate, account.aws_account_id);
+    if (!validation.ok) {
+      await writeAuditLog(db, {
+        orgId, actorId: auth.userId, action: 'aws_account.credential_rotation_rejected',
+        targetType: 'cloud_connection', targetId: c.req.param('id'),
+        metadata: { code: validation.code },
+      });
+      return c.json({ ok: false, code: validation.code, error: validation.message }, 400);
+    }
+
+    const versionId = await activateCandidate(db, c.env, {
+      orgId,
+      connectionId: account.id,
+      actorId: auth.userId,
+      candidate,
+      identityArn: validation.identityArn ?? null,
+      accountId: validation.accountId ?? null,
+      outgoingEncrypted: account.credentials_encrypted,
     });
 
-    const updated = await db.update<Record<string, unknown>[]>(
-      'cloud_connections',
-      { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
-      {
-        credentials_encrypted,
-        masked_access_key: maskAccessKey(body.accessKeyId),
-        key_rotated_at: new Date().toISOString(),
-        status: 'pending',
-        error_message: null,
-        updated_at: new Date().toISOString(),
-      },
-    );
+    await writeAuditLog(db, {
+      orgId, actorId: auth.userId, action: 'aws_account.credentials_rotated',
+      targetType: 'cloud_connection', targetId: c.req.param('id'),
+      metadata: { versionId, identityArn: validation.identityArn, rollbackAvailable: Boolean(account.credentials_encrypted) },
+    });
 
-    await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.credentials_updated', targetType: 'cloud_connection', targetId: c.req.param('id') });
-    const { credentials_encrypted: _omit, ...safe } = updated[0];
-    return okJson(safe);
+    const rows2 = await db.select<Record<string, unknown>[]>('cloud_connections', {
+      select: LIST_SELECT,
+      filters: { id: `eq.${account.id}` },
+    });
+    return okJson({ ...rows2[0], credentialVersionId: versionId, validatedIdentity: validation.identityArn });
   }),
 );
 
@@ -284,6 +414,46 @@ interface UpdateRoleBody {
  * the only real way to fix a cross-account-role connection whose role was
  * misconfigured or needs re-pointing.
  */
+/**
+ * POST /accounts/:id/credentials/rollback — restore the previous credential.
+ *
+ * Only possible because activation archives the outgoing encrypted blob
+ * before overwriting it. Without that step this endpoint could exist but
+ * could not do anything, which is worse than not offering it.
+ */
+accountsRoutes.post('/accounts/:id/credentials/rollback', (c) =>
+  guarded(async () => {
+    const auth = getAuthContext(c.req.raw);
+    const orgId = requireOrgId(c.req.raw);
+    const db = createDb(c.env, auth.accessToken);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
+    await requirePermittedConnection(db, orgId, auth.userId, c.req.param('id'), getActiveScope(c.req.raw, orgId));
+    /*
+     * AWS-I3. Rollback had NO rate limit, while rotation (line ~340) has one.
+     * The 2026-09-22 audit described the API path as enforcing "permission,
+     * permitted-connection, rate limit and audit log" -- true of rotation, not
+     * of this route.
+     *
+     * It matters because rollback SWAPS THE LIVE CREDENTIAL. An authorised but
+     * careless or malicious editor could flip a connection between credential
+     * versions repeatedly, and every flip is a real write to
+     * cloud_connections plus two to credential_versions. Same budget as
+     * rotation: these are the same class of operation on the same object.
+     */
+    await enforceRateLimit(db, `aws-account:rollback-credentials:${orgId}`, 30, 3600);
+
+    const result = await rollbackToPrevious(db, c.req.param('id'));
+    if (!result.ok) return c.json({ ok: false, code: result.code, error: result.message }, 409);
+
+    await writeAuditLog(db, {
+      orgId, actorId: auth.userId, action: 'aws_account.credential_rollback',
+      targetType: 'cloud_connection', targetId: c.req.param('id'),
+      metadata: { restoredVersionId: result.versionId },
+    });
+    return okJson({ restoredVersionId: result.versionId });
+  }),
+);
+
 accountsRoutes.put('/accounts/:id/role', (c) =>
   guarded(async () => {
     const auth = getAuthContext(c.req.raw);
@@ -300,6 +470,10 @@ accountsRoutes.put('/accounts/:id/role', (c) =>
     if (account.connection_method !== 'cross_account_role') {
       return errJson(400, 'Only cross-account-role connections have a role to update — access-key connections use /credentials instead.');
     }
+
+    // Same gate as create: an un-certified method must not be reachable by
+    // updating an existing connection into it either.
+    if (!isAssumeRoleEnabled(c.env)) return assumeRoleDisabledResponse();
 
     const body = (await c.req.json().catch(() => ({}))) as UpdateRoleBody;
     if (!body.roleArn || !/^arn:aws:iam::\d{12}:role\//.test(body.roleArn)) return errJson(400, 'roleArn must be a valid IAM role ARN');
@@ -356,6 +530,12 @@ accountsRoutes.delete('/accounts/:id', (c) =>
  */
 accountsRoutes.delete('/accounts/:id/permanently', (c) =>
   guarded(async () => {
+    // Phase 0.6 (2026-09-08 audits): permanent purge is disabled by default.
+    // Checked before any auth/DB work so a crafted request cannot probe for a
+    // connection's existence. Disconnect remains available and preserves
+    // history. See lib/capabilities.ts for the full list of missing controls.
+    if (!isConnectionPurgeEnabled(c.env)) return purgeDisabledResponse();
+
     const auth = getAuthContext(c.req.raw);
     const orgId = requireOrgId(c.req.raw);
     const db = createDb(c.env, auth.accessToken);

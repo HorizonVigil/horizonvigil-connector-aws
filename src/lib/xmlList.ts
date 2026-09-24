@@ -86,5 +86,7 @@ export function boolField(xml: string, tag: string): boolean {
 
 export function numField(xml: string, tag: string): number | undefined {
   const v = field(xml, tag);
-  return v === null ? undefined : Number(v);
+  if (v === null) return undefined;
+  const parsed = Number(v);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }

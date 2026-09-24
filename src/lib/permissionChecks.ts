@@ -1,4 +1,9 @@
-import { callQueryApi, callJsonApi, createAwsClient, extractXmlField, type AwsCreds } from './awsApi';
+import { callQueryApi, callJsonApi, createAwsClient, extractXmlField, safeFetch, type AwsCreds } from './awsApi';
+import {
+  checkGuardDuty, checkInspector, checkAccessAnalyzer, checkEcs, checkAwsHealth, checkCur,
+  checkLambda, checkKafka, checkImageBuilder, checkMacie, checkFirewallManager, checkLicenseManager,
+} from './permissionProbesExtra';
+import { redactAwsText } from './redactAws';
 
 export type CheckStatus = 'granted' | 'denied' | 'error' | 'not_applicable';
 
@@ -129,6 +134,21 @@ export async function checkCostExplorer(creds: AwsCreds): Promise<PermissionChec
     });
     if (!res.ok) {
       if (res.errorCode === 'DataUnavailableException') return { service: 'cost_explorer', label: 'Cost Explorer', status: 'not_applicable', detail: 'Cost Explorer has not accumulated data for this account yet', verified: false };
+      /**
+       * Cost Explorer must be switched on in Billing preferences before ANY
+       * principal can query it, and AWS reports that as a plain error rather
+       * than a distinct code. Verified live on a real account: the message is
+       * "User not enabled for cost explorer access".
+       *
+       * This matters because it is the reason cost renders as "no billing
+       * data" for this account -- and "enable Cost Explorer in Billing
+       * preferences" is a completely different instruction from "your IAM
+       * role is missing ce:GetCostAndUsage". Reporting it as a failure sends
+       * someone to fix a policy that is already correct.
+       */
+      if (/not enabled for cost explorer/i.test(res.errorMessage ?? '')) {
+        return { service: 'cost_explorer', label: 'Cost Explorer', status: 'not_applicable', detail: 'Cost Explorer is not enabled for this AWS account. Enable it in the Billing console; data appears within ~24 hours.', verified: false };
+      }
       return { service: 'cost_explorer', label: 'Cost Explorer', status: res.status === 403 ? 'denied' : 'error', detail: res.errorMessage ?? res.errorCode ?? `HTTP ${res.status}`, verified: false };
     }
     return { service: 'cost_explorer', label: 'Cost Explorer', status: 'granted', detail: 'Read access to Cost Explorer confirmed', verified: false };
@@ -149,7 +169,7 @@ export async function checkCostExplorer(creds: AwsCreds): Promise<PermissionChec
 export async function checkEks(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
   try {
     const client = createAwsClient(creds, 'eks', region);
-    const res = await client.fetch(`https://eks.${region}.amazonaws.com/clusters`, { method: 'GET' });
+    const res = await safeFetch(client, `https://eks.${region}.amazonaws.com/clusters`, { method: 'GET' });
     const text = await res.text();
     if (!res.ok) {
       let detail = text.slice(0, 300);
@@ -180,10 +200,22 @@ export async function runFullValidation(creds: AwsCreds, region: string): Promis
   // other check would just fail the same way, so skip straight to reporting
   // that single root cause instead of 6 more denied/error rows saying nothing new.
   if (stsResult.status !== 'granted') {
-    return { identity: null, checks: [stsResult] };
+    // Same redaction: an STS failure message names the principal that failed.
+    return { identity: null, checks: [{ ...stsResult, detail: redactAwsText(stsResult.detail) }] };
   }
 
-  const [iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks] = await Promise.all([
+  /*
+   * AWS-P2. Six capabilities the matrix requires had NO probe, so their state
+   * was `unknown` forever -- indistinguishable, to the frontend, from "we
+   * looked and it is fine". They are probed here alongside the original
+   * twelve. See lib/permissionProbesExtra.ts.
+   */
+  const [
+    iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks, config,
+    securityHub, computeOptimizer, trustedAdvisor,
+    guardDuty, inspector, accessAnalyzer, ecs, health, cur,
+    lambdaFn, kafka, imageBuilder, macie, firewallManager, licenseManager,
+  ] = await Promise.all([
     checkIam(creds),
     checkOrganizations(creds),
     checkCloudWatch(creds, region),
@@ -191,7 +223,177 @@ export async function runFullValidation(creds: AwsCreds, region: string): Promis
     checkTaggingApi(creds, region),
     checkCostExplorer(creds),
     checkEks(creds, region),
+    checkConfig(creds, region),
+    checkSecurityHub(creds, region),
+    checkComputeOptimizer(creds, region),
+    checkTrustedAdvisor(creds),
+    checkGuardDuty(creds, region),
+    checkInspector(creds, region),
+    checkAccessAnalyzer(creds, region),
+    checkEcs(creds, region),
+    checkAwsHealth(creds),
+    checkCur(creds),
+    /*
+     * AWS-I1. The services the IAM-drift finding named.
+     *
+     * Six of these were not probed at all, so when the deployed roles were
+     * missing their permissions, validation reported a clean run while every
+     * one of their scanners was refused. Their ABSENCE from the denied list
+     * was then read as success -- which is exactly how the 2026-09-23 admin
+     * grant appeared to fix seven services that were still, in fact, denied.
+     *
+     * Each calls the same endpoint its scanner calls, so a pass here means
+     * that scanner can actually read.
+     */
+    checkLambda(creds, region),
+    checkKafka(creds, region),
+    checkImageBuilder(creds, region),
+    checkMacie(creds, region),
+    checkFirewallManager(creds),
+    checkLicenseManager(creds, region),
   ]);
 
-  return { identity, checks: [stsResult, iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks] };
+  /*
+   * Every probe ends with `detail: res.errorMessage ?? ...`, passing AWS's own
+   * error text through to a column that is rendered on the account page,
+   * returned by the API, and written to logs. AWS routinely quotes the refused
+   * principal in that text, and for an IAM-user principal it contains the
+   * ACCESS-KEY ID.
+   *
+   * Redacted at this one chokepoint rather than in nineteen separate probes --
+   * a probe added later cannot forget to do it. Found by a test asserting no
+   * probe echoes credential material, which caught Inspector returning
+   * `failed for AKIA_TEST` verbatim. See lib/redactAws.ts.
+   */
+  const checks = [
+    stsResult, iam, organizations, cloudwatch, cloudtrail, tagging, costExplorer, eks, config,
+    securityHub, computeOptimizer, trustedAdvisor,
+    guardDuty, inspector, accessAnalyzer, ecs, health, cur,
+    lambdaFn, kafka, imageBuilder, macie, firewallManager, licenseManager,
+  ].map((check) => ({ ...check, detail: redactAwsText(check.detail) }));
+
+  return { identity, checks };
+}
+
+/**
+ * The four capabilities below are SCANNED by discovery but were never PROBED
+ * here, so the account-health view reported "connected" while the scan for
+ * them failed every night on a missing permission. That is the specific thing
+ * §5C of the connector spec forbids: reporting a connection as working when
+ * half the required permissions are absent.
+ *
+ * All four distinguish "not enabled" from "not permitted", because those need
+ * different words in front of a customer — only one of them is fixed by
+ * editing an IAM policy. They are `verified: false` on the same convention
+ * the existing unconfirmed checks use: an unexpected response shape degrades
+ * to an honest `error`, never to a wrong `granted`.
+ */
+export async function checkConfig(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  const base = { service: 'config', label: 'AWS Config', verified: false };
+  try {
+    const res = await callJsonApi(creds, {
+      service: 'config', region, host: `config.${region}.amazonaws.com`,
+      target: 'StarlingDoveService.DescribeConfigurationRecorders', body: {},
+    });
+    if (!res.ok) {
+      if (res.normalizedCode === 'UNSUPPORTED_CAPABILITY') return { ...base, status: 'not_applicable', detail: 'AWS Config is not enabled in this region.' };
+      return { ...base, status: res.normalizedCode === 'PERMISSION_DENIED' ? 'denied' : 'error', detail: res.errorMessage ?? res.normalizedCode ?? `HTTP ${res.status}` };
+    }
+    const recorders = (res.body as { ConfigurationRecorders?: unknown[] })?.ConfigurationRecorders ?? [];
+    // Readable but with no recorder is a real, distinct state: compliance
+    // evidence will be empty for an honest reason, not a permissions one.
+    if (recorders.length === 0) return { ...base, status: 'not_applicable', detail: 'Permission confirmed, but no configuration recorder exists in this region — Config has no evidence to return.' };
+    return { ...base, status: 'granted', detail: `Read access to AWS Config confirmed — ${recorders.length} configuration recorder(s) in ${region}` };
+  } catch (err) {
+    return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
+  }
+}
+
+export async function checkSecurityHub(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  const base = { service: 'securityhub', label: 'Security Hub', verified: false };
+  try {
+    const client = createAwsClient(creds, 'securityhub', region);
+    const res = await safeFetch(client, `https://securityhub.${region}.amazonaws.com/accounts`, { method: 'GET' });
+    if (res.status === 404 || res.status === 400 || res.status === 401) {
+      /*
+       * Security Hub answers "not subscribed" rather than "forbidden" when the
+       * service was never enabled for the account -- and unusually for AWS it
+       * uses **401** for that, not 400/404. Production, 2026-09-22: both
+       * connections recorded `error: AWS returned HTTP 401 for Security Hub`,
+       * which read as a fault in a product that was simply switched off.
+       *
+       * 401 is safe to read this way HERE specifically: STS is probed first
+       * and must pass, so credentials are known good by the time this runs.
+       * A genuine credential failure cannot reach this line.
+       */
+      return { ...base, status: 'not_applicable', detail: 'Security Hub is not enabled in this region.' };
+    }
+    if (!res.ok) {
+      return { ...base, status: res.status === 403 ? 'denied' : 'error', detail: `AWS returned HTTP ${res.status} for Security Hub.` };
+    }
+    return { ...base, status: 'granted', detail: 'Read access to Security Hub confirmed' };
+  } catch (err) {
+    return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
+  }
+}
+
+export async function checkComputeOptimizer(creds: AwsCreds, region: string): Promise<PermissionCheckResult> {
+  const base = { service: 'compute_optimizer', label: 'Compute Optimizer', verified: false };
+  try {
+    const res = await callJsonApi(creds, {
+      service: 'compute-optimizer', region, host: `compute-optimizer.${region}.amazonaws.com`,
+      target: 'ComputeOptimizerService.GetEnrollmentStatus', body: {},
+    });
+    if (!res.ok) {
+      if (res.normalizedCode === 'UNSUPPORTED_CAPABILITY') return { ...base, status: 'not_applicable', detail: 'Compute Optimizer is not available for this account.' };
+      /*
+       * GetEnrollmentStatus answers RESOURCE_NOT_FOUND when the account has
+       * never opted in. That is the same enablement state the `status !==
+       * 'Active'` branch below already handles correctly -- it just arrives by
+       * a different route when no enrollment record exists at all.
+       *
+       * Production, 2026-09-22: both connections recorded
+       * `error: RESOURCE_NOT_FOUND`, sending customers to debug a fault where
+       * the answer was a console opt-in.
+       */
+      const code = res.errorCode ?? res.normalizedCode ?? '';
+      if (/RESOURCE_NOT_FOUND|ResourceNotFound/i.test(code) || /RESOURCE_NOT_FOUND/i.test(res.errorMessage ?? '')) {
+        return { ...base, status: 'not_applicable', detail: 'Compute Optimizer is not enrolled for this account (AWS returned RESOURCE_NOT_FOUND).' };
+      }
+      return { ...base, status: res.normalizedCode === 'PERMISSION_DENIED' ? 'denied' : 'error', detail: res.errorMessage ?? res.normalizedCode ?? `HTTP ${res.status}` };
+    }
+    const status = (res.body as { status?: string })?.status;
+    // Opt-in is the common real case, and it is NOT a permission problem —
+    // saying "denied" here would send someone to edit an IAM policy that is
+    // already correct.
+    if (status && status !== 'Active') {
+      return { ...base, status: 'not_applicable', detail: `Compute Optimizer is not enrolled for this account (status: ${status}).` };
+    }
+    return { ...base, status: 'granted', detail: 'Read access to Compute Optimizer confirmed and the account is enrolled' };
+  } catch (err) {
+    return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
+  }
+}
+
+export async function checkTrustedAdvisor(creds: AwsCreds): Promise<PermissionCheckResult> {
+  const base = { service: 'trusted_advisor', label: 'Trusted Advisor', verified: false };
+  try {
+    // Support API is global and only resolves via us-east-1.
+    const res = await callJsonApi(creds, {
+      service: 'support', region: 'us-east-1', host: 'support.us-east-1.amazonaws.com',
+      target: 'AWSSupport_20130415.DescribeTrustedAdvisorChecks', body: { language: 'en' },
+    });
+    if (!res.ok) {
+      // Trusted Advisor's full check set requires Business/Enterprise support.
+      // A Basic-plan account is not misconfigured, so this is not_applicable.
+      if (res.normalizedCode === 'UNSUPPORTED_CAPABILITY' || /subscription/i.test(res.errorMessage ?? '')) {
+        return { ...base, status: 'not_applicable', detail: 'Trusted Advisor checks require a Business or Enterprise support plan on this account.' };
+      }
+      return { ...base, status: res.normalizedCode === 'PERMISSION_DENIED' ? 'denied' : 'error', detail: res.errorMessage ?? res.normalizedCode ?? `HTTP ${res.status}` };
+    }
+    const checks = (res.body as { checks?: unknown[] })?.checks ?? [];
+    return { ...base, status: 'granted', detail: `Read access to Trusted Advisor confirmed — ${checks.length} check(s) available` };
+  } catch (err) {
+    return { ...base, status: 'error', detail: err instanceof Error ? err.message : 'Request failed' };
+  }
 }

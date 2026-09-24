@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, inFilter, writeAuditLog, guarded, okJson, errJson, type Db } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, inFilter, writeAuditLog, guarded, okJson, errJson, type Db, requirePermittedConnection } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
 import { resolveFindingResourceIds } from '../lib/arnResourceLookup';
@@ -6,6 +6,7 @@ import { scanEc2, EC2_RESOURCE_TYPES } from '../lib/scanners/ec2';
 import { scanRds, RDS_RESOURCE_TYPES } from '../lib/scanners/rds';
 import { scanIam, IAM_RESOURCE_TYPES, extractCloudIdentityRows } from '../lib/scanners/iam';
 import { materializeResourceEdges } from '../lib/edgeMaterialization';
+import { materializeNetworkTopology } from '../lib/networkTopology';
 import { scanSns, SNS_RESOURCE_TYPES } from '../lib/scanners/sns';
 import { scanSqs, SQS_RESOURCE_TYPES } from '../lib/scanners/sqs';
 import { scanDynamoDb, DYNAMODB_RESOURCE_TYPES } from '../lib/scanners/dynamodb';
@@ -112,10 +113,27 @@ import { scanAwsConfigFindings } from '../lib/scanners/awsConfigFindings';
 import { scanTrustedAdvisorFindings } from '../lib/scanners/trustedAdvisorFindings';
 import { scanEc2CpuMetrics } from '../lib/scanners/ec2Metrics';
 import type { ScannedResource, ScannerFn } from '../lib/scanners/types';
+import type { AwsCallFailure, AwsCallRecord } from '../lib/awsApi';
+import { admitObservations } from '../lib/admission';
+import { NORMALIZATION_VERSION, SOURCE_SCHEMA_VERSION } from '../lib/lineage';
+import { closeBatch, openBatch, recordObservations, recordProviderRequests, recordQuarantine } from '../lib/ingestion';
+
+/**
+ * Cap on provider-request rows kept per ingestion batch.
+ *
+ * A scanner fanning out over hundreds of resources can make hundreds of
+ * calls, and a step's lineage should not become the largest thing in the
+ * database. When the cap bites it is RECORDED on the batch, not applied
+ * silently -- truncated evidence that claims to be complete is the exact
+ * failure this phase exists to remove.
+ */
+const MAX_PROVIDER_REQUESTS_PER_BATCH = 200;
 import type { ScannedFinding, FindingScannerFn } from '../lib/scanners/findingTypes';
 import type { ScannedMetric } from '../lib/scanners/metricTypes';
 import { computeFinalizeResult } from '../lib/discoveryFinalize';
+import { resolveGeneration, type ExistingGeneration, type LifecycleState } from '../lib/generations';
 import { triggerRecommendationGeneration, triggerAlertEvaluation } from '../lib/postScanHooks';
+import { RegionCoverageLedger } from '../lib/regionalAvailability';
 
 export const discoveryRoutes = new Hono<{ Bindings: Env }>();
 
@@ -308,6 +326,32 @@ export const FINDING_SCANNERS: Record<string, FindingScannerFn> = {
 };
 
 /**
+ * Which `vulnerability_findings.finding_source` values each finding scanner
+ * can produce — the findings counterpart of SCANNER_RESOURCE_TYPES, and for
+ * the same reason.
+ *
+ * finalize marks an open finding RESOLVED when this run did not see it again.
+ * That is only true if the scanner that produces it actually ran and
+ * succeeded; otherwise "we could not read GuardDuty" is written to the
+ * database as "GuardDuty reports you are clean". Before this map the source
+ * list was a hardcoded literal inside finalize, applied unconditionally, so a
+ * denied, throttled or simply not-yet-executed finding scanner silently
+ * closed every one of its open findings.
+ *
+ * `iam_access_analyzer_unused` is listed here and was NOT in that literal --
+ * the drift a hardcoded list produces. Its findings could never be resolved at
+ * all, which is the opposite error: a fixed problem staying open forever.
+ */
+export const FINDING_SCANNER_SOURCES: Record<string, readonly string[]> = {
+  guardduty: ['guardduty'],
+  securityhub: ['security_hub'],
+  accessanalyzer: ['iam_access_analyzer', 'iam_access_analyzer_unused'],
+  inspector: ['inspector'],
+  awsconfig: ['aws_config'],
+  trustedadvisor: ['trusted_advisor'],
+};
+
+/**
  * Metric steps are a fourth kind, alongside REGIONAL/GLOBAL_SCANNERS and
  * FINDING_SCANNERS — they write to resource_metrics (a time-series table),
  * and unlike every other scanner they need to know which resources this
@@ -440,7 +484,12 @@ export interface ConnectionForDiscovery extends ResolvableConnection {
   scan_regions: string[] | null;
 }
 
-export async function loadConnection(db: Db, orgId: string, id: string): Promise<ConnectionForDiscovery | null> {
+export async function loadConnection(db: Db, orgId: string, userId: string | null, id: string): Promise<ConnectionForDiscovery | null> {
+  // Compile-enforced authorization: `userId` is required so every call site
+  // has to decide. An id + org_id filter proves only that the connection
+  // belongs to the caller's org, never that this caller is permitted it.
+  // Pass null ONLY from internal/scheduled paths that run without a user.
+  if (userId) await requirePermittedConnection(db, orgId, userId, id);
   const rows = await db.select<ConnectionForDiscovery[]>('cloud_connections', {
     select: 'id,aws_account_id,connection_method,credentials_encrypted,role_arn,external_id,default_region,scan_regions',
     filters: { id: `eq.${id}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
@@ -453,41 +502,19 @@ export function regionsFor(connection: ConnectionForDiscovery): string[] {
 }
 
 /**
- * GET /api/aws-accounts/accounts/:id/discovery/steps — the ordered step
- * list this account's scan regions require, for the frontend's step-loop.
- * Also stamps scan_started_at, even though this is nominally a GET — this
- * is genuinely the first call of every interactive scan (see
- * syncContext.tsx's startDiscovery), so it's the one reliable place to
- * record "a scan began here" for the abandoned-scan sweep in
- * internalScan.ts to detect a tab that closed before finishing. Bumped to
- * requiring 'write' rather than 'read' to match that real side effect.
+ * GET /accounts/:id/discovery/steps was REMOVED (Phase B cleanup, 2026-09-10).
+ *
+ * It served the browser's step-loop, which Phase 1 removed and Phase 3
+ * replaced with durable, server-owned collection runs. `planSteps` in
+ * routes/collectionRuns.ts now builds the same plan server-side, so this was
+ * a second, unauthenticated-by-the-worker way to enumerate a scan.
+ *
+ * It also stamped `scan_started_at` as a side effect of a GET. Nothing else
+ * writes that column, so the abandoned-scan branch in internalStep.ts that
+ * reads it has been inert since the browser stopped calling this -- see the
+ * note there, which is now corrected rather than left implying a check that
+ * cannot fire.
  */
-discoveryRoutes.get('/accounts/:id/discovery/steps', (c) =>
-  guarded(async () => {
-    const auth = getAuthContext(c.req.raw);
-    const orgId = requireOrgId(c.req.raw);
-    const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
-
-    const connection = await loadConnection(db, orgId, c.req.param('id'));
-    if (!connection) return errJson(404, 'Account not found');
-
-    const regionalNames = Object.keys(REGIONAL_SCANNERS);
-    const globalNames = Object.keys(GLOBAL_SCANNERS);
-    const findingNames = Object.keys(FINDING_SCANNERS);
-    const regions = regionsFor(connection);
-    const steps = [
-      ...regions.flatMap((region) => regionalNames.map((name) => `regional:${name}:${region}`)),
-      ...globalNames.map((name) => `global:${name}`),
-      ...regions.flatMap((region) => findingNames.map((name) => `finding:${name}:${region}`)),
-      ...regions.map((region) => `metric:${METRIC_STEP_NAME}:${region}`),
-    ];
-
-    await db.update('cloud_connections', { id: `eq.${connection.id}` }, { scan_started_at: new Date().toISOString() }, 'return=minimal');
-
-    return okJson({ steps, regions, scannerCount: regionalNames.length + globalNames.length + findingNames.length + 1 });
-  }),
-);
 
 export interface StepResult {
   stepId: string;
@@ -496,6 +523,15 @@ export interface StepResult {
   error?: string;
   /** 'info' = the account/region just doesn't have this service turned on — not a real failure. */
   errorSeverity?: 'error' | 'info';
+  /**
+   * Resource types whose coverage this step could not complete (an AWS call
+   * failed and the scanner continued with partial data). The caller passes
+   * these to finalize, which excludes them from vanished-resource deletion --
+   * otherwise a throttled Describe* reads as "everything was deleted".
+   */
+  degradedResourceTypes?: string[];
+  /** Why each degraded type degraded, keyed by resource type. */
+  degradedReasons?: Record<string, string>;
 }
 
 const EXPECTED_ACCOUNT_STATE_PATTERNS = [/needs a subscription for the service/i, /is not subscribed to/i, /opt.?in/i, /not.{0,20}(enabled|activated)/i];
@@ -516,7 +552,14 @@ interface CatalogRow { key: string; category: string; service: string }
  * AWS (PostgREST's `resolution=merge-duplicates` only touches columns
  * actually present in the payload).
  */
-export async function runFindingStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+export async function runFindingStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string,
+  /**
+   * The durable run this step belongs to. Optional so the signature stays
+   * compatible, but the durable worker always supplies it -- without it
+   * `ingestion_batches.collection_run_id` is NULL and a stored resource
+   * cannot be traced back to the run that collected it.
+   */
+  collectionRunId: string | null = null): Promise<StepResult> {
   const rest = stepId.slice('finding:'.length);
   const sep = rest.indexOf(':');
   if (sep === -1) return { stepId, resourceCount: 0, created: 0, error: `Malformed stepId "${stepId}"`, errorSeverity: 'error' };
@@ -525,20 +568,50 @@ export async function runFindingStep(db: Db, orgId: string, env: Env, connection
   const scanner = FINDING_SCANNERS[scannerName];
   if (!scanner) return { stepId, resourceCount: 0, created: 0, error: `Unknown finding scanner "${scannerName}"`, errorSeverity: 'error' };
 
-  const connection = await loadConnection(db, orgId, connectionId);
+  const connection = await loadConnection(db, orgId, userId, connectionId);
   if (!connection) return { stepId, resourceCount: 0, created: 0, error: 'Account not found', errorSeverity: 'error' };
 
   const resolved = await resolveCredentials(env, connection);
   if ('error' in resolved) return { stepId, resourceCount: 0, created: 0, error: resolved.error, errorSeverity: 'error' };
 
+  /**
+   * Finding scanners had NO failure sink at all: they were called with bare
+   * credentials, so a denied, throttled or unreachable call returned an empty
+   * list and left no trace anywhere. finalize then resolved every open finding
+   * from that source, because it could not tell "AWS says this is fixed" from
+   * "we never got to ask".
+   *
+   * Recorded on the STEP ROW rather than in memory, because the step and the
+   * finalize that consumes it routinely happen in different worker ticks. The
+   * severity is deliberately 'info', not 'error': nothing fatal happened, the
+   * run should still report SUCCEEDED, and a service the account has not
+   * enabled must not look like a broken connection. What it must do is stop
+   * the step counting as proof of absence -- which is exactly what a
+   * non-'succeeded' status does in collectionRuns.ts.
+   */
+  const callFailures: AwsCallFailure[] = [];
+  const onCallFailure = (f: AwsCallFailure) => { callFailures.push(f); };
+
   let scanned: ScannedFinding[];
   try {
-    scanned = await scanner({ creds: resolved.creds, region });
+    scanned = await scanner({ creds: { ...resolved.creds, onCallFailure }, region });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Scan failed';
     return { stepId, resourceCount: 0, created: 0, error: message, errorSeverity: classifyError(message) };
   }
-  if (scanned.length === 0) return { stepId, resourceCount: 0, created: 0 };
+
+  const coverage = new RegionCoverageLedger();
+  const sources = FINDING_SCANNER_SOURCES[scannerName] ?? [scannerName];
+  for (const f of callFailures) coverage.record(f, sources);
+  const degradedMap = coverage.degradedTypes();
+  // A service AWS does not offer in this region is not a coverage gap -- the
+  // ledger already makes that distinction, and treating it as one would keep
+  // every finding in a single-region account open forever.
+  const incomplete = degradedMap.size > 0
+    ? { error: [...degradedMap.values()][0], errorSeverity: 'info' as const }
+    : {};
+
+  if (scanned.length === 0) return { stepId, resourceCount: 0, created: 0, ...incomplete };
 
   const existing = await db.select<{ finding_source: string; aws_finding_id: string }[]>('vulnerability_findings', {
     select: 'finding_source,aws_finding_id',
@@ -559,7 +632,7 @@ export async function runFindingStep(db: Db, orgId: string, env: Env, connection
     return {
       connection_id: connection.id, resource_id: (f.resourceArn && resourceIdByArn.get(f.resourceArn)) ?? null,
       finding_source: f.findingSource, aws_finding_id: f.awsFindingId,
-      severity: f.severity, cvss_score: f.cvssScore ?? null, title: f.title, description: f.description ?? null,
+      severity: f.severity, cvss_score: f.cvssScore ?? null, cve: f.cve ?? null, title: f.title, description: f.description ?? null,
       compliance_frameworks: f.complianceFrameworks ?? [], remediation_link: f.remediationLink ?? null,
       discovered_at: f.discoveredAt, region: f.region, resource_arn: f.resourceArn ?? null, last_seen_at: now,
     };
@@ -567,7 +640,9 @@ export async function runFindingStep(db: Db, orgId: string, env: Env, connection
 
   await db.insert('vulnerability_findings?on_conflict=connection_id,finding_source,aws_finding_id', rows, 'resolution=merge-duplicates,return=minimal');
 
-  return { stepId, resourceCount: rows.length, created };
+  // Same reasoning as the empty path above, and the more dangerous case: a
+  // step that wrote SOME findings and failed other calls looks complete.
+  return { stepId, resourceCount: rows.length, created, ...incomplete };
 }
 
 /**
@@ -582,7 +657,14 @@ export async function runFindingStep(db: Db, orgId: string, env: Env, connection
  * instance that isn't running, so pulling their metrics would just waste
  * subrequests on empty responses.
  */
-export async function runMetricStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+export async function runMetricStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string,
+  /**
+   * The durable run this step belongs to. Optional so the signature stays
+   * compatible, but the durable worker always supplies it -- without it
+   * `ingestion_batches.collection_run_id` is NULL and a stored resource
+   * cannot be traced back to the run that collected it.
+   */
+  collectionRunId: string | null = null): Promise<StepResult> {
   const rest = stepId.slice('metric:'.length);
   const sep = rest.indexOf(':');
   if (sep === -1) return { stepId, resourceCount: 0, created: 0, error: `Malformed stepId "${stepId}"`, errorSeverity: 'error' };
@@ -590,7 +672,7 @@ export async function runMetricStep(db: Db, orgId: string, env: Env, connectionI
   const region = rest.slice(sep + 1);
   if (metricName !== METRIC_STEP_NAME) return { stepId, resourceCount: 0, created: 0, error: `Unknown metric step "${metricName}"`, errorSeverity: 'error' };
 
-  const connection = await loadConnection(db, orgId, connectionId);
+  const connection = await loadConnection(db, orgId, userId, connectionId);
   if (!connection) return { stepId, resourceCount: 0, created: 0, error: 'Account not found', errorSeverity: 'error' };
 
   const resolved = await resolveCredentials(env, connection);
@@ -627,7 +709,14 @@ export async function runMetricStep(db: Db, orgId: string, env: Env, connectionI
  * routes/internalScan.ts's scheduled-scan path can drive the exact same
  * upsert logic server-side instead of duplicating it.
  */
-export async function runResourceStep(db: Db, orgId: string, env: Env, connectionId: string, stepId: string): Promise<StepResult> {
+export async function runResourceStep(db: Db, orgId: string, userId: string | null, env: Env, connectionId: string, stepId: string,
+  /**
+   * The durable run this step belongs to. Optional so the signature stays
+   * compatible, but the durable worker always supplies it -- without it
+   * `ingestion_batches.collection_run_id` is NULL and a stored resource
+   * cannot be traced back to the run that collected it.
+   */
+  collectionRunId: string | null = null): Promise<StepResult> {
   let scanner: ScannerFn | undefined;
   let region: string;
   let scannerName: string;
@@ -647,59 +736,281 @@ export async function runResourceStep(db: Db, orgId: string, env: Env, connectio
   }
   if (!scanner) return { stepId, resourceCount: 0, created: 0, error: `Unknown scanner in stepId "${stepId}"`, errorSeverity: 'error' };
 
-  const connection = await loadConnection(db, orgId, connectionId);
+  const connection = await loadConnection(db, orgId, userId, connectionId);
   if (!connection) return { stepId, resourceCount: 0, created: 0, error: 'Account not found', errorSeverity: 'error' };
 
   const resolved = await resolveCredentials(env, connection);
   if ('error' in resolved) return { stepId, resourceCount: 0, created: 0, error: resolved.error, errorSeverity: 'error' };
 
+  /**
+   * Collects sub-call failures the scanner absorbed while continuing with
+   * partial data. Without this they were invisible: the step reported success
+   * and finalize deleted everything the failed call would have returned.
+   *
+   * The sink hangs off the CREDENTIALS rather than being reported by each
+   * scanner, because creds are the one object all 111 scanners already thread
+   * into every AWS call regardless of which helper they use. Any failed call
+   * therefore degrades this scanner's resource types automatically -- and a
+   * scanner written next month is covered without anyone remembering to wire
+   * it.
+   *
+   * The affected types come from SCANNER_RESOURCE_TYPES, the same map that
+   * builds COVERED_RESOURCE_TYPES, so a failure protects exactly what this
+   * scanner would have been trusted to delete and nothing else.
+   */
+  /*
+   * AWS-P3. This used to mark every type a scanner owns as degraded on ANY
+   * terminal call failure -- including a service that simply has no endpoint
+   * in the region being scanned. Discovery fans out over 17 regions and most
+   * AWS services are not offered in all of them, so 41 resource types were
+   * degraded on every single run, inventory was never authoritative, and those
+   * types could never be reconciled for deletion.
+   *
+   * The ledger classifies each failure instead: absence of an endpoint is a
+   * coverage FACT (there is nothing there to read), while a denial, a throttle
+   * or a real error is a coverage GAP. Only gaps degrade.
+   * See lib/regionalAvailability.ts.
+   */
+  const coverage = new RegionCoverageLedger();
+  const ownedTypes: readonly string[] = SCANNER_RESOURCE_TYPES[scannerName] ?? [];
+  const onCallFailure = (f: AwsCallFailure) => {
+    coverage.record(f, ownedTypes);
+    console.warn(`[degraded] ${f.service}:${f.action} ${f.region} -> ${f.normalizedCode} after ${f.attempts} attempt(s); ${ownedTypes.length} resource type(s) protected from deletion this run`);
+  };
+
+  /**
+   * Phase 2: every AWS call this step makes, for provider-request lineage.
+   *
+   * Capped because a scanner fanning out over hundreds of resources can make
+   * hundreds of calls, and a step's lineage should not become the largest
+   * thing in the database. The cap is recorded on the batch rather than
+   * silently applied -- a truncated record that claims to be complete is the
+   * failure mode this phase exists to remove.
+   */
+  const calls: AwsCallRecord[] = [];
+  let callsDropped = 0;
+  const onCall = (c: AwsCallRecord) => {
+    if (calls.length < MAX_PROVIDER_REQUESTS_PER_BATCH) calls.push(c);
+    else callsDropped += 1;
+  };
+
+  /**
+   * The batch is opened BEFORE the scanner runs, so a crash mid-step leaves a
+   * visible RUNNING batch rather than no evidence that ingestion was ever
+   * attempted. "No batch" and "a batch that failed" must not look the same.
+   */
+  const batch = await openBatch(db, {
+    orgId,
+    connectionId: connection.id,
+    accountNativeId: connection.aws_account_id ?? null,
+    collectionRunId,
+    collectionStepId: stepId,
+  });
+
   let scanned: ScannedResource[];
   try {
-    scanned = await scanner({ creds: resolved.creds, region });
+    scanned = await scanner({ creds: { ...resolved.creds, onCallFailure, onCall }, region });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Scan failed';
+    await recordProviderRequests(db, batch, calls).catch(() => {});
+    await closeBatch(db, batch.id, {
+      observed: 0, accepted: 0, quarantined: 0, rejected: 0,
+      errorCount: 1, errorSummary: classifyError(message) === 'error' ? 'Scanner threw' : message, failed: true,
+    }).catch(() => {});
     return { stepId, resourceCount: 0, created: 0, error: message, errorSeverity: classifyError(message) };
   }
-  if (scanned.length === 0) return { stepId, resourceCount: 0, created: 0 };
+  const degradedMap = coverage.degradedTypes();
+  const degradedResourceTypes = degradedMap.size > 0 ? [...degradedMap.keys()] : undefined;
+  // The REASON travels with the type. Production runs stored 41 bare type
+  // names with no reason anywhere, so nothing could tell an absent service
+  // from an IAM denial -- and those need opposite responses.
+  const degradedReasons = degradedMap.size > 0 ? Object.fromEntries(degradedMap) : undefined;
+  // Returned even on the zero-resource path: an empty result caused by a
+  // failed call is exactly the case finalize must not read as deletion.
+  if (scanned.length === 0) {
+    await recordProviderRequests(db, batch, calls).catch(() => {});
+    await closeBatch(db, batch.id, {
+      observed: 0, accepted: 0, quarantined: 0, rejected: 0,
+      errorCount: degradedMap.size,
+      errorSummary: callsDropped > 0 ? `${callsDropped} provider request(s) not recorded (per-batch cap)` : null,
+    }).catch(() => {});
+    return { stepId, resourceCount: 0, created: 0, degradedResourceTypes, degradedReasons };
+  }
 
   const typeKeys = [...new Set(scanned.map((r) => r.resourceTypeKey))];
   const [catalogRows, existing] = await Promise.all([
     db.select<CatalogRow[]>('resource_type_catalog', { select: 'key,category,service', filters: { key: inFilter(typeKeys) } }),
-    db.select<{ resource_type_key: string; resource_id: string; deleted_at: string | null }[]>('cloud_resources', {
-      select: 'resource_type_key,resource_id,deleted_at',
+    // Phase 4 §2: generation and lifecycle_state are selected because the
+    // upsert can no longer be decided from the native id alone -- a deleted
+    // id that reappears must open a new generation rather than land back in
+    // the dead row.
+    db.select<{ id: string; resource_type_key: string; resource_id: string; deleted_at: string | null; generation: number; lifecycle_state: LifecycleState }[]>('cloud_resources', {
+      select: 'id,resource_type_key,resource_id,deleted_at,generation,lifecycle_state',
       filters: { connection_id: `eq.${connection.id}`, resource_type_key: inFilter(typeKeys) },
     }),
   ]);
   const catalogByKey = new Map(catalogRows.map((r) => [r.key, r]));
   const existingByKey = new Map(existing.map((r) => [`${r.resource_type_key}:${r.resource_id}`, r]));
 
+  /**
+   * All generations held for each identity, so resolveGeneration sees the
+   * full history rather than whichever row happened to be last. Grouped once
+   * here because the row builder below runs per accepted record.
+   */
+  const generationsByKey = new Map<string, ExistingGeneration[]>();
+  for (const r of existing) {
+    const key = `${r.resource_type_key}:${r.resource_id}`;
+    const list = generationsByKey.get(key) ?? [];
+    list.push({
+      id: r.id,
+      generation: r.generation ?? 1,
+      lifecycle_state: r.lifecycle_state ?? (r.deleted_at ? 'DELETED' : 'ACTIVE'),
+      // No AWS scanner supplies a reuse-proof identifier today, so this is
+      // null for every type. Stated explicitly rather than left implicit:
+      // when a scanner starts providing one (RDS DbiResourceId is the
+      // obvious first), this is the single place that changes.
+      immutable_identity: null,
+    });
+    generationsByKey.set(key, list);
+  }
+
+  /**
+   * Phase 2 admission. Before this, `scanned` went straight into the upsert:
+   * an unrecognised resourceTypeKey became a real inventory row in the
+   * 'Others' category, an empty resourceId upserted against a conflict key
+   * containing an empty string, and a resource belonging to a different AWS
+   * account was written under this connection's account id regardless.
+   *
+   * Every record now ends as exactly ACCEPTED or QUARANTINED, and the batch's
+   * accounting constraint makes a record that fell out of the pipeline
+   * entirely unrepresentable rather than merely unlikely.
+   *
+   * The catalog for the WHOLE scan is the authority on known types, not just
+   * the types this step happened to return -- otherwise every type would look
+   * unknown on a step that returned only unknown types.
+   */
+  const knownTypes = new Set(catalogRows.map((c) => c.key));
+  const admission = await admitObservations(scanned, {
+    orgId,
+    connectionId: connection.id,
+    accountNativeId: connection.aws_account_id ?? null,
+    knownResourceTypes: knownTypes,
+  });
+
   const now = new Date().toISOString();
   const createdEvents: Record<string, unknown>[] = [];
-  const rows = scanned.map((r) => {
+  // Only ACCEPTED records reach canonical state. This single substitution is
+  // the canonical-admission rule (§7): validated observation -> canonical
+  // resource, never raw provider response -> canonical resource.
+  const acceptedByIdentity = new Map(admission.accepted.map((a) => [`${a.resource.resourceTypeKey}${a.resource.resourceId}`, a]));
+  const rows = admission.accepted.map(({ resource: r }) => {
     const catalog = catalogByKey.get(r.resourceTypeKey);
     const key = `${r.resourceTypeKey}:${r.resourceId}`;
     const prior = existingByKey.get(key);
     if (!prior || prior.deleted_at) {
       createdEvents.push({ connection_id: connection.id, resource_type_key: r.resourceTypeKey, aws_resource_id: r.resourceId, event_type: 'created' });
     }
+    const decision = resolveGeneration(generationsByKey.get(key) ?? [], null);
     return {
       connection_id: connection.id, account_id: connection.aws_account_id, resource_type_key: r.resourceTypeKey,
       resource_id: r.resourceId, resource_name: r.resourceName ?? null, region: r.region,
+      // Phase 4 §2/§8/§5.
+      generation: decision.generation,
+      lifecycle_state: decision.lifecycle_state,
+      org_id: orgId,
+      // §5: a region we hold is REGIONAL; absence of one is UNKNOWN, never a
+      // default region and never GLOBAL, which needs the type registry's
+      // globality flag to prove.
+      location_scope: r.region && r.region.trim() !== '' && r.region.toLowerCase() !== 'unknown' ? 'REGIONAL' : 'UNKNOWN',
+      updated_at: now,
       category: catalog?.category ?? 'Others', service: catalog?.service ?? r.resourceTypeKey.split('_')[0],
       state: r.state ?? null, status: r.state === 'terminated' ? 'terminated' : r.state === 'stopped' ? 'stopped' : 'active',
       is_default: r.isDefault ?? false, tags: r.tags ?? {}, metadata: r.metadata ?? {}, relationships: r.relationships ?? {},
       last_seen_at: now, deleted_at: null,
+      // Lineage. `lineage_state: 'traced'` is only ever set here, on a row
+      // that actually went through admission -- rows that predate this keep
+      // 'legacy_unknown', which is the truth about them.
+      ingestion_batch_id: batch.id,
+      partition: acceptedByIdentity.get(`${r.resourceTypeKey}${r.resourceId}`)?.partition ?? null,
+      provider_resource_arn: acceptedByIdentity.get(`${r.resourceTypeKey}${r.resourceId}`)?.arn ?? null,
+      source_type: 'aws_api',
+      collector_observed_at: now,
+      ingested_at: now,
+      normalized_at: now,
+      source_schema_version: SOURCE_SCHEMA_VERSION,
+      normalization_version: NORMALIZATION_VERSION,
+      record_fingerprint: acceptedByIdentity.get(`${r.resourceTypeKey}${r.resourceId}`)?.recordFingerprint ?? null,
+      configuration_hash: acceptedByIdentity.get(`${r.resourceTypeKey}${r.resourceId}`)?.configurationHash ?? null,
+      lineage_state: 'traced',
     };
   });
 
-  // cloud_resources has a unique constraint on (connection_id, resource_type_key,
-  // resource_id) — upsert via on_conflict rather than delete+insert, so a
-  // resource's first_seen_at/created_at (and its row id, which lifecycle
-  // events elsewhere may reference) survive a re-scan.
-  await db.insert('cloud_resources?on_conflict=connection_id,resource_type_key,resource_id', rows, 'resolution=merge-duplicates,return=minimal');
+  // Identity is (connection_id, resource_type_key, resource_id, GENERATION) —
+  // upsert via on_conflict rather than delete+insert, so a resource's
+  // first_seen_at/created_at (and its row id, which lifecycle events
+  // elsewhere may reference) survive a re-scan.
+  //
+  // Phase 4 §2 added `generation` to the conflict target. Without it, a
+  // native id that AWS released and reissued upserted straight into the
+  // deleted resource's row and inherited its entire history -- including
+  // cost facts and security findings that belonged to a different machine.
+  // The four-column unique index backing this was created ahead of the
+  // deploy; the older three-column constraint is dropped only afterwards.
+  // `return=representation` (not minimal) because the canonical row ids are
+  // what link each observation back to the resource it was admitted into --
+  // without them, "show me the lineage for this resource" has nothing to
+  // join on.
+  const upserted = await db.insert<{ id: string; resource_type_key: string; resource_id: string; generation: number }[]>(
+    'cloud_resources?on_conflict=connection_id,resource_type_key,resource_id,generation',
+    rows,
+    'resolution=merge-duplicates,return=representation',
+  );
   if (createdEvents.length > 0) {
     await db.insert('resource_lifecycle_events', createdEvents, 'return=minimal');
   }
+
+  /**
+   * Evidence, written after canonical state so observations can point at real
+   * row ids.
+   *
+   * Wrapped so a lineage write cannot fail a scan that already succeeded: a
+   * missing lineage row is a visible gap, whereas a step that died recording
+   * one loses the inventory too. The failure is counted on the batch rather
+   * than swallowed silently.
+   */
+  const canonicalIdByIdentity = new Map((upserted ?? []).map((u) => [`${u.resource_type_key}${u.resource_id}`, u.id]));
+  let lineageErrors = 0;
+  await Promise.all([
+    recordProviderRequests(db, batch, calls).catch(() => { lineageErrors += 1; }),
+    recordObservations(db, {
+      batch,
+      accepted: admission.accepted,
+      canonicalIdByIdentity,
+      providerService: scannerName,
+      providerOperation: null,
+      collectorObservedAt: now,
+    }).catch(() => { lineageErrors += 1; }),
+    recordQuarantine(db, {
+      batch,
+      quarantined: admission.quarantined,
+      providerService: scannerName,
+      providerOperation: null,
+      collectorObservedAt: now,
+    }).catch(() => { lineageErrors += 1; }),
+  ]);
+
+  await closeBatch(db, batch.id, {
+    observed: admission.counts.observed,
+    accepted: admission.counts.accepted,
+    quarantined: admission.counts.quarantined,
+    rejected: admission.counts.rejected,
+    errorCount: degradedMap.size + lineageErrors,
+    // expected_count stays null: AWS list operations do not report how many
+    // results exist before paging them, so `expected = observed` would be a
+    // reconciliation that always passes and means nothing.
+    expectedCount: null,
+    errorSummary: callsDropped > 0 ? `${callsDropped} provider request(s) not recorded (per-batch cap)` : null,
+  }).catch(() => {});
 
   // monitoring_alarms sync -- piggybacks on the cloudwatch step's own
   // DescribeAlarms results (no second API call) so cloudops-observability's
@@ -738,7 +1049,19 @@ export async function runResourceStep(db: Db, orgId: string, env: Env, connectio
     }
   }
 
-  return { stepId, resourceCount: rows.length, created: createdEvents.length };
+  /*
+   * AWS-P3 (M2). The degraded set travels on the SUCCESS path too, not only on
+   * the zero-resource path above.
+   *
+   * A partial read is the dangerous case, not the empty one. A scanner that
+   * covers 17 regions, is denied in 5 of them and returns rows from the other
+   * 12 lands here -- and, before this, reported nothing at all about the 5.
+   * finalize then reads "this type was covered and these ids did not come
+   * back" as deletion and tombstones live infrastructure, which is the exact
+   * outcome degradedResourceTypes exists to prevent. The empty case was
+   * already guarded; the case that returns SOME data was not.
+   */
+  return { stepId, resourceCount: rows.length, created: createdEvents.length, degradedResourceTypes, degradedReasons };
 }
 
 /**
@@ -747,26 +1070,7 @@ export async function runResourceStep(db: Db, orgId: string, env: Env, connectio
  * always fit inside one invocation's CPU/subrequest budget regardless of
  * how many scanners/regions exist in total.
  */
-discoveryRoutes.post('/accounts/:id/discovery/run-step', (c) =>
-  guarded(async () => {
-    const auth = getAuthContext(c.req.raw);
-    const orgId = requireOrgId(c.req.raw);
-    const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
-    const body = (await c.req.json().catch(() => ({}))) as { stepId?: string };
-    const stepId = body.stepId;
-    if (!stepId) return errJson(400, 'stepId is required, e.g. "regional:ec2:us-east-1", "global:iam", or "finding:guardduty:us-east-1"');
-
-    if (stepId.startsWith('finding:')) {
-      return okJson(await runFindingStep(db, orgId, c.env, c.req.param('id'), stepId));
-    }
-    if (stepId.startsWith('metric:')) {
-      return okJson(await runMetricStep(db, orgId, c.env, c.req.param('id'), stepId));
-    }
-    return okJson(await runResourceStep(db, orgId, c.env, c.req.param('id'), stepId));
-  }),
-);
 
 export interface StepErrorInput { message: string; severity: 'error' | 'info' }
 
@@ -814,9 +1118,19 @@ export interface FinalizeOutcome { totalResources: number; deleted: number; find
  * deleted resources whose region simply hadn't been re-checked yet this
  * cycle, not resources that had actually vanished from AWS.
  */
-export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], env: Env, coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES, totalSteps = 0): Promise<FinalizeOutcome> {
-  const existing = await db.select<{ id: string; resource_type_key: string; category: string; last_seen_at: string; deleted_at: string | null }[]>('cloud_resources', {
-    select: 'id,resource_type_key,category,last_seen_at,deleted_at',
+export async function runFinalize(db: Db, orgId: string, actorId: string | null, connection: ConnectionForDiscovery, runStartedAt: string, stepErrors: StepErrorInput[], env: Env, coveredResourceTypes: readonly string[] = COVERED_RESOURCE_TYPES, totalSteps = 0, degradedResourceTypes: readonly string[] = [], provenScopes: ReadonlySet<string> | null = null,
+  /**
+   * Finding sources this run actually proved -- see the resolve call below.
+   * Defaults to NONE rather than to every source: a caller that does not know
+   * what it covered has not proved anything, and the cost of being wrong here
+   * is closing a real security finding nobody looked at.
+   */
+  coveredFindingSources: readonly string[] = []): Promise<FinalizeOutcome> {
+  // `region` is selected for AWS-12: a resource in a region this run did not
+  // successfully evaluate must not be tombstoned, however well its resource
+  // type fared elsewhere.
+  const existing = await db.select<{ id: string; resource_type_key: string; category: string; last_seen_at: string; deleted_at: string | null; region: string | null }[]>('cloud_resources', {
+    select: 'id,resource_type_key,category,last_seen_at,deleted_at,region',
     filters: { connection_id: `eq.${connection.id}` },
     limit: 10000,
   });
@@ -824,10 +1138,14 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   // Only resource types a currently-implemented scanner actually checked
   // this run are eligible to be marked vanished — see the coveredResourceTypes
   // param above and lib/discoveryFinalize.ts (extracted so this is unit-testable).
-  const { vanishedIds, activeCategoryCounts, activeCount } = computeFinalizeResult(existing, coveredResourceTypes, runStartedAt);
+  const { vanishedIds, activeCategoryCounts, activeCount } = computeFinalizeResult(existing, coveredResourceTypes, runStartedAt, degradedResourceTypes, provenScopes);
   const now = new Date().toISOString();
   if (vanishedIds.length > 0) {
-    await db.update('cloud_resources', { id: `in.(${vanishedIds.join(',')})` }, { deleted_at: now, status: 'deleted' }, 'return=minimal');
+    // lifecycle_state moves with deleted_at. If the two could drift, the
+    // generation logic -- which reads lifecycle_state -- would keep treating
+    // a tombstoned row as live and never open a new generation when the id
+    // came back, quietly restoring the bug §2 exists to remove.
+    await db.update('cloud_resources', { id: `in.(${vanishedIds.join(',')})` }, { deleted_at: now, status: 'deleted', lifecycle_state: 'DELETED', updated_at: now }, 'return=minimal');
   }
 
   // Same vanish reasoning as cloud_resources above, scoped to the finding
@@ -835,11 +1153,65 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   // AWS itself stopped returning (fixed, archived, or its resource gone)
   // is marked resolved rather than left open forever. Only 'open' rows are
   // touched, so a finding a user already suppressed stays suppressed.
-  const resolvedFindings = await db.update<{ id: string }[]>(
+  /*
+   * AWS-P3. Only sources a finding scanner actually PROVED this run.
+   *
+   * This filter used to be a hardcoded literal listing all six sources,
+   * applied on every finalize regardless of what ran. So a run whose GuardDuty
+   * step was denied, throttled, cancelled by the slice budget, or simply not
+   * in this run's plan still closed every open GuardDuty finding -- writing
+   * "we could not read this" into the database as "the customer is clean",
+   * which is the single worst form of that error the product can make, and it
+   * happens silently and irreversibly to security findings.
+   *
+   * An empty set resolves nothing, which is the safe direction: a finding that
+   * stays open one cycle too long is visible and self-correcting; one closed
+   * because nobody looked is neither.
+   */
+  const resolvedFindings = coveredFindingSources.length === 0 ? [] : await db.update<{ id: string }[]>(
     'vulnerability_findings',
-    { connection_id: `eq.${connection.id}`, status: 'eq.open', finding_source: 'in.(guardduty,security_hub,iam_access_analyzer,inspector,aws_config,trusted_advisor)', last_seen_at: `lt.${runStartedAt}` },
+    { connection_id: `eq.${connection.id}`, status: 'eq.open', finding_source: inFilter([...coveredFindingSources]), last_seen_at: `lt.${runStartedAt}` },
     { status: 'resolved', resolved_at: now },
   );
+
+  /**
+   * Edge materialization runs once per full scan cycle, not per-step, since
+   * it joins resources and identities scanned by different, independently-
+   * ordered steps (lambda.ts, eks.ts, iam.ts) -- see edgeMaterialization.ts.
+   * It runs AFTER tombstoning above so an edge can only bind to the
+   * generation that is live now, and BEFORE the summary below so its outcome
+   * is recorded rather than only logged.
+   *
+   * Still best-effort -- a correlation failure must not fail a scan that
+   * collected real inventory. But "best-effort" previously meant a single
+   * shared try/catch and one console line, and that is how AWS-10 spent its
+   * whole life broken: every topology insert raised 23514 against a CHECK
+   * constraint, the catch swallowed it, and a 1,904-resource estate rendered
+   * as "no relationships" -- a total write failure presented as a fact about
+   * the customer's infrastructure.
+   *
+   * Two changes so that cannot recur silently:
+   *  - the two materializers get their own try/catch, so a failure in one no
+   *    longer skips the other (that shared catch is why the topology call was
+   *    never even reached whenever the identity edges failed first);
+   *  - the outcome goes into the stored summary, so an empty graph is
+   *    distinguishable from a graph that could not be built.
+   */
+  const graphOutcome: Record<string, unknown> = {};
+  try {
+    const { edgeCount } = await materializeResourceEdges(db, connection.id);
+    graphOutcome.identityEdges = { state: 'materialized', edges: edgeCount };
+  } catch (err) {
+    graphOutcome.identityEdges = { state: 'failed', reason: err instanceof Error ? err.message : String(err) };
+    console.error(`Identity edge materialization failed for connection ${connection.id} (continuing without it): ${err instanceof Error ? err.message : err}`);
+  }
+  try {
+    const { edgeCount } = await materializeNetworkTopology(db, connection.id);
+    graphOutcome.topologyEdges = { state: 'materialized', edges: edgeCount };
+  } catch (err) {
+    graphOutcome.topologyEdges = { state: 'failed', reason: err instanceof Error ? err.message : String(err) };
+    console.error(`Network topology materialization failed for connection ${connection.id} (continuing without it): ${err instanceof Error ? err.message : err}`);
+  }
 
   const realErrors = stepErrors.filter((e) => e.severity !== 'info');
   // A handful of transient failures (a couple of "fetch failed" network
@@ -857,6 +1229,10 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
     scannedAt: now, totalResources: activeCount, categoryCounts: activeCategoryCounts,
     servicesTotal: `${Object.keys(REGIONAL_SCANNERS).length + Object.keys(GLOBAL_SCANNERS).length} live / 245 catalogued`,
     regionsScanned: regionsFor(connection), errors: stepErrors.slice(0, 20),
+    // Present so a reader can tell "this estate has no relationships" from
+    // "the graph could not be built this run". Those render identically
+    // without it, and for AWS-10 the second was true for every run.
+    graph: graphOutcome,
   };
 
   await db.update(
@@ -897,43 +1273,57 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
     'return=minimal',
   );
 
-  // Edge materialization runs once per full scan cycle, not per-step, since
-  // it joins resources and identities scanned by different, independently-
-  // ordered steps (lambda.ts, eks.ts, iam.ts) -- see edgeMaterialization.ts.
-  // Best-effort: a resource that briefly can't be correlated into an edge
-  // (e.g. its role hasn't been scanned yet this run) is picked up cleanly
-  // on the next cycle, so a failure here must never fail the whole scan.
-  try {
-    await materializeResourceEdges(db, connection.id);
-  } catch (err) {
-    console.error(`Edge materialization failed for connection ${connection.id} (continuing without it): ${err instanceof Error ? err.message : err}`);
-  }
-
   // Both best-effort, server-to-server — see postScanHooks.ts's doc comment
   // for why these live here rather than as a client-side post-scan step:
   // this is the one function every scan path (interactive, daily sweep,
   // abandoned-scan recovery) already funnels through, so triggering here
   // covers all of them instead of just the browser-driven one.
-  await triggerRecommendationGeneration(env, connection.id, orgId);
-  await triggerAlertEvaluation(env, connection.id, orgId);
+  /**
+   * Recorded, not just awaited. Both hooks return `not_configured` when this
+   * service carries no hook URL or secret — which is the case in production
+   * today — and a silently skipped hook is indistinguishable from one that
+   * ran and found nothing to do. Stale cost recommendations survived three
+   * weeks behind exactly that ambiguity.
+   *
+   * Written after the summary above rather than folded into it, because these
+   * calls must happen last: they notify downstream services about inventory
+   * that has to be committed first.
+   */
+  const hooks = {
+    recommendations: await triggerRecommendationGeneration(env, connection.id, orgId),
+    alerts: await triggerAlertEvaluation(env, connection.id, orgId),
+  };
+  if (hooks.recommendations.state !== 'called' || hooks.alerts.state !== 'called') {
+    console.warn(`Post-scan hooks did not all fire for connection ${connection.id}: ${JSON.stringify(hooks)}`);
+  }
+  await db.update(
+    'cloud_connections',
+    { id: `eq.${connection.id}` },
+    { resource_summary: { ...summary, hooks } },
+    'return=minimal',
+  );
 
   return { totalResources: activeCount, deleted: vanishedIds.length, findingsResolved: resolvedFindings.length, categoryCounts: activeCategoryCounts, errors: stepErrors };
 }
 
-discoveryRoutes.post('/accounts/:id/discovery/finalize', (c) =>
-  guarded(async () => {
-    const auth = getAuthContext(c.req.raw);
-    const orgId = requireOrgId(c.req.raw);
-    const db = createDb(c.env, auth.accessToken);
-    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
-
-    const body = (await c.req.json().catch(() => ({}))) as { runStartedAt?: string; stepErrors?: StepErrorInput[]; totalSteps?: number };
-    if (!body.runStartedAt) return errJson(400, 'runStartedAt is required');
-
-    const connection = await loadConnection(db, orgId, c.req.param('id'));
-    if (!connection) return errJson(404, 'Account not found');
-
-    const outcome = await runFinalize(db, orgId, auth.userId, connection, body.runStartedAt, body.stepErrors ?? [], c.env, COVERED_RESOURCE_TYPES, body.totalSteps ?? 0);
-    return okJson(outcome);
-  }),
-);
+/**
+ * REMOVED (Phase 12 verification pass): the browser-era worker endpoints
+ * `POST .../discovery/run-step` and `POST .../discovery/finalize`.
+ *
+ * The audit's disposition for both was "internal worker operation only" /
+ * "remove; server computes terminal result". Phase 1 removed the browser's
+ * calls and Phase 3 replaced the whole loop with durable collection runs,
+ * but the ROUTES stayed mounted. I previously reported them as removed --
+ * that was wrong. I probed with GET on POST-only routes, read the 404 as
+ * "gone", and did not check the source.
+ *
+ * They were not merely redundant. A hand-crafted authenticated request
+ * could drive a scan step outside the durable job machinery entirely: no
+ * lease, no checkpoint, no run row. The partial unique index that makes
+ * "one job despite repeated clicks" true guards `collection_runs`, and a
+ * caller who never creates one is not covered by it.
+ *
+ * The step FUNCTIONS (runResourceStep, runFindingStep, runMetricStep,
+ * runFinalize) are exported and unchanged -- collectionRuns.ts imports them
+ * directly. Only the HTTP surface is gone.
+ */

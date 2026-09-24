@@ -1,5 +1,6 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, getActiveScope, inFilter, guarded, okJson } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
+import { selectAllPages } from '../lib/pagedSelect';
 import { notCurrentlyExcludedFilter } from '../lib/exclusions';
 
 export const dashboardRoutes = new Hono<{ Bindings: Env }>();
@@ -43,26 +44,83 @@ dashboardRoutes.get('/dashboard', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // Bounded by the permitted set, not the org: this response renders
+    // connection names, status and health directly, so an org-wide read
+    // disclosed accounts outside the caller's grants and outside the
+    // active folder/project scope.
+    const permittedIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
+
     const connections = await db.select<ConnectionRow[]>('cloud_connections', {
       select: 'id,connection_name,status,environment,scan_regions,last_sync_at,last_discovery_at,last_permission_check_at,error_message,resource_summary,key_rotated_at',
-      filters: { org_id: `eq.${orgId}`, provider: 'eq.aws' },
+      filters: { id: inFilter(permittedIds), org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     const connectionIds = connections.map((conn) => conn.id);
 
-    const [resourceRows, recentRuns, costRows, recommendationRows, activityRows, alertRows] = await Promise.all([
-      db.select<{ region: string | null }[]>('cloud_resources', { select: 'region', filters: { connection_id: inFilter(connectionIds), deleted_at: 'is.null' }, limit: 5000 }),
+    /*
+     * allSettled, not all.
+     *
+     * Six independent reads behind one `Promise.all` meant ANY single failure
+     * returned 400 for the entire dashboard -- no resources, no connections,
+     * no costs, nothing. That is the same defect already fixed in
+     * CloudSecurity.tsx and on the account page (AWS-P1-06), left in place
+     * here.
+     *
+     * It is also what makes a tenant-isolation assertion vacuous. The
+     * integration suite's anti-vacuity guard has failed 30 consecutive runs
+     * because this endpoint answers 400 there: its alerts block cannot read
+     * the fixture's `alerts` table, so the dashboard returns nothing for EVERY
+     * tenant, and "the totals exclude Tenant B" passes without ever having
+     * been capable of failing.
+     *
+     * Each section now stands on its own result, and a section that could not
+     * be read is NAMED in `unavailable` rather than rendered as empty --
+     * absence of data must not read as absence of resources.
+     */
+    const settled = await Promise.allSettled([
+      /**
+       * Phase 4 §24/§32. This was `db.select('cloud_resources', … limit 5000)`
+       * followed by `resourceRows.length`, which was wrong twice over.
+       *
+       * 1. LATENT, not yet biting: PostgREST caps the returned row body
+       *    around 1,000 regardless of the app-level limit. These connections
+       *    hold 922 live rows, so the count was still accurate today and
+       *    would have started silently truncating a little above that -- the
+       *    same class of bug that made 1,805 resources render as 1,000, and
+       *    one that fails by understating a GROWING estate, which is the
+       *    hardest moment to notice it.
+       * 2. ACTIVE: it counted every row, and 376 of those 922 are ALIASES
+       *    (KMS aliases, Route 53 records), plus 94 observations and 34
+       *    control-status records. Only 418 are assets. An alias is a second
+       *    name for a thing already counted, so the headline overstated the
+       *    estate by 41%. Hard NO-GO condition 2.
+       *
+       * The RPC does the GROUP BY in Postgres -- one round trip, no row cap,
+       * and it returns entity_class so assets can be counted as assets.
+       */
+      db.rpc<{ entity_class: string | null; count: number }[]>('cloud_resources_breakdown', {
+        p_connection_ids: connectionIds,
+        p_region: null,
+      }),
       db.select<{ connection_id: string; status: string; started_at: string }[]>('connection_validation_runs', {
         select: 'connection_id,status,started_at',
         filters: { connection_id: inFilter(connectionIds) },
         order: 'started_at.desc',
         limit: 500,
       }),
-      db.select<{ connection_id: string; unblended_cost: string }[]>('cost_snapshots', {
+      /*
+       * Paged: these rows are SUMMED into month-to-date spend per connection.
+       * A `limit: 5000` read is capped at 1,000 by PostgREST, so past that the
+       * figure silently understates the customer's bill -- and a spend number
+       * that plateaus looks like a plateau, not a bug. See lib/pagedSelect.ts.
+       */
+      selectAllPages<{ connection_id: string; unblended_cost: string }>(db, 'cost_snapshots', {
         select: 'connection_id,unblended_cost',
         filters: { connection_id: inFilter(connectionIds), usage_date: `gte.${monthStartIso()}` },
-        limit: 5000,
+        order: 'connection_id.asc',
       }),
-      db.select<{ potential_monthly_savings: string }[]>('cost_recommendations', { select: 'potential_monthly_savings', filters: { connection_id: inFilter(connectionIds), status: 'eq.open', or: notCurrentlyExcludedFilter() }, limit: 5000 }),
+      // Paged for the same reason: these feed both `openRecommendations` and
+      // the advertised `potentialMonthlySavings`.
+      selectAllPages<{ potential_monthly_savings: string }>(db, 'cost_recommendations', { select: 'id,potential_monthly_savings', filters: { connection_id: inFilter(connectionIds), status: 'eq.open', or: notCurrentlyExcludedFilter() }, order: 'id.asc' }),
       db.select<{ id: string; action: string; target_id: string | null; created_at: string; profiles: { email: string } | null }[]>('audit_log', {
         select: 'id,action,target_id,created_at,profiles(email)',
         filters: { org_id: `eq.${orgId}`, action: 'ilike.aws_account.*' },
@@ -76,6 +134,31 @@ dashboardRoutes.get('/dashboard', (c) =>
         limit: 5,
       }),
     ]);
+
+    /*
+     * A rejected section yields its empty shape so the rest of the dashboard
+     * still renders, and its NAME is collected so the response can say which
+     * part of the answer is missing. The reason is deliberately not taken from
+     * the rejection: those carry sanitized DB text, and a section name is what
+     * a caller can act on.
+     */
+    const SECTION_NAMES = ['resources', 'validationRuns', 'cost', 'recommendations', 'activity', 'alerts'] as const;
+    const unavailable: string[] = [];
+    settled.forEach((r, i) => { if (r.status === 'rejected') unavailable.push(SECTION_NAMES[i]); });
+
+    const valueOf = <T>(i: number, fallback: T): T => {
+      const r = settled[i];
+      return r.status === 'fulfilled' ? (r.value as T) : fallback;
+    };
+
+    const resourceBreakdown = valueOf<{ entity_class: string | null; count: number }[]>(0, []);
+    const recentRuns = valueOf<{ connection_id: string; status: string; started_at: string }[]>(1, []);
+    const costPage = valueOf<{ rows: { connection_id: string; unblended_cost: string }[]; complete: boolean }>(2, { rows: [], complete: false });
+    const recommendationPage = valueOf<{ rows: { potential_monthly_savings: string }[]; complete: boolean }>(3, { rows: [], complete: false });
+    const costRows = costPage.rows;
+    const recommendationRows = recommendationPage.rows;
+    const activityRows = valueOf<{ id: string; action: string; target_id: string | null; created_at: string; profiles: { email: string } | null }[]>(4, []);
+    const alertRows = valueOf<{ id: string; alert_name: string; severity: string; connection_id: string | null; triggered_at: string }[]>(5, []);
 
     // Latest validation run per connection (already sorted desc above).
     const latestRunByConnection = new Map<string, { status: string; started_at: string }>();
@@ -132,14 +215,47 @@ dashboardRoutes.get('/dashboard', (c) =>
       .sort((a, b) => b.totalResources - a.totalResources)
       .slice(0, 5);
 
+    /**
+     * An uncatalogued type counts as an asset (`?? 'asset'`), deliberately:
+     * under-reporting someone's estate is worse than over-reporting it, and
+     * a type missing from the catalog is our gap, not their missing resource.
+     */
+    const byEntityClass: Record<string, number> = {};
+    let assetCount = 0;
+    let allRecordCount = 0;
+    for (const row of resourceBreakdown ?? []) {
+      const count = Number(row.count ?? 0);
+      const entityClass = row.entity_class ?? 'asset';
+      byEntityClass[entityClass] = (byEntityClass[entityClass] ?? 0) + count;
+      allRecordCount += count;
+      if (entityClass === 'asset') assetCount += count;
+    }
+
     return okJson({
+      /*
+       * Sections that could not be read, by name. Empty array means every
+       * section answered. A client must not render a zero from a section
+       * listed here: it is missing, not empty.
+       */
+      unavailableSections: unavailable,
+      /*
+       * Complete means BOTH: every section answered, and every paged read
+       * reached the end of its data. A sum over a truncated page is a wrong
+       * number, not a smaller one, so it must not be published as complete.
+       */
+      complete: unavailable.length === 0 && costPage.complete && recommendationPage.complete,
       totalAccounts: connections.length,
       healthyAccounts: healthy,
       failedAccounts: failed,
       disconnectedAccounts: disconnected,
       accountsNeedingAttention: needingAttention,
       accountsNeedingAttentionList: needingAttentionList,
-      resourcesDiscovered: resourceRows.length,
+      // Assets only. `allRecords` and the per-class split travel with it so
+      // a headline moving from 922 to 418 reads as "aliases are not assets"
+      // rather than as data loss.
+      resourcesDiscovered: assetCount,
+      resourceRecordsAllClasses: allRecordCount,
+      resourcesByEntityClass: byEntityClass,
       regionsCovered,
       lastDiscovery,
       nextScheduledDiscovery: null,

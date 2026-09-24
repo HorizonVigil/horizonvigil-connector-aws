@@ -1,8 +1,6 @@
-import { callQueryApi } from '../awsApi';
-import { extractSection, extractListItems, field, boolField, numField } from '../xmlList';
+import { field } from '../xmlList';
+import { clusterEvidence, describeAllRds, rdsTags } from './rdsQuery';
 import type { ScannedResource, ScannerContext } from './types';
-
-const VERSION = '2014-10-31';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
 export const DOCDB_RESOURCE_TYPES = ['docdb_cluster'] as const;
@@ -11,34 +9,36 @@ export const DOCDB_RESOURCE_TYPES = ['docdb_cluster'] as const;
  * DocumentDB clusters are DescribeDBClusters calls against the plain RDS API
  * (same host/service/version as rds.ts — "docdb" isn't a distinct signing
  * service, it's an engine value on the shared RDS control plane), filtered
- * server-side to just the docdb engine family so this doesn't re-list every
- * Aurora/MySQL/Postgres cluster rds.ts already covers under rds_cluster.
+ * server-side to the docdb engine. rds.ts excludes docdb clusters from
+ * rds_cluster so the same cluster is never inventoried twice.
+ *
+ * Every page is read (see rdsQuery.ts): the previous version read only the
+ * first 100 clusters, and finalize read the rest as deleted.
+ *
+ * resourceId stays the DBClusterIdentifier (unique per account+region) so
+ * existing rows keep their identity; the ARN is carried in metadata.
  */
 export async function scanDocDb(ctx: ScannerContext): Promise<ScannedResource[]> {
-  const endpoint = `rds.${ctx.region}.amazonaws.com`;
-  const result = await callQueryApi(ctx.creds, {
-    service: 'rds', region: ctx.region, host: endpoint, action: 'DescribeDBClusters', version: VERSION,
-    params: { 'Filters.member.1.Name': 'engine', 'Filters.member.1.Values.member.1': 'docdb' },
+  const walk = await describeAllRds(ctx, 'DescribeDBClusters', 'DBClusters', 'DBCluster', {
+    'Filters.member.1.Name': 'engine', 'Filters.member.1.Values.member.1': 'docdb',
   });
-  if (!result.ok) {
-    console.error(`DocumentDB DescribeDBClusters failed in ${ctx.region} (continuing without it): ${result.errorMessage ?? result.errorCode ?? result.status}`);
-    return [];
-  }
 
-  const xml = result.body as string;
   const out: ScannedResource[] = [];
-  for (const cl of extractListItems(extractSection(xml, 'DBClusters'), 'DBCluster')) {
+  for (const cl of walk.items) {
+    // Defence in depth: the server-side filter is authoritative, but a
+    // non-docdb cluster must never be recorded under this type.
+    const engine = field(cl, 'Engine');
+    if (engine && engine !== 'docdb') continue;
+    const id = field(cl, 'DBClusterIdentifier');
+    const evidence = clusterEvidence(cl);
+    const tags = rdsTags(cl);
     out.push({
-      resourceTypeKey: 'docdb_cluster', resourceId: field(cl, 'DBClusterIdentifier')!, region: ctx.region,
-      resourceName: field(cl, 'DBClusterIdentifier') ?? undefined, state: field(cl, 'Status') ?? undefined,
-      metadata: {
-        engineVersion: field(cl, 'EngineVersion'), endpoint: field(cl, 'Endpoint'),
-        storageEncrypted: boolField(cl, 'StorageEncrypted'), backupRetentionPeriod: numField(cl, 'BackupRetentionPeriod'),
-        createTime: field(cl, 'ClusterCreateTime'),
-      },
-      relationships: {
-        securityGroupIds: extractListItems(extractSection(cl, 'VpcSecurityGroups'), 'VpcSecurityGroupMembership').map(m => field(m, 'VpcSecurityGroupId')),
-      },
+      // `?? ''` not `continue`: admission quarantines an empty identity with a
+      // typed reason instead of the record vanishing silently.
+      resourceTypeKey: 'docdb_cluster', resourceId: id ?? '', region: ctx.region,
+      resourceName: tags['Name'] ?? id ?? undefined, state: field(cl, 'Status') ?? undefined, tags,
+      metadata: { ...evidence.metadata, walkComplete: walk.termination === 'complete' },
+      relationships: evidence.relationships,
     });
   }
   return out;

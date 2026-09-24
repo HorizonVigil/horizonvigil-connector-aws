@@ -1,38 +1,44 @@
-import { callQueryApi } from '../awsApi';
-import { extractSection, extractListItems, field, boolField, numField } from '../xmlList';
+import { field } from '../xmlList';
+import { clusterEvidence, describeAllRds, rdsTags } from './rdsQuery';
 import type { ScannedResource, ScannerContext } from './types';
-
-const VERSION = '2014-10-31';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
 export const NEPTUNE_RESOURCE_TYPES = ['neptune_cluster'] as const;
 
-/** Same shared-RDS-API-filtered-by-engine shape as docdb.ts — see that file's comment. */
+/**
+ * Neptune clusters: same shared-RDS-API-filtered-by-engine shape as docdb.ts
+ * ("neptune" is an engine value on the RDS control plane, not a separate
+ * signing service), filtered server-side to the neptune engine. rds.ts
+ * excludes neptune clusters from rds_cluster so the same cluster is never
+ * inventoried twice.
+ *
+ * Every page is read (see rdsQuery.ts): the previous version read only the
+ * first 100 clusters, and finalize read the rest as deleted.
+ *
+ * resourceId stays the DBClusterIdentifier (unique per account+region) so
+ * existing rows keep their identity; the ARN is carried in metadata.
+ */
 export async function scanNeptune(ctx: ScannerContext): Promise<ScannedResource[]> {
-  const endpoint = `rds.${ctx.region}.amazonaws.com`;
-  const result = await callQueryApi(ctx.creds, {
-    service: 'rds', region: ctx.region, host: endpoint, action: 'DescribeDBClusters', version: VERSION,
-    params: { 'Filters.member.1.Name': 'engine', 'Filters.member.1.Values.member.1': 'neptune' },
+  const walk = await describeAllRds(ctx, 'DescribeDBClusters', 'DBClusters', 'DBCluster', {
+    'Filters.member.1.Name': 'engine', 'Filters.member.1.Values.member.1': 'neptune',
   });
-  if (!result.ok) {
-    console.error(`Neptune DescribeDBClusters failed in ${ctx.region} (continuing without it): ${result.errorMessage ?? result.errorCode ?? result.status}`);
-    return [];
-  }
 
-  const xml = result.body as string;
   const out: ScannedResource[] = [];
-  for (const cl of extractListItems(extractSection(xml, 'DBClusters'), 'DBCluster')) {
+  for (const cl of walk.items) {
+    // Defence in depth: the server-side filter is authoritative, but a
+    // non-neptune cluster must never be recorded under this type.
+    const engine = field(cl, 'Engine');
+    if (engine && engine !== 'neptune') continue;
+    const id = field(cl, 'DBClusterIdentifier');
+    const evidence = clusterEvidence(cl);
+    const tags = rdsTags(cl);
     out.push({
-      resourceTypeKey: 'neptune_cluster', resourceId: field(cl, 'DBClusterIdentifier')!, region: ctx.region,
-      resourceName: field(cl, 'DBClusterIdentifier') ?? undefined, state: field(cl, 'Status') ?? undefined,
-      metadata: {
-        engineVersion: field(cl, 'EngineVersion'), endpoint: field(cl, 'Endpoint'),
-        storageEncrypted: boolField(cl, 'StorageEncrypted'), backupRetentionPeriod: numField(cl, 'BackupRetentionPeriod'),
-        createTime: field(cl, 'ClusterCreateTime'),
-      },
-      relationships: {
-        securityGroupIds: extractListItems(extractSection(cl, 'VpcSecurityGroups'), 'VpcSecurityGroupMembership').map(m => field(m, 'VpcSecurityGroupId')),
-      },
+      // `?? ''` not `continue`: admission quarantines an empty identity with a
+      // typed reason instead of the record vanishing silently.
+      resourceTypeKey: 'neptune_cluster', resourceId: id ?? '', region: ctx.region,
+      resourceName: tags['Name'] ?? id ?? undefined, state: field(cl, 'Status') ?? undefined, tags,
+      metadata: { ...evidence.metadata, walkComplete: walk.termination === 'complete' },
+      relationships: evidence.relationships,
     });
   }
   return out;

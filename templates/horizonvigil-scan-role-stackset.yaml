@@ -77,6 +77,7 @@ Resources:
                   - 's3:GetEncryptionConfiguration'
                   - 's3:GetBucketPolicyStatus'
                   - 's3:GetBucketPublicAccessBlock'
+                  - 's3:GetAccountPublicAccessBlock'
                   - 'efs:Describe*'
                   - 'fsx:Describe*'
                   - 'backup:List*'

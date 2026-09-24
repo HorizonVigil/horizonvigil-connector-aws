@@ -92,6 +92,11 @@ describe('numField', () => {
   it('returns undefined when the tag is absent', () => {
     expect(numField('<a></a>', 'n')).toBeUndefined();
   });
+
+  it('returns undefined for a malformed or non-finite number', () => {
+    expect(numField('<a><n>not-a-number</n></a>', 'n')).toBeUndefined();
+    expect(numField('<a><n>Infinity</n></a>', 'n')).toBeUndefined();
+  });
 });
 
 describe('tagsFromSet', () => {

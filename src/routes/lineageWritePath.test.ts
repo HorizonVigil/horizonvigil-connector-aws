@@ -1,0 +1,156 @@
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+/**
+ * Phase 2 wrote `ingestion_batches`, `provider_requests`,
+ * `resource_observations` and `quarantine_records` as evidence tables:
+ * member-READ only, with INSERT/UPDATE/DELETE/TRUNCATE revoked from
+ * `authenticated`.
+ *
+ * That makes the write path's authentication load-bearing. `runResourceStep`
+ * writes lineage using whichever Db its caller hands it, so a caller passing
+ * a JWT-scoped Db would get 42501 on every ingestion -- inventory would still
+ * be written (cloud_resources is not revoked) while the evidence silently
+ * failed, which is precisely the "canonical resource with no traceable
+ * source" condition this phase forbids.
+ *
+ * Both real callers use the service role today. This test pins that, at the
+ * source level, because the failure would otherwise appear as a quiet gap in
+ * evidence rather than as a broken scan.
+ *
+ * Read with readFileSync rather than `import.meta.glob`, which is Vite-only
+ * and breaks these services' CommonJS `tsc` build.
+ */
+const read = (p: string) => readFileSync(join(__dirname, p), 'utf8');
+
+describe('lineage write path runs under the service role', () => {
+  it('the worker tick builds its Db from SUPABASE_SERVICE_ROLE_KEY', () => {
+    const src = read('collectionRuns.ts');
+    expect(src).toContain('createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY)');
+    // The tick is the caller that drives executeStep -> runResourceStep.
+    expect(src).toContain('executeStep(db, c.env, run, steps[i], i)');
+  });
+
+  /**
+   * Updated for AWS-06. The second assertion used to pin
+   * `runResourceStep(...)` inside internalScan.ts, because the scheduled
+   * endpoints executed steps inline. They now ENQUEUE durable runs and the
+   * worker tick executes them, so the property is asserted where execution
+   * actually happens.
+   *
+   * The intent is unchanged and still load-bearing: unattended collection
+   * must run under the service role. A caller-JWT Db silently stops
+   * ingestion evidence being written, because RLS blocks the lineage tables.
+   */
+  it('the scheduled scan builds its Db from SUPABASE_SERVICE_ROLE_KEY', () => {
+    expect(read('internalScan.ts')).toContain('createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY)');
+  });
+
+  it('the worker tick that executes steps also runs under the service role', () => {
+    const src = read('collectionRuns.ts');
+    expect(src).toContain('createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY)');
+
+    /**
+     * Asserts the PROPERTY this guard exists for -- the worker passes a null
+     * userId, so the step runs as the service role -- rather than the exact
+     * argument list.
+     *
+     * It previously pinned the whole call verbatim, which broke the moment a
+     * run id was threaded through for lineage. A guard that fails on any
+     * signature change teaches people to edit the guard rather than read it,
+     * and the next edit is the one that quietly drops the `null`.
+     */
+    for (const fn of ['runResourceStep', 'runFindingStep', 'runMetricStep']) {
+      const at = src.indexOf(`${fn}(db, run.org_id,`);
+      expect(at, `${fn} must be called with the worker's service-role db and run org`).toBeGreaterThan(-1);
+      const call = src.slice(at, src.indexOf(`)`, at) + 1);
+      expect(call, `${fn} must pass a null userId -- the worker has no requesting user`).toContain('run.org_id, null,');
+    }
+  });
+
+  it('no route hands runResourceStep a caller-JWT Db', () => {
+    /**
+     * A negative assertion that would have caught the mistake: if a route
+     * ever calls runResourceStep with the `db` it built from
+     * `auth.accessToken`, ingestion evidence stops being written.
+     */
+    for (const file of ['discovery.ts', 'collectionRuns.ts', 'internalScan.ts', 'accounts.ts']) {
+      const src = read(file);
+      const jwtDbCalls = src.match(/runResourceStep\(\s*createDb\(c\.env,\s*auth\.accessToken\)/g);
+      expect(jwtDbCalls, `${file} passes a caller-JWT Db to runResourceStep`).toBeNull();
+    }
+  });
+
+  /**
+   * Scoped to runResourceStep's own body.
+   *
+   * `runFindingStep` and `runMetricStep` live in the same file and have their
+   * own `scanned.map(...)`, so a file-wide assertion here fails for the wrong
+   * reason -- it did, on the first run of this test. They are also genuinely
+   * out of scope: findings target `vulnerability_findings` (V2-gated, and the
+   * phase brief says not to touch vulnerability functionality) and metrics
+   * target `resource_metrics`, a time series rather than canonical resource
+   * state. Phase 2's canonical-admission rule is about the canonical RESOURCE
+   * table, and that limitation is recorded in the certification rather than
+   * glossed over by a broader assertion that happens to pass.
+   */
+  function runResourceStepBody(): string {
+    const src = read('discovery.ts');
+    const start = src.indexOf('export async function runResourceStep(');
+    expect(start, 'runResourceStep not found').toBeGreaterThan(-1);
+    const next = src.indexOf('\nexport ', start + 1);
+    return src.slice(start, next === -1 ? undefined : next);
+  }
+
+  it('opens the batch before the scanner runs, so a crash leaves evidence', () => {
+    /**
+     * "No batch" and "a batch that failed" must not look the same. If the
+     * batch were opened after a successful scan, a step that died mid-scan
+     * would leave no record that ingestion was ever attempted.
+     */
+    const body = runResourceStepBody();
+    const openIdx = body.indexOf('const batch = await openBatch(db, {');
+    const scanIdx = body.indexOf('scanned = await scanner(');
+    expect(openIdx).toBeGreaterThan(-1);
+    expect(scanIdx).toBeGreaterThan(-1);
+    expect(openIdx).toBeLessThan(scanIdx);
+  });
+
+  it('only ACCEPTED records reach the canonical upsert', () => {
+    /**
+     * The canonical-admission rule (§7). Before Phase 2 this read
+     * `scanned.map(...)`, so every raw provider record became inventory
+     * regardless of whether it was valid.
+     */
+    const body = runResourceStepBody();
+    expect(body).toContain('const rows = admission.accepted.map(');
+    expect(body).not.toMatch(/const rows = scanned\.map\(/);
+    // And the upsert it feeds is the canonical resource table.
+    expect(body).toContain("'cloud_resources?on_conflict=connection_id,resource_type_key,resource_id,generation'");
+  });
+
+  /**
+   * Phase 4 §2. The conflict target MUST include `generation`.
+   *
+   * Without it, an AWS-native id that was released and reissued upserts into
+   * the deleted resource's row and silently inherits its history -- hard
+   * NO-GO conditions 4 and 12. The negative assertion is the load-bearing
+   * half: it pins the exact three-column string this used to be, so a revert
+   * or a careless edit fails here rather than in production six weeks later
+   * when an instance id happens to get reused.
+   */
+  it('the canonical upsert conflicts on generation, not on the native id alone', () => {
+    const body = runResourceStepBody();
+    expect(body).toContain("resource_id,generation'");
+    expect(body).not.toContain("'cloud_resources?on_conflict=connection_id,resource_type_key,resource_id'");
+  });
+
+  it('generation is resolved from prior generations, never assumed', () => {
+    const body = runResourceStepBody();
+    expect(body).toContain('resolveGeneration(');
+    // The row must carry the resolved generation rather than a literal.
+    expect(body).toMatch(/generation:\s*decision\.generation/);
+    expect(body).not.toMatch(/generation:\s*1\s*,/);
+  });
+});

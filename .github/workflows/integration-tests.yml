@@ -1,0 +1,130 @@
+# Phase 1J — integration and isolation tests, separate from unit tests.
+#
+# Separate workflow, not another step in deploy.yml, for two reasons: these
+# need credentials the unit suite does not, and a red isolation run should
+# be legible as "isolation broke" rather than buried in a deploy log.
+#
+# The suite FAILS when the database is unreachable. It never skips: a
+# skipped tenant-isolation test reports green while proving nothing, which
+# is the exact failure this phase exists to remove.
+name: Integration & Isolation Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      # The shared-lib dependency is a PRIVATE repo, and npm resolves it to
+      # an ssh:// URL. Three things are needed, and I originally did only the
+      # last one -- which is why this kept failing at install with
+      # "Permission denied (publickey)" before any test ran:
+      #
+      #   1. drop the checkout action's injected auth header, which otherwise
+      #      conflicts with the credentials below;
+      #   2. rewrite ssh:// to https:// -- WITHOUT this the netrc never
+      #      applies, because netrc only covers HTTPS;
+      #   3. supply the token via ~/.netrc, which is what npm's git actually
+      #      reads (it ignores a GH_PAT env var entirely).
+      #
+      # Byte-for-byte the pattern deploy.yml's build-and-test job already
+      # uses successfully.
+      - name: Configure git for private shared-lib dependency
+        run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          printf "machine github.com\nlogin x-access-token\npassword %s\n" "${{ secrets.GH_PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc
+
+      - name: Install
+        run: npm install
+
+      # Guard rail: without this a missing secret surfaces as an obscure
+      # sign-in error deep in the run rather than a clear failure.
+      #
+      # It checks for PLACEHOLDER values as well as empty ones, because an
+      # empty check alone is not enough. A secret set to the literal text of
+      # a setup instruction -- "<connection string>", "<the anon key ...>" --
+      # is non-empty, sails past an -z test, and then fails at sign-in with a
+      # message about the database rather than about the secret. That
+      # happened on the first attempt to configure these, which is why the
+      # check is here rather than in a comment.
+      - name: Verify integration credentials are present and real
+        run: |
+          fail() { echo "::error::$1"; echo "::error::The integration suite must FAIL rather than skip when it cannot reach a database."; exit 1; }
+
+          [ -n "${INTEGRATION_SUPABASE_URL}" ]      || fail "INTEGRATION_SUPABASE_URL is not set."
+          [ -n "${INTEGRATION_SUPABASE_ANON_KEY}" ] || fail "INTEGRATION_SUPABASE_ANON_KEY is not set."
+
+          case "${INTEGRATION_SUPABASE_URL}" in
+            *"<"*|*">"*) fail "INTEGRATION_SUPABASE_URL still contains placeholder text. Set it to the real project URL." ;;
+            https://*.supabase.co) : ;;
+            *) fail "INTEGRATION_SUPABASE_URL does not look like a Supabase project URL." ;;
+          esac
+
+          case "${INTEGRATION_SUPABASE_ANON_KEY}" in
+            *"<"*|*">"*) fail "INTEGRATION_SUPABASE_ANON_KEY still contains placeholder text. Set it to the real anon key." ;;
+          esac
+
+          # Both secrets are usually set in one sitting, so the value meant
+          # for DATABASE_URL landing here is a real and easy mistake -- and
+          # it is one an earlier version of this check let through, because
+          # it only asked whether the value contained two dots. A connection
+          # string ("...@db.<ref>.supabase.co:5432/postgres") contains two
+          # dots, so it passed, and the run then failed at sign-in with
+          # "Invalid API key" -- pointing at the database rather than at the
+          # paste. Name that case explicitly.
+          case "${INTEGRATION_SUPABASE_ANON_KEY}" in
+            postgres://*|postgresql://*)
+              fail "INTEGRATION_SUPABASE_ANON_KEY is a Postgres connection string, not an anon key. Check whether DATABASE_URL's value was pasted here by mistake." ;;
+          esac
+
+          # A Supabase anon key is a JWT: three base64url segments whose
+          # first decodes to a JSON header carrying "alg". Only the header is
+          # inspected -- it is the same for every Supabase key and carries no
+          # secret. Lengths are reported on failure because a wrong value is
+          # diagnosable by size (a real anon key runs to ~200 characters) and
+          # a length is not the secret; no value is ever echoed.
+          jwt_header=${INTEGRATION_SUPABASE_ANON_KEY%%.*}
+          jwt_rest=${INTEGRATION_SUPABASE_ANON_KEY#*.}
+          jwt_payload=${jwt_rest%%.*}
+          jwt_sig=${jwt_rest#*.}
+          if [ "$jwt_header" = "${INTEGRATION_SUPABASE_ANON_KEY}" ] \
+             || [ "$jwt_payload" = "$jwt_rest" ] \
+             || [ -z "$jwt_header" ] || [ -z "$jwt_payload" ] || [ -z "$jwt_sig" ]; then
+            fail "INTEGRATION_SUPABASE_ANON_KEY is not a three-segment JWT (it is ${#INTEGRATION_SUPABASE_ANON_KEY} characters long)."
+          fi
+
+          # base64url -> base64, then pad to a multiple of 4 so base64 -d
+          # accepts it; JWT segments are unpadded by spec.
+          b64=$(printf '%s' "$jwt_header" | tr '_-' '/+')
+          case $(( ${#b64} % 4 )) in
+            2) b64="${b64}==" ;;
+            3) b64="${b64}=" ;;
+          esac
+          decoded=$(printf '%s' "$b64" | base64 -d 2>/dev/null || true)
+          case "$decoded" in
+            *'"alg"'*) : ;;
+            *) fail "INTEGRATION_SUPABASE_ANON_KEY's first segment is not a JWT header (the key is ${#INTEGRATION_SUPABASE_ANON_KEY} characters long; a Supabase anon key is roughly 200). Copy it from Settings > API > Project API keys > anon public." ;;
+          esac
+        env:
+          INTEGRATION_SUPABASE_URL: ${{ secrets.INTEGRATION_SUPABASE_URL }}
+          INTEGRATION_SUPABASE_ANON_KEY: ${{ secrets.INTEGRATION_SUPABASE_ANON_KEY }}
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Integration & isolation tests
+        run: npm run test:integration
+        env:
+          INTEGRATION_SUPABASE_URL: ${{ secrets.INTEGRATION_SUPABASE_URL }}
+          INTEGRATION_SUPABASE_ANON_KEY: ${{ secrets.INTEGRATION_SUPABASE_ANON_KEY }}

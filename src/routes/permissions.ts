@@ -1,9 +1,13 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson, type Db } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, writeAuditLog, guarded, okJson, errJson, type Db, getActiveScope, requirePermittedConnection } from '@horizonvigil/shared-lib';
+import { buildCapabilityStatuses, writeCapabilityStatuses } from '../lib/capabilityStatus';
 import type { Env } from '../env';
 import { decryptCredentials } from '../lib/crypto';
 import { assumeConnectionRole } from '../lib/assumeRole';
 import { runFullValidation, type PermissionCheckResult, type IdentitySummary } from '../lib/permissionChecks';
 import type { AwsCreds } from '../lib/awsApi';
+import { nextDueAtHours } from '../lib/scheduleCadence';
+import { verdictFor } from '../lib/capabilityMatrix';
+import { checkAccountBinding } from '../lib/accountBinding';
 
 export const permissionsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -35,7 +39,21 @@ export async function resolveCredentials(env: Env, connection: ResolvableConnect
 
 type ValidationOutcome =
   | { crashed: true; message: string }
-  | { crashed: false; status: 'succeeded' | 'failed'; identity: IdentitySummary | null; checks: PermissionCheckResult[]; errorMessage?: string };
+  | {
+      crashed: false;
+      status: 'succeeded' | 'failed';
+      identity: IdentitySummary | null;
+      checks: PermissionCheckResult[];
+      errorMessage?: string;
+      /** AWS-L2: the credentials belong to a different account than this connection claims. */
+      accountMismatch?: boolean;
+      /**
+       * The account binding could not be checked -- the connection states no
+       * account id, or STS returned none. Reported rather than passed over,
+       * because "not checked" must not read as "checked and matched".
+       */
+      accountUnverified?: boolean;
+    };
 
 /**
  * Runs real sts:GetCallerIdentity + IAM/Organizations/CloudWatch/CloudTrail/
@@ -57,8 +75,24 @@ type ValidationOutcome =
 export async function runConnectionValidation(
   db: Db,
   env: Env,
-  connection: ResolvableConnection & { id: string },
-  actor: { orgId: string; userId: string } | null,
+  connection: ResolvableConnection & {
+    id: string;
+    /**
+     * The AWS account this connection CLAIMS to be bound to, so the validation
+     * can check that claim against STS. Optional only because not every caller
+     * selected it historically; a caller that omits it skips the check and
+     * says so, rather than silently passing it.
+     */
+    aws_account_id?: string | null;
+  },
+  /**
+   * `userId` is null on the scheduled path, which has no requesting user.
+   * `orgId` is still required there, because capability status is written per
+   * org -- an earlier version guarded the write on `actor?.orgId`, and since
+   * the scheduled worker passed null outright, the WEEKLY validation (the
+   * primary one) silently wrote no capability rows at all.
+   */
+  actor: { orgId: string; userId: string | null } | null,
 ): Promise<ValidationOutcome> {
   const [run] = await db.insert<{ id: string }[]>('connection_validation_runs', {
     connection_id: connection.id,
@@ -76,7 +110,69 @@ export async function runConnectionValidation(
     }
 
     const { identity, checks } = await runFullValidation(resolved.creds, connection.default_region || 'us-east-1');
-    const overallStatus = checks[0]?.status === 'granted' ? 'succeeded' : 'failed';
+
+    /**
+     * A validation run cannot be `succeeded` without evidence (§6.1: "An
+     * empty required check list cannot be succeeded").
+     *
+     * This read `checks[0]?.status === 'granted'` -- positional, so it
+     * depended entirely on STS happening to be first in the array, and an
+     * empty checks array evaluated to `failed` only by accident of
+     * `undefined`. Naming the required check makes the rule explicit and
+     * order-independent.
+     *
+     * Denials on OTHER services deliberately do not fail the run: an account
+     * that has not enabled Cost Explorer is not a broken connection. That
+     * distinction is now carried per capability in
+     * connector_capability_status rather than collapsed into one boolean.
+     */
+    /*
+     * AWS-P2. This was `stsCheck?.status === 'granted'` -- the run's verdict
+     * came from ONE check, so it said `succeeded` however many others errored.
+     * Production, 2026-09-22: both AWS connections reported `succeeded` while
+     * carrying TWO `error` checks each (Security Hub 401, Compute Optimizer
+     * RESOURCE_NOT_FOUND). A customer reading "succeeded" had been told their
+     * account was fine while two sources were dark.
+     *
+     * The verdict now comes from REQUIRED capabilities only, which is what
+     * keeps the opposite failure away too: an account with no Trusted Advisor
+     * support plan or no Config recorder is a normal account, not a broken
+     * connection. See lib/capabilityMatrix.ts.
+     */
+    const verdict = verdictFor(checks);
+
+    /*
+     * AWS-L2. The credentials must belong to the account this connection says
+     * it is bound to.
+     *
+     * STS's answer was being RECORDED as `identity_account_id` and never
+     * compared to `cloud_connections.aws_account_id`. Production carries the
+     * consequence: 10 ACCOUNT_MISMATCH quarantine records from 2026-09-10,
+     * reading "Resource belongs to AWS account 604179600483, but this
+     * connection is bound to 000000000000." A connection was collecting a real
+     * estate under a placeholder id, and every single resource it read was
+     * refused admission -- while validation reported success.
+     *
+     * Admission already catches it, one resource at a time, after the work is
+     * done and with no explanation a customer can act on. Catching it here
+     * names the real problem once, before a scan wastes a full run producing
+     * nothing but quarantine rows.
+     *
+     * This is the same check credential rotation already performs, and for the
+     * same reason: keys for a DIFFERENT account authenticate perfectly well,
+     * so accepting them silently points the connection at another estate while
+     * every screen keeps showing the original account's name and history.
+     *
+     * A connection with no stated account id is NOT treated as matching -- it
+     * is reported as unverifiable, because "we did not check" and "we checked
+     * and it matched" must not produce the same answer.
+     */
+    const binding = checkAccountBinding(connection.aws_account_id, identity?.accountId);
+    const accountMismatch = binding.state === 'mismatched';
+    const accountUnverified = binding.state === 'unverified';
+    const accountMismatchMessage = binding.state === 'mismatched' ? binding.message : null;
+
+    const overallStatus = accountMismatch ? 'failed' : verdict.status;
 
     await db.update(
       'connection_validation_runs',
@@ -87,7 +183,12 @@ export async function runConnectionValidation(
         identity_arn: identity?.arn ?? null,
         identity_account_id: identity?.accountId ?? null,
         identity_user_id: identity?.userId ?? null,
-        error_message: overallStatus === 'failed' ? checks[0]?.detail : null,
+        // Names the required capabilities that failed. Previously `checks[0]`
+        // -- the FIRST check in the array, which on a failing run was usually
+        // a passing one. The account mismatch takes precedence when present:
+        // it explains why nothing will reach inventory even if every
+        // permission is granted.
+        error_message: accountMismatchMessage ?? (overallStatus === 'failed' ? verdict.summary : null),
       },
       'return=minimal',
     );
@@ -100,13 +201,73 @@ export async function runConnectionValidation(
       );
     }
 
+    /**
+     * Per-capability health from this snapshot (§2.3). One blended score per
+     * connection cannot say "inventory is fine but Cost Explorer is denied",
+     * which is the only form of this information a customer can act on.
+     */
+    /**
+     * Written under the SERVICE ROLE, never the caller's token.
+     *
+     * `connector_capability_status` has RLS enabled with a member-READ policy
+     * and no insert policy -- which is the correct design: capability health
+     * is evidence about whether a connection works, and evidence a customer
+     * can write is not evidence.
+     *
+     * But the interactive path passed the caller's own db, so every insert was
+     * silently rejected by RLS. "Validate Permissions" returned `succeeded`
+     * with 12 checks and wrote ZERO capability rows, and the panel stayed
+     * empty saying it had never been evaluated. Measured 2026-09-15: the only
+     * rows in the table belonged to one connection and were dated 09-09 -- the
+     * weekly SCHEDULED run, which alone uses the service role.
+     *
+     * Falls back to the caller's db only when no service key is configured,
+     * so a misconfigured environment degrades rather than throwing -- and it
+     * will write nothing there, exactly as before.
+     */
+    if (actor?.orgId) {
+      const statusDb = env.SUPABASE_SERVICE_ROLE_KEY ? createDb(env, env.SUPABASE_SERVICE_ROLE_KEY) : db;
+
+      /*
+       * Read the existing last_success_at before writing. The write is an
+       * UPSERT, and it used to overwrite that column with null on every run
+       * where a capability was not currently available -- so "when did this
+       * last work?" was destroyed the moment it stopped working. Carrying it
+       * forward is what makes the timestamp durable, which is what staleness
+       * evaluation and recovery detection both read.
+       */
+      const existing = await statusDb
+        .select<{ capability: string; last_success_at: string | null }[]>('connector_capability_status', {
+          select: 'capability,last_success_at',
+          filters: { connection_id: `eq.${connection.id}`, org_id: `eq.${actor.orgId}` },
+          limit: 100,
+        })
+        .catch(() => [] as { capability: string; last_success_at: string | null }[]);
+
+      const previousSuccessAt = Object.fromEntries(existing.map((r) => [r.capability, r.last_success_at]));
+
+      await writeCapabilityStatuses(
+        statusDb,
+        buildCapabilityStatuses({
+          orgId: actor.orgId,
+          connectionId: connection.id,
+          checks,
+          snapshotId: run.id,
+          connectionStatus: overallStatus === 'succeeded' ? 'connected' : 'error',
+          previousSuccessAt,
+        }),
+      );
+    }
+
     const connectionPatch: Record<string, unknown> = { last_permission_check_at: new Date().toISOString() };
     if (overallStatus === 'succeeded') {
       connectionPatch.status = 'connected';
       connectionPatch.error_message = null;
     } else {
       connectionPatch.status = 'error';
-      connectionPatch.error_message = checks[0]?.detail ?? 'Validation failed';
+      // Same correction as the run row: name the required capabilities that
+      // failed, not whichever check happens to sit first in the array.
+      connectionPatch.error_message = verdict.summary;
     }
     await db.update('cloud_connections', { id: `eq.${connection.id}` }, connectionPatch, 'return=minimal');
 
@@ -121,7 +282,7 @@ export async function runConnectionValidation(
       });
     }
 
-    return { crashed: false, status: overallStatus, identity, checks };
+    return { crashed: false, status: overallStatus, identity, checks, accountMismatch, accountUnverified, errorMessage: accountMismatchMessage ?? undefined };
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Validation crashed unexpectedly';
     await db.update('connection_validation_runs', { id: `eq.${run.id}` }, { status: 'failed', finished_at: new Date().toISOString(), error_message: message }, 'return=minimal');
@@ -143,8 +304,12 @@ permissionsRoutes.post('/accounts/:id/permissions/validate', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'write');
 
+    // Authorize the caller for THIS connection before reading it: an
+    // id + org_id filter proves org ownership, not that this caller is
+    // permitted the connection (resource grants / active scope).
+    await requirePermittedConnection(db, orgId, auth.userId, c.req.param('id'), getActiveScope(c.req.raw, orgId));
     const rows = await db.select<ResolvableConnection[]>('cloud_connections', {
-      select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
+      select: 'id,aws_account_id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
       filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     const connection = rows[0];
@@ -186,8 +351,8 @@ permissionsRoutes.post('/internal/run-due-permission-checks', (c) =>
     const db = createDb(c.env, c.env.SUPABASE_SERVICE_ROLE_KEY);
     const now = new Date().toISOString();
 
-    const due = await db.select<(ResolvableConnection & { id: string })[]>('cloud_connections', {
-      select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
+    const due = await db.select<(ResolvableConnection & { id: string; org_id: string })[]>('cloud_connections', {
+      select: 'id,org_id,aws_account_id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
       filters: {
         provider: 'eq.aws',
         or: `(next_permission_check_at.is.null,next_permission_check_at.lte.${now})`,
@@ -198,8 +363,10 @@ permissionsRoutes.post('/internal/run-due-permission-checks', (c) =>
 
     const results = [];
     for (const connection of due) {
-      const result = await runConnectionValidation(db, c.env, connection, null);
-      const nextCheck = new Date(Date.now() + PERMISSION_CHECK_INTERVAL_DAYS * 24 * 60 * 60 * 1000).toISOString();
+      const result = await runConnectionValidation(db, c.env, connection, { orgId: connection.org_id, userId: null });
+      // See lib/scheduleCadence.ts. This is the weekly cron, so the jitter
+      // skip it used to suffer cost a full WEEK of permission validation.
+      const nextCheck = nextDueAtHours(PERMISSION_CHECK_INTERVAL_DAYS * 24);
       await db.update('cloud_connections', { id: `eq.${connection.id}` }, { next_permission_check_at: nextCheck }, 'return=minimal');
       results.push({ connectionId: connection.id, status: result.crashed ? 'crashed' : result.status });
     }
@@ -211,7 +378,24 @@ permissionsRoutes.post('/internal/run-due-permission-checks', (c) =>
 async function latestRunFor(db: Db, connectionId: string) {
   const runs = await db.select<{ id: string; status: string; identity_arn: string | null; identity_account_id: string | null; started_at: string; finished_at: string | null; error_message: string | null }[]>(
     'connection_validation_runs',
-    { select: 'id,status,identity_arn,identity_account_id,started_at,finished_at,error_message', filters: { connection_id: `eq.${connectionId}` }, order: 'started_at.desc', limit: 1 },
+    {
+      select: 'id,status,identity_arn,identity_account_id,started_at,finished_at,error_message',
+      /**
+       * AWS-P0-04: this had NO run_type filter, so it returned the latest run
+       * of ANY type. Discovery runs outnumber validations 96:24 in
+       * production, so the "Latest Validation Run" shown to customers was
+       * almost always a DISCOVERY run -- reported as `succeeded`, with its
+       * permission checks looked up by that run's id and therefore empty.
+       *
+       * Verified before the fix: both AWS connections showed
+       * latest_run_type=discovery, status=succeeded, 0 checks displayed --
+       * while 8 real permission checks existed for each. The evidence was
+       * always there; the query threw it away.
+       */
+      filters: { connection_id: `eq.${connectionId}`, run_type: 'eq.permission_validation' },
+      order: 'started_at.desc',
+      limit: 1,
+    },
   );
   const run = runs[0];
   if (!run) return null;
@@ -293,7 +477,7 @@ permissionsRoutes.get('/permissions', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
-    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId);
+    const connectionIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
     const connections = await db.select<{ id: string; connection_name: string; last_permission_check_at: string | null }[]>('cloud_connections', {
       select: 'id,connection_name,last_permission_check_at',
       filters: { id: inFilter(connectionIds), provider: 'eq.aws' },

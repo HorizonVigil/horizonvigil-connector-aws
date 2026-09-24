@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, inFilter, guarded, okJson, errJson, type Env } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, getOrgConnectionIds, getActiveScope, inFilter, guarded, okJson, errJson, type Env, requirePermittedConnection } from '@horizonvigil/shared-lib';
 
 export const regionsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -23,9 +23,14 @@ regionsRoutes.get('/regions', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // "Accounts enabled per region" is counted straight off these rows, so
+    // reading the org's full connection list published out-of-scope and
+    // un-granted accounts into the region summary. Bound it to the permitted
+    // set like every other read.
+    const permittedIds = await getOrgConnectionIds(db, orgId, auth.userId, getActiveScope(c.req.raw, orgId));
     const connections = await db.select<{ id: string; scan_regions: string[] }[]>('cloud_connections', {
       select: 'id,scan_regions',
-      filters: { org_id: `eq.${orgId}`, provider: 'eq.aws' },
+      filters: { id: inFilter(permittedIds), org_id: `eq.${orgId}`, provider: 'eq.aws' },
     });
     const connectionIds = connections.map((conn) => conn.id);
 
@@ -70,6 +75,10 @@ regionsRoutes.get('/accounts/:id/regions', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // Authorize the caller for THIS connection before reading it: an
+    // id + org_id filter proves org ownership, not that this caller is
+    // permitted the connection (resource grants / active scope).
+    await requirePermittedConnection(db, orgId, auth.userId, c.req.param('id'), getActiveScope(c.req.raw, orgId));
     const rows = await db.select<{ id: string; scan_regions: string[]; default_region: string; last_discovery_at: string | null }[]>('cloud_connections', {
       select: 'id,scan_regions,default_region,last_discovery_at',
       filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },

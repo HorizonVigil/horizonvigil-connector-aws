@@ -1,13 +1,14 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, guarded, okJson, errJson } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, guarded, okJson, errJson, requirePermittedConnection, getActiveScope } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { callJsonApi } from '../lib/awsApi';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
+import { classifyProvenance, describeProvenance } from '../lib/changeProvenance';
 
 export const cloudtrailEventsRoutes = new Hono<{ Bindings: Env }>();
 
 const LOOKUP_ATTRIBUTE_KEYS = new Set(['Username', 'EventName', 'ResourceName', 'ResourceType', 'EventSource', 'AccessKeyId', 'ReadOnly']);
 
-interface RawCloudTrailEvent {
+export interface RawCloudTrailEvent {
   EventId: string; EventName: string; EventTime: number; EventSource: string; Username?: string;
   Resources?: { ResourceType?: string; ResourceName?: string }[];
   CloudTrailEvent: string;
@@ -21,17 +22,80 @@ interface ParsedDetail {
   requestParameters?: unknown; responseElements?: unknown; managementEvent?: boolean; eventType?: string;
 }
 
-function mapEvent(e: RawCloudTrailEvent) {
+/**
+ * AWS access-key identifiers, temporary (ASIA) or long-lived (AKIA).
+ *
+ * AWS-P1-05: "Temporary AWS session access-key identifiers can appear in
+ * event summaries." CloudTrail puts the access key id in `Username` for
+ * some event shapes -- notably an IAM user acting without a resolvable user
+ * name. Rule 12 forbids exposing temporary access-key IDs in UI, logs,
+ * events, reports or telemetry, and a change feed is all four at once.
+ *
+ * Redacted rather than dropped: "an IAM principal we could not name" is
+ * still useful attribution, and blanking the actor entirely would make the
+ * row look like a system event.
+ */
+const ACCESS_KEY_ID = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
+
+function redactKeyIds(value: string | null): string | null {
+  return value === null ? null : value.replace(ACCESS_KEY_ID, '[redacted access key]');
+}
+
+const SENSITIVE_FIELD = /(password|passwd|secret|token|credential|authorization|private.?key|session.?key|access.?key)/i;
+
+/** Redacts credential-shaped values before CloudTrail detail reaches a UI or durable store. */
+export function redactCloudTrailDetail(value: unknown, depth = 0): unknown {
+  if (depth > 10) return '[truncated]';
+  if (typeof value === 'string') return redactKeyIds(value);
+  if (Array.isArray(value)) return value.slice(0, 200).map(item => redactCloudTrailDetail(item, depth + 1));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).slice(0, 300).map(([key, item]) => [
+      key,
+      SENSITIVE_FIELD.test(key) ? '[redacted]' : redactCloudTrailDetail(item, depth + 1),
+    ]));
+  }
+  return value;
+}
+
+export function mapCloudTrailEvent(e: RawCloudTrailEvent) {
   let detail: ParsedDetail = {};
   try { detail = JSON.parse(e.CloudTrailEvent) as ParsedDetail; } catch { /* leave detail empty if AWS ever returns a malformed string */ }
+
+  /*
+   * AWS-22.1. `invokedBy` was parsed and then dropped, which cost the feed its
+   * single strongest attribution signal: when an AWS service itself made the
+   * call -- Auto Scaling replacing an instance, CloudFormation rolling a stack
+   * -- it is named there and nowhere else. Without it, a change nobody made is
+   * indistinguishable from a change nobody can be found for.
+   */
+  const invokedBy = detail.userIdentity?.invokedBy ?? null;
+
+  /*
+   * Raw fields are kept AND classified. The classification is what a reviewer
+   * reads; the raw fields are what they check it against, which is the whole
+   * reason it is safe to offer a verdict at all.
+   */
+  const provenance = classifyProvenance({
+    userIdentityType: detail.userIdentity?.type ?? null,
+    invokedBy,
+    userAgent: detail.userAgent ?? null,
+    eventSource: e.EventSource,
+  });
+
   return {
     eventId: e.EventId,
     eventName: e.EventName,
     eventTime: new Date(e.EventTime * 1000).toISOString(),
     eventSource: e.EventSource,
-    username: e.Username ?? detail.userIdentity?.userName ?? null,
+    username: redactKeyIds(e.Username ?? detail.userIdentity?.userName ?? null),
     userIdentityType: detail.userIdentity?.type ?? null,
-    userIdentityArn: detail.userIdentity?.arn ?? detail.userIdentity?.sessionContext?.sessionIssuer?.arn ?? null,
+    userIdentityArn: redactKeyIds(detail.userIdentity?.arn ?? detail.userIdentity?.sessionContext?.sessionIssuer?.arn ?? null),
+    invokedBy,
+    /** Who made the change, classified. See lib/changeProvenance.ts. */
+    provenance: {
+      ...provenance,
+      summary: describeProvenance(provenance),
+    },
     sourceIpAddress: detail.sourceIPAddress ?? null,
     userAgent: detail.userAgent ?? null,
     awsRegion: detail.awsRegion ?? null,
@@ -39,8 +103,8 @@ function mapEvent(e: RawCloudTrailEvent) {
     errorCode: detail.errorCode ?? null,
     errorMessage: detail.errorMessage ?? null,
     resources: (e.Resources ?? []).map((r) => ({ resourceType: r.ResourceType, resourceName: r.ResourceName })),
-    requestParameters: detail.requestParameters ?? null,
-    responseElements: detail.responseElements ?? null,
+    requestParameters: redactCloudTrailDetail(detail.requestParameters ?? null),
+    responseElements: redactCloudTrailDetail(detail.responseElements ?? null),
   };
 }
 
@@ -72,6 +136,10 @@ cloudtrailEventsRoutes.get('/accounts/:id/cloudtrail-events', (c) =>
     const db = createDb(c.env, auth.accessToken);
     await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
 
+    // Authorize the caller for THIS connection before reading it: an
+    // id + org_id filter proves org ownership, not that this caller is
+    // permitted the connection (resource grants / active scope).
+    await requirePermittedConnection(db, orgId, auth.userId, c.req.param('id'), getActiveScope(c.req.raw, orgId));
     const rows = await db.select<ResolvableConnection[]>('cloud_connections', {
       select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
       filters: { id: `eq.${c.req.param('id')}`, org_id: `eq.${orgId}`, provider: 'eq.aws' },
@@ -90,9 +158,30 @@ cloudtrailEventsRoutes.get('/accounts/:id/cloudtrail-events', (c) =>
     const from = url.searchParams.get('from');
     const to = url.searchParams.get('to');
 
+    /**
+     * AWS-P1-05: this endpoint backs a surface called "Changes", and it was
+     * returning every Describe, List and Get call the account made. Read
+     * traffic dwarfs configuration changes by orders of magnitude, so the
+     * genuinely useful rows -- who changed what -- were buried.
+     *
+     * Default is now changes only. `includeReadOnly=true` brings the reads
+     * back for anyone who wants the full audit view.
+     *
+     * Pushed down to AWS as a LookupAttribute when we can, because filtering
+     * after the fact would return a page of 50 reads and display two rows.
+     * LookupEvents accepts exactly ONE attribute per call (an AWS
+     * constraint, not ours), so when the caller is already filtering by
+     * something else the ReadOnly filter is applied to the mapped results
+     * instead -- correct either way, just less efficient.
+     */
+    const includeReadOnly = url.searchParams.get('includeReadOnly') === 'true';
+    const callerFiltering = Boolean(attributeKey && attributeValue && LOOKUP_ATTRIBUTE_KEYS.has(attributeKey));
+
     const body: Record<string, unknown> = { MaxResults: 50 };
-    if (attributeKey && attributeValue && LOOKUP_ATTRIBUTE_KEYS.has(attributeKey)) {
+    if (callerFiltering) {
       body.LookupAttributes = [{ AttributeKey: attributeKey, AttributeValue: attributeValue }];
+    } else if (!includeReadOnly) {
+      body.LookupAttributes = [{ AttributeKey: 'ReadOnly', AttributeValue: 'false' }];
     }
     // CloudTrail only retains 90 days of default Event History regardless of
     // what's requested, so an unset "from" doesn't need clamping here — AWS
@@ -114,6 +203,23 @@ cloudtrailEventsRoutes.get('/accounts/:id/cloudtrail-events', (c) =>
     }
 
     const responseBody = result.body as { Events?: RawCloudTrailEvent[]; NextToken?: string };
-    return okJson({ events: (responseBody.Events ?? []).map(mapEvent), nextToken: responseBody.NextToken ?? null, region });
+    let events = (responseBody.Events ?? []).map(mapCloudTrailEvent);
+
+    // The fallback path described above. `readOnly` is null when CloudTrail
+    // did not state it; such an event is KEPT, because dropping an event we
+    // cannot classify would silently hide changes.
+    const filteredLocally = callerFiltering && !includeReadOnly;
+    if (filteredLocally) events = events.filter((e) => e.readOnly !== true);
+
+    return okJson({
+      events,
+      nextToken: responseBody.NextToken ?? null,
+      region,
+      // Stated so the UI never has to guess which view it is showing.
+      filter: {
+        includeReadOnly,
+        appliedBy: includeReadOnly ? 'none' : filteredLocally ? 'server' : 'aws',
+      },
+    });
   }),
 );

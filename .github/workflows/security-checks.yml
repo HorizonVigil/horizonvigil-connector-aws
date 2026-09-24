@@ -1,6 +1,7 @@
 name: Security Checks
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, test]
   pull_request:
@@ -9,26 +10,35 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 22 }
 
-      - name: Install dependencies
+      - name: Verify private dependency credential
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          if [ -z "$GH_PAT" ]; then
-            echo "::error::GH_PAT secret is required to install private HorizonVigil dependencies."
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "::error::GH_PAT is not configured for the private @horizonvigil/shared-lib dependency"
             exit 1
           fi
+
+      # package-lock resolves the private shared library to git+ssh. Rewrite
+      # that transport to HTTPS and supply the repository-read token via netrc
+      # so npm's git subprocess can install it without an SSH key. This is the
+      # same authenticated, non-build-arg pattern used by deploy.yml.
+      - name: Configure git for private shared-lib dependency
+        run: |
           git config --local --unset-all http.https://github.com/.extraheader || true
-          export GIT_CONFIG_COUNT=2
-          export GIT_CONFIG_KEY_0=url.https://x-access-token:${GH_PAT}@github.com/.insteadOf
-          export GIT_CONFIG_VALUE_0=ssh://git@github.com/
-          export GIT_CONFIG_KEY_1=url.https://x-access-token:${GH_PAT}@github.com/.insteadOf
-          export GIT_CONFIG_VALUE_1=git@github.com:
-          npm install
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          printf "machine github.com\nlogin x-access-token\npassword %s\n" "${{ secrets.GH_PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc
+
+      - name: Install locked dependencies
+        run: |
+          trap 'rm -f ~/.netrc' EXIT
+          npm ci
 
       - name: Type check
         run: npm run typecheck --if-present
@@ -43,13 +53,12 @@ jobs:
         run: npm audit --omit=dev --audit-level=high
 
       - name: Secret scan
-        run: |
-          set -euo pipefail
-          GITLEAKS_VERSION=8.28.0
-          curl -sSfL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          tar -xzf gitleaks.tar.gz gitleaks
-          sudo mv gitleaks /usr/local/bin/gitleaks
-          gitleaks detect --source . --redact --verbose
+        run: >-
+          docker run --rm
+          -v "$PWD:/repo"
+          zricethezav/gitleaks:v8.30.0
+          detect --source=/repo --config=/repo/.gitleaks.toml --redact --no-banner --verbose
+
       # Container scan only applies to services with a Dockerfile.
       - name: Check for a Dockerfile
         id: has-dockerfile
@@ -59,12 +68,9 @@ jobs:
         if: steps.has-dockerfile.outputs.exists == 'true'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          if [ -z "$GH_PAT" ]; then
-            echo "::error::GH_PAT secret is required to build images that install private HorizonVigil dependencies."
-            exit 1
-          fi
-          DOCKER_BUILDKIT=1 docker build --secret id=gh_pat,env=GH_PAT -t local-scan-target:${{ github.sha }} .
+          DOCKER_BUILDKIT: "1"
+        run: docker build --secret id=gh_pat,env=GH_PAT -t local-scan-target:${{ github.sha }} .
+
       # scanners: vuln only -- secret detection is gitleaks' job (above).
       # Running both here flagged UI placeholder copy (a GCP-key JSON
       # example in an account-connect form) as a "leaked" credential
@@ -73,7 +79,7 @@ jobs:
       # build.
       - name: Container scan
         if: steps.has-dockerfile.outputs.exists == 'true'
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: local-scan-target:${{ github.sha }}
           scanners: vuln
