@@ -27,12 +27,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
-      - name: Configure git for private shared-lib dependency
+      - name: Configure git for private GitHub dependencies
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::GH_PAT secret is required to install private HorizonVigil dependencies."
+            exit 1
+          fi
           git config --local --unset-all http.https://github.com/.extraheader || true
-          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-          printf "machine github.com\nlogin x-access-token\npassword %s\n" "${{ secrets.GH_PAT }}" > ~/.netrc
-          chmod 600 ~/.netrc
+          git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "ssh://git@github.com/"
+          git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "git@github.com:"
       - run: npm install
       - run: npm run typecheck
       - run: npm run build
