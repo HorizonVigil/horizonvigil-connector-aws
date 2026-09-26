@@ -31,25 +31,19 @@ RUN --mount=type=secret,id=gh_pat \
     npm ci && rm -f ~/.netrc
 COPY tsconfig.json ./
 COPY src ./src
-RUN npm run build
+RUN npm run build && npm prune --omit=dev
 
 FROM node:22-slim
 WORKDIR /app
 ENV NODE_ENV=production
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && update-ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && update-ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
-RUN --mount=type=secret,id=gh_pat \
-    git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"; \
-    if [ -f /run/secrets/gh_pat ]; then \
-      printf "machine github.com\nlogin x-access-token\npassword %s\n" "$(cat /run/secrets/gh_pat)" > ~/.netrc && chmod 600 ~/.netrc; \
-    fi; \
-    npm ci --omit=dev; status=$?; rm -f ~/.netrc; exit $status
+COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 # npm and git are installation tooling, not runtime dependencies. Removing
 # them shrinks the production attack surface and prevents vulnerabilities in
 # npm's bundled package manager libraries from shipping with the service.
-RUN apt-get purge -y --auto-remove git \
-    && rm -rf /var/lib/apt/lists/* /usr/local/lib/node_modules/npm \
+RUN rm -rf /usr/local/lib/node_modules/npm \
     && rm -f /usr/local/bin/npm /usr/local/bin/npx
 RUN useradd -r -u 10001 -g node appuser && chown -R appuser:node /app
 USER appuser

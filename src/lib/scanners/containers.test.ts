@@ -11,8 +11,28 @@ vi.mock('aws4fetch', () => ({
       return fetchMock(url, init);
     }
   },
+  AwsV4Signer: class {
+    opts: { url: string; method?: string; headers?: HeadersInit };
+    constructor(opts: { url: string; method?: string; headers?: HeadersInit }) { this.opts = opts; }
+    async sign() {
+      return { url: new URL(this.opts.url), method: this.opts.method ?? 'GET', headers: new Headers(this.opts.headers) };
+    }
+  },
 }));
-vi.mock('undici', () => ({ fetch: (url: string, init?: unknown) => k8sFetchMock(String(url), init) }));
+vi.mock('undici', () => ({
+  fetch: (url: string, init?: unknown) => k8sFetchMock(String(url), init),
+  Agent: class {
+    closed = false;
+    opts: unknown;
+    constructor(opts: unknown) {
+      this.opts = opts;
+      const g = globalThis as { __undiciAgents?: Array<{ closed: boolean; opts: unknown }> };
+      g.__undiciAgents = g.__undiciAgents ?? [];
+      g.__undiciAgents.push(this);
+    }
+    close() { this.closed = true; return Promise.resolve(); }
+  },
+}));
 vi.mock('../awsApi', async (importOriginal: () => Promise<Record<string, unknown>>) => ({
   ...(await importOriginal()),
   callJsonApi: (...args: unknown[]) => callJsonApiMock(...args),

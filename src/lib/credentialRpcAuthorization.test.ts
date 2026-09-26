@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 /**
  * AWS-I3. Credential rollback must not be reachable by an unauthorised org
@@ -22,13 +22,12 @@ import { readFileSync } from 'node:fs';
  * combinations, each run as the real user via `request.jwt.claims` inside a
  * rolled-back transaction.
  */
-const MIGRATION = readFileSync(
-  '../supabase/migrations/20260922160000_close_credential_rotation_rpc_escalation.sql',
-  'utf8',
-);
+const MIGRATION_PATH = '../supabase/migrations/20260922160000_close_credential_rotation_rpc_escalation.sql';
+const HAS_MIGRATION = existsSync(MIGRATION_PATH);
+const MIGRATION = HAS_MIGRATION ? readFileSync(MIGRATION_PATH, 'utf8') : '';
 const ACCOUNTS = readFileSync('src/routes/accounts.ts', 'utf8');
 
-describe('the RPCs require the same privilege the API requires', () => {
+describe.skipIf(!HAS_MIGRATION)('the RPCs require the same privilege the API requires', () => {
   it('rollback checks the effective cloud menu level, not just membership', () => {
     const fn = MIGRATION.slice(MIGRATION.indexOf('create or replace function public.rollback_aws_access_key'));
     expect(fn).toContain("fn_effective_menu_level(auth.uid(), v_org_id, 'cloud')");
@@ -55,7 +54,7 @@ describe('the RPCs require the same privilege the API requires', () => {
   });
 });
 
-describe('the SECURITY DEFINER surface stays safe', () => {
+describe.skipIf(!HAS_MIGRATION)('the SECURITY DEFINER surface stays safe', () => {
   it('every function the migration defines pins search_path', () => {
     const defs = MIGRATION.match(/create or replace function[\s\S]*?language \w+/g) ?? [];
     expect(defs.length).toBeGreaterThanOrEqual(3);

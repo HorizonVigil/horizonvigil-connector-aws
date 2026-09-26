@@ -563,7 +563,7 @@ export async function scanIam(ctx: ScannerContext): Promise<ScannedResource[]> {
       if (res.ok) return parsePasswordPolicy(res.body as string);
       // NoSuchEntity is a real answer: the account has NO password policy,
       // which is itself the finding. It is not missing evidence.
-      if (res.errorCode === 'NoSuchEntity' || res.normalizedCode === 'NOT_FOUND' || res.status === 404) {
+      if (res.errorCode === 'NoSuchEntity' || (res.normalizedCode as string | undefined) === 'NOT_FOUND' || res.status === 404) {
         return { ...EMPTY_PASSWORD_POLICY, collected: true, configured: false };
       }
       const code = res.normalizedCode ?? res.errorCode ?? res.errorMessage ?? String(res.status);

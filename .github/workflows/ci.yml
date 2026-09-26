@@ -1,0 +1,48 @@
+# CI only -- build/typecheck/test on every push and PR. Deployment is
+# handled by Cloud Build (cloudbuild.yaml + the horizonvigil-connector-aws-main-deploy
+# trigger in cloudops360), not here: this repo used to also deploy from
+# this workflow, but running both on the same push to main raced two
+# concurrent deploys of the same Cloud Run service. Cloud Build was kept
+# (see the comment at the top of cloudbuild.yaml -- it predates this
+# change and was already the one with a consistent success record); this
+# file now only gives PR/push authors a fast build-and-test signal.
+
+name: CI
+
+on:
+  push:
+    branches: [main, test]
+  pull_request:
+
+env:
+  PROJECT_ID: cloudops360
+  REGION: us-central1
+  SERVICE: connector-aws
+  REPO: cloudops360
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Install dependencies
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::GH_PAT secret is required to install private HorizonVigil dependencies."
+            exit 1
+          fi
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0=url.https://x-access-token:${GH_PAT}@github.com/.insteadOf
+          export GIT_CONFIG_VALUE_0=ssh://git@github.com/
+          export GIT_CONFIG_KEY_1=url.https://x-access-token:${GH_PAT}@github.com/.insteadOf
+          export GIT_CONFIG_VALUE_1=git@github.com:
+          npm install
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+
