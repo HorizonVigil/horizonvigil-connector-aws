@@ -3,6 +3,7 @@ import type { Env } from '../env';
 import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '../lib/crypto';
 import { validateCandidate, activateCandidate, rollbackToPrevious } from '../lib/credentialRotation';
 import { isConnectionPurgeEnabled, purgeDisabledResponse, isAssumeRoleEnabled, assumeRoleDisabledResponse } from '../lib/capabilities';
+import { validateConnectionCandidate } from '../lib/connectionValidation';
 
 export const accountsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -222,6 +223,22 @@ accountsRoutes.post('/accounts', (c) =>
         },
         409,
       );
+    }
+
+    // Never persist credentials that have only passed shape validation. STS
+    // must authenticate them (or the assumed role) and bind them to the exact
+    // account id selected by the customer first.
+    const validation = await validateConnectionCandidate(c.env, body.connectionMethod === 'access_key'
+      ? {
+          method: 'access_key', accountId: body.awsAccountId,
+          accessKeyId: body.accessKeyId!, secretAccessKey: body.secretAccessKey!,
+        }
+      : {
+          method: 'cross_account_role', accountId: body.awsAccountId,
+          roleArn: body.roleArn!, externalId: String(insert.external_id),
+        });
+    if (!validation.ok) {
+      return c.json({ ok: false, code: validation.code, error: validation.message }, validation.status);
     }
 
     const [created] = await db.insert<Record<string, unknown>[]>('cloud_connections', insert);
