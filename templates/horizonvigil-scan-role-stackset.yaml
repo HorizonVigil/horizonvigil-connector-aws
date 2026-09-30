@@ -33,6 +33,22 @@ Parameters:
     AllowedPattern: '^\d{12}$'
     ConstraintDescription: Must be a 12-digit AWS account ID.
 
+  AdditionalCurBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      Leave EMPTY unless you already had a Cost & Usage Report before
+      installing HorizonVigil. horizonvigil-cur-setup.yaml creates a bucket
+      named horizonvigil-cur-<account-id>, which this role can already read.
+      Set this only to point HorizonVigil at a pre-existing CUR bucket
+      instead; read access is then granted to that bucket as well, and to
+      nothing else.
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Must be empty or a valid S3 bucket name.
+
+Conditions:
+  HasAdditionalCurBucket: !Not [!Equals [!Ref AdditionalCurBucketName, '']]
+
 Resources:
   HorizonVigilScanRole:
     Type: AWS::IAM::Role
@@ -67,7 +83,6 @@ Resources:
                 Action:
                   - 'ec2:Describe*'
                   - 'ec2:GetEbsEncryptionByDefault'
-                  - 'ec2:GetConsoleOutput'
                   - 'elasticloadbalancing:Describe*'
                   - 'autoscaling:Describe*'
                   - 's3:List*'
@@ -104,7 +119,6 @@ Resources:
                   - 'dynamodb:List*'
                   - 'elasticache:Describe*'
                   - 'redshift:Describe*'
-                  - 'redshift:GetClusterCredentials'
                   - 'memorydb:Describe*'
                   - 'redshift-serverless:ListWorkgroups'
                   - 'timestream:List*'
@@ -132,7 +146,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - 'codebuild:List*'
-                  - 'codebuild:BatchGet*'
+                  - 'codebuild:BatchGetProjects'
                   - 'codepipeline:List*'
                   - 'cognito-idp:List*'
                   - 'cognito-identity:List*'
@@ -161,7 +175,6 @@ Resources:
                   - 'states:Describe*'
                   - 'batch:Describe*'
                   - 'elasticbeanstalk:Describe*'
-                  - 'apigateway:GET'
                   - 'appsync:List*'
                 Resource: '*'
               - Sid: NetworkingEdgeDns
@@ -194,7 +207,6 @@ Resources:
                   - 'iam:List*'
                   - 'iam:Get*'
                   - 'iam:GenerateCredentialReport'
-                  - 'iam:GenerateServiceLastAccessedDetails'
                   - 'kms:List*'
                   - 'kms:Describe*'
                   - 'kms:GetKeyPolicy'
@@ -237,7 +249,6 @@ Resources:
                   - 'cloudwatch:Get*'
                   - 'cloudwatch:List*'
                   - 'logs:Describe*'
-                  - 'logs:Get*'
                   - 'logs:FilterLogEvents'
                   - 'cloudtrail:Describe*'
                   - 'cloudtrail:Get*'
@@ -292,6 +303,63 @@ Resources:
                   - 'ds:DescribeDirectories'
                   - 'license-manager:List*'
                 Resource: '*'
+
+              # apigateway:GET is an inventory read, but on Resource "*" it
+              # also covers GET /apikeys, which returns API key VALUES. Scoped
+              # to the two collections the scanner actually walks. This
+              # narrowing was applied to the published collection policy on
+              # 2026-09-09 (AC-12) and is re-applied here, where it had been
+              # missed -- the template is what customers actually deploy.
+              - Sid: ApiGatewayInventoryOnly
+                Effect: Allow
+                Action:
+                  - 'apigateway:GET'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:apigateway:*::/restapis'
+                  - !Sub 'arn:${AWS::Partition}:apigateway:*::/restapis/*'
+                  - !Sub 'arn:${AWS::Partition}:apigateway:*::/apis'
+                  - !Sub 'arn:${AWS::Partition}:apigateway:*::/apis/*'
+
+              # Finding the Cost & Usage Report. These are read-only lookups of
+              # the export DEFINITION -- where the report is written and under
+              # what name -- so HorizonVigil never asks you to type a bucket
+              # name. cur:Describe* covers legacy CUR; bcm-data-exports covers
+              # CUR 2.0.
+              - Sid: CostAndUsageReportDiscovery
+                Effect: Allow
+                Action:
+                  - 'cur:DescribeReportDefinitions'
+                  - 'bcm-data-exports:ListExports'
+                  - 'bcm-data-exports:GetExport'
+                Resource: '*'
+
+              # Reading the report's CONTENTS.
+              #
+              # This is the only s3:GetObject in the whole role, and it is why
+              # it is a separate statement rather than another action in the
+              # storage block: everything else here reads bucket METADATA
+              # (policy, encryption, lifecycle, public-access settings), which
+              # is what a posture scanner needs. Object contents are customer
+              # data, and a collection role that can read any object is a
+              # different and much larger promise than one that cannot.
+              #
+              # Scoped to the bucket horizonvigil-cur-setup.yaml creates. That
+              # name is derived from the account ID rather than configurable
+              # precisely so this grant can be written before the bucket
+              # exists, letting the two stacks deploy in either order.
+              - Sid: CostAndUsageReportObjectRead
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource: !If
+                  - HasAdditionalCurBucket
+                  - - !Sub 'arn:${AWS::Partition}:s3:::horizonvigil-cur-${AWS::AccountId}'
+                    - !Sub 'arn:${AWS::Partition}:s3:::horizonvigil-cur-${AWS::AccountId}/*'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${AdditionalCurBucketName}'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${AdditionalCurBucketName}/*'
+                  - - !Sub 'arn:${AWS::Partition}:s3:::horizonvigil-cur-${AWS::AccountId}'
+                    - !Sub 'arn:${AWS::Partition}:s3:::horizonvigil-cur-${AWS::AccountId}/*'
 
 Outputs:
   RoleArn:

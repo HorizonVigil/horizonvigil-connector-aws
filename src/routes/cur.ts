@@ -47,7 +47,7 @@ curRoutes.post('/accounts/:id/cur/discover', (c) =>
     }, 'return=minimal');
 
     await writeAuditLog(db, { orgId, actorId: auth.userId, action: 'aws_account.cur_discovered', targetType: 'cloud_connection', targetId: connection.id, metadata: { reportName: report.ReportName, bucket: report.S3Bucket } });
-    return okJson({ reportName: report.ReportName, bucket: report.S3Bucket, prefix: report.S3Prefix, region: report.S3Region });
+    return okJson({ reportName: report.ReportName, bucket: report.S3Bucket, prefix: report.S3Prefix, region: report.S3Region, curVersion: report.version });
   }),
 );
 
@@ -71,7 +71,10 @@ curRoutes.get('/accounts/:id/cur/manifest', (c) =>
     const result = await fetchCurManifest(resolved.creds, config);
     if ('error' in result) return errJson(404, result.error);
 
-    return okJson({ billingPeriod: result.billingPeriod, reportKeys: result.manifest.reportKeys });
+    // result.reportKeys, not result.manifest.reportKeys: the latter is
+    // undefined on a CUR 2.0 manifest, which lists its files under a
+    // different property.
+    return okJson({ billingPeriod: result.billingPeriod, curVersion: result.version, reportKeys: result.reportKeys });
   }),
 );
 
