@@ -89,11 +89,27 @@ export function purgeDisabledResponse(): Response {
  * Organizations hierarchy + bulk import depend on this same path, so a
  * UI-only change would leave the broken flow callable.
  *
- * This is deliberately a gate and not a deletion. resolveCredentials already
- * implements AssumeRole for connections that have a role ARN, so the work to
- * certify it is validation and testing (external-ID generation, trust-policy
- * verification, account match, live STS probe), not reimplementation. Flip
- * ASSUME_ROLE_ENABLED to 'true' once that acceptance suite passes.
+ * This is deliberately a gate and not a deletion.
+ *
+ * WHAT CHANGED, AND WHY THE FLAG STAYS
+ *
+ * The original blocker was not the code — resolveCredentials has always
+ * implemented AssumeRole — but that the only implementation needed
+ * HorizonVigil's OWN long-lived AWS access key (PLATFORM_AWS_ACCESS_KEY_ID),
+ * and no such key or account exists. Certification could not proceed against
+ * a mechanism with no credentials behind it.
+ *
+ * That is now resolved without any AWS credential at all: this service runs on
+ * Cloud Run, AWS trusts `accounts.google.com` as a native federated principal,
+ * and AssumeRoleWithWebIdentity is unsigned. See webIdentity.ts.
+ *
+ * The flag REMAINS, and remains fail-closed, because the code working is not
+ * the same as the rollout being done. Turning it on is a deployment decision
+ * that also requires the customer-side trust policy
+ * (templates/horizonvigil-scan-role-stackset.yaml, TrustMode: WebIdentity) to
+ * be what customers are actually given. Enabling it automatically the moment
+ * the code shipped would be exactly the "it compiles, therefore it works"
+ * substitution this connector refuses elsewhere.
  */
 export function isAssumeRoleEnabled(env: unknown): boolean {
   return (env as { ASSUME_ROLE_ENABLED?: string } | null)?.ASSUME_ROLE_ENABLED === 'true';
@@ -103,6 +119,6 @@ export function isAssumeRoleEnabled(env: unknown): boolean {
 export function assumeRoleDisabledResponse(): Response {
   return errJson(
     403,
-    'capability_not_available: cross_account_role — this connection method is not enabled in this build. Use IAM access keys until AssumeRole is certified.',
+    'capability_not_available: cross_account_role — this connection method is not enabled in this deployment. Use IAM access keys, or set ASSUME_ROLE_ENABLED=true once the workload-identity trust policy has been rolled out.',
   );
 }

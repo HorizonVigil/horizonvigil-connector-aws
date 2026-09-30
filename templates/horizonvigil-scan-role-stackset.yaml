@@ -33,6 +33,36 @@ Parameters:
     AllowedPattern: '^\d{12}$'
     ConstraintDescription: Must be a 12-digit AWS account ID.
 
+  TrustMode:
+    Type: String
+    Default: 'WebIdentity'
+    AllowedValues: ['WebIdentity', 'PlatformAccount']
+    Description: >
+      How HorizonVigil proves who it is when assuming this role.
+
+      WebIdentity (recommended) trusts a Google-signed workload identity token.
+      HorizonVigil runs on Google Cloud Run, AWS accepts accounts.google.com as
+      a native federated principal, and AssumeRoleWithWebIdentity is unsigned —
+      so NO long-lived AWS credential exists on either side. Nothing to rotate,
+      nothing to leak.
+
+      PlatformAccount is the older model: this role trusts a HorizonVigil-owned
+      AWS account, which holds a long-lived access key used to call
+      sts:AssumeRole. Choose it only if your security policy requires an AWS
+      account principal.
+
+  PlatformGoogleSubject:
+    Type: String
+    Default: ''
+    Description: >
+      Required when TrustMode is WebIdentity. The numeric unique ID of
+      HorizonVigil's Google service account — the `sub` claim its tokens carry.
+      HorizonVigil shows you this value during onboarding; it is a public
+      identifier, not a secret. Pinning it is what stops any other Google
+      workload from assuming this role.
+    AllowedPattern: '^$|^[0-9]{10,30}$'
+    ConstraintDescription: Must be empty or the service account's numeric unique ID.
+
   AdditionalCurBucketName:
     Type: String
     Default: ''
@@ -48,6 +78,7 @@ Parameters:
 
 Conditions:
   HasAdditionalCurBucket: !Not [!Equals [!Ref AdditionalCurBucketName, '']]
+  UseWebIdentity: !Equals [!Ref TrustMode, 'WebIdentity']
 
 Resources:
   HorizonVigilScanRole:
@@ -58,16 +89,50 @@ Resources:
         Read-only role for HorizonVigil's cloud security scanning. Grants no
         write, delete, or object/secret-content-read permissions anywhere --
         see the inline policy below for the exact action list.
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              AWS: !Sub 'arn:aws:iam::${PlatformAccountId}:root'
-            Action: 'sts:AssumeRole'
-            Condition:
-              StringEquals:
-                'sts:ExternalId': !Ref ExternalId
+      # Two trust models, selected by TrustMode. Both pin the SAME external ID;
+      # only the principal and the claim carrying that ID differ.
+      AssumeRolePolicyDocument: !If
+        - UseWebIdentity
+        # ---------------------------------------------------------------
+        # Workload identity. No AWS credential exists on either side.
+        #
+        # `sub` pins WHICH Google workload may assume this role. `oaud` pins
+        # WHICH of HorizonVigil's connections the token was minted for — the
+        # external ID travels as the token's audience, so it is a claim Google
+        # signed rather than a parameter the caller chose. Both are required:
+        # `sub` alone would let a token minted for another customer's
+        # connection be replayed against this role, because the same service
+        # account serves every customer.
+        #
+        # `oaud`, not `aud`: AWS maps the `aud` condition key from the token's
+        # `azp` claim when `azp` is set, and Google sets `azp` on
+        # service-account tokens. `oaud` always maps from `aud`, so it means
+        # the same thing either way.
+        # ---------------------------------------------------------------
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Federated: 'accounts.google.com'
+              Action: 'sts:AssumeRoleWithWebIdentity'
+              Condition:
+                StringEquals:
+                  'accounts.google.com:sub': !Ref PlatformGoogleSubject
+                  'accounts.google.com:oaud': !Ref ExternalId
+        # ---------------------------------------------------------------
+        # Platform account. HorizonVigil holds a long-lived AWS access key and
+        # calls the signed sts:AssumeRole. Retained for customers whose policy
+        # requires an AWS account principal.
+        # ---------------------------------------------------------------
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                AWS: !Sub 'arn:${AWS::Partition}:iam::${PlatformAccountId}:root'
+              Action: 'sts:AssumeRole'
+              Condition:
+                StringEquals:
+                  'sts:ExternalId': !Ref ExternalId
       # Kept in exact sync with cloudops-frontend/src/lib/leastPrivilegePolicy.ts
       # (LEAST_PRIVILEGE_POLICY) -- the same permission set the interactive
       # single-account onboarding wizard already shows customers to attach by

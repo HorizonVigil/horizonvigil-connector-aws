@@ -1,5 +1,6 @@
 import type { Env } from '../env';
 import { assumeConnectionRole } from './assumeRole';
+import type { WebIdentityDeps } from './webIdentity';
 import { checkAccountBinding } from './accountBinding';
 import { checkCallerIdentity } from './permissionChecks';
 import type { AwsCreds } from './awsApi';
@@ -16,7 +17,11 @@ export type ConnectionValidation =
  * Proves that a proposed connection authenticates to the account it claims
  * before any credential material or connection row is persisted.
  */
-export async function validateConnectionCandidate(env: Env, candidate: ConnectionCandidate): Promise<ConnectionValidation> {
+export async function validateConnectionCandidate(
+  env: Env,
+  candidate: ConnectionCandidate,
+  deps: WebIdentityDeps = {},
+): Promise<ConnectionValidation> {
   let creds: AwsCreds;
   if (candidate.method === 'access_key') {
     creds = { accessKeyId: candidate.accessKeyId, secretAccessKey: candidate.secretAccessKey };
@@ -25,13 +30,19 @@ export async function validateConnectionCandidate(env: Env, candidate: Connectio
       { accessKeyId: env.PLATFORM_AWS_ACCESS_KEY_ID, secretAccessKey: env.PLATFORM_AWS_SECRET_ACCESS_KEY },
       candidate.roleArn,
       candidate.externalId,
+      deps,
     );
     if (!assumed.ok || !assumed.credentials) {
-      const platformMissing = !env.PLATFORM_AWS_ACCESS_KEY_ID || !env.PLATFORM_AWS_SECRET_ACCESS_KEY;
+      // 503 only when no mechanism existed to try -- that is OUR infrastructure
+      // being unconfigured, and the customer can do nothing about it. Once a
+      // mechanism ran and AWS refused, it is a 400 and the message points at
+      // the trust policy, which is the thing they can fix. Keying this off
+      // "are platform keys set" (as it did before workload identity existed)
+      // now reports every trust-policy mismatch on Cloud Run as a 503 outage.
       return {
         ok: false,
-        status: platformMissing ? 503 : 400,
-        code: platformMissing ? 'assume_role_platform_unavailable' : 'assume_role_failed',
+        status: assumed.unavailable ? 503 : 400,
+        code: assumed.unavailable ? 'assume_role_platform_unavailable' : 'assume_role_failed',
         message: assumed.reason ?? 'HorizonVigil could not assume the supplied role.',
       };
     }

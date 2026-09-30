@@ -232,3 +232,60 @@ describe('the CUR bucket is not writable by the wrong billing service', () => {
     expect(CUR_CODE).toContain('DeletionPolicy: Retain');
   });
 });
+
+/**
+ * The trust policy is the security boundary for cross-account access: it is
+ * the only thing deciding who may assume a customer's role. It is also the
+ * hardest part to change later, because changing it means asking every
+ * customer to redeploy a stack.
+ */
+describe('the cross-account trust policy', () => {
+  const trust = ROLE_CODE.slice(
+    ROLE_CODE.indexOf('AssumeRolePolicyDocument'),
+    ROLE_CODE.indexOf('ManagedPolicyArns') === -1 ? ROLE_CODE.indexOf('Policies:') : ROLE_CODE.indexOf('ManagedPolicyArns'),
+  );
+
+  it('defaults to workload identity, which needs no AWS credential at all', () => {
+    expect(ROLE_CODE).toMatch(/TrustMode:[\s\S]{0,200}Default: 'WebIdentity'/);
+  });
+
+  it('trusts Google natively rather than an AWS account', () => {
+    expect(trust).toContain("Federated: 'accounts.google.com'");
+    expect(trust).toContain("Action: 'sts:AssumeRoleWithWebIdentity'");
+  });
+
+  /**
+   * BOTH conditions, and this is the one that matters most.
+   *
+   * The same Google service account assumes every customer's role, so `sub`
+   * alone is not customer-specific -- a token minted for one connection would
+   * satisfy every other customer's trust policy. `oaud` carries the external
+   * ID as a claim Google signed, which is what makes the grant specific.
+   */
+  it('pins the workload AND the connection, not just the workload', () => {
+    expect(trust).toContain("'accounts.google.com:sub'");
+    expect(trust).toContain("'accounts.google.com:oaud'");
+  });
+
+  /**
+   * `aud` maps from the token's `azp` claim when `azp` is set, and Google sets
+   * `azp` on service-account tokens -- so conditioning on `aud` would compare
+   * the external ID against the service account's ID and never match. `oaud`
+   * always maps from `aud`.
+   */
+  it('conditions on oaud, not aud', () => {
+    expect(trust).not.toContain("'accounts.google.com:aud'");
+  });
+
+  it('keeps the platform-account model available, still pinned by external ID', () => {
+    expect(trust).toContain("Action: 'sts:AssumeRole'");
+    expect(trust).toContain("'sts:ExternalId'");
+  });
+
+  it('never grants trust without a condition', () => {
+    // A trust policy naming a principal with no Condition block is the
+    // classic confused-deputy hole. Both branches carry one.
+    const conditions = trust.match(/Condition:/g) ?? [];
+    expect(conditions.length).toBe(2);
+  });
+});
