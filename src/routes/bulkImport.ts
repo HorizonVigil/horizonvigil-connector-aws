@@ -1,4 +1,4 @@
-import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireRole, writeAuditLog, guarded, okJson, errJson, enforceRateLimit, type Db } from '@horizonvigil/shared-lib';
+import { Hono, getAuthContext, requireOrgId, createDb, requireMenuPermission, requireRole, writeAuditLog, guarded, okJson, errJson, enforceRateLimit, checkCloudAccountLimit, type Db } from '@horizonvigil/shared-lib';
 import type { Env } from '../env';
 import { isAssumeRoleEnabled, assumeRoleDisabledResponse } from '../lib/capabilities';
 import { resolveCredentials, type ResolvableConnection } from './permissions';
@@ -14,7 +14,40 @@ export const bulkImportRoutes = new Hono<{ Bindings: Env }>();
  * instead of asking the customer to tell it account-by-account.
  */
 const ROLE_NAME = 'HorizonVigilRead';
-const MAX_ACCOUNTS_PER_BULK_IMPORT = 2000;
+export const MAX_ACCOUNTS_PER_BULK_IMPORT = 2000;
+
+/**
+ * Rows per insert request.
+ *
+ * The whole import used to go in ONE insert. At 2,000 accounts that is a
+ * single multi-megabyte request in a single transaction, where one rejected
+ * row loses all 2,000 and the customer gets no partial progress and no idea
+ * which account was the problem. Chunking bounds the body, bounds the
+ * transaction, and lets a failure name the batch it happened in while the
+ * batches that succeeded stay imported.
+ */
+export const INSERT_CHUNK = 200;
+
+export function chunk<T>(items: readonly T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+/**
+ * The partition the member roles live in, taken from the management
+ * connection's own role ARN.
+ *
+ * Hardcoding `arn:aws:` produces role ARNs that cannot exist in GovCloud
+ * (`aws-us-gov`) or China (`aws-cn`) — every imported connection would be
+ * shaped correctly and authenticate nowhere. Access-key connections have no
+ * ARN to read, so they fall back to the commercial partition, which is where
+ * they almost certainly are.
+ */
+export function partitionOf(roleArn: string | null | undefined): string {
+  const parts = (roleArn ?? '').split(':');
+  return parts.length > 1 && parts[1] ? parts[1] : 'aws';
+}
 
 /** Every aws_account_id this org already has an AWS connection for, paginated to completion rather than one `in.(...)` filter -- at real scale (thousands of accounts) that filter's query string would risk the URL length AWS/Cloud Run infra actually allows through. */
 async function existingAwsAccountIds(db: Db, orgId: string): Promise<Set<string>> {
@@ -77,6 +110,8 @@ bulkImportRoutes.get('/organizations/external-id', (c) =>
 
 interface BulkImportBody {
   managementConnectionId?: string;
+  /** Optional OU or root id. Omitted, the whole Organization is imported. */
+  parentId?: string;
   projectId?: string | null;
   environment?: string;
 }
@@ -102,6 +137,9 @@ bulkImportRoutes.get('/accounts/bulk-import/preview', (c) =>
     if (!managementConnectionId) {
       return errJson(400, 'managementConnectionId is required — pass the connection id of your AWS Organizations management account.');
     }
+    // Optional OU scope. The preview MUST accept the same scope as the import,
+    // or the counts a customer approves are not the accounts they get.
+    const parentId = c.req.query('parentId') ?? undefined;
 
     const rows = await db.select<(ResolvableConnection & { id: string })[]>('cloud_connections', {
       select: 'id,connection_method,credentials_encrypted,role_arn,external_id,default_region',
@@ -113,20 +151,30 @@ bulkImportRoutes.get('/accounts/bulk-import/preview', (c) =>
     const resolved = await resolveCredentials(c.env, managementConnection);
     if ('error' in resolved) return errJson(400, `Could not resolve credentials for the management account connection: ${resolved.error}`);
 
-    const listed = await listOrganizationAccounts(resolved.creds);
+    const listed = await listOrganizationAccounts(resolved.creds, parentId);
     if (!listed.ok) return errJson(400, listed.error);
 
     const active = listed.accounts.filter((a): a is OrgAccount & { Id: string } => a.Status === 'ACTIVE' && !!a.Id);
     const alreadyConnected = await existingAwsAccountIds(db, orgId);
     const importable = active.filter((a) => !alreadyConnected.has(a.Id));
 
+    // The plan position AFTER the import, not before. "You are at 48 of 50"
+    // is not the useful sentence when the next click adds 800.
+    const planLimit = await checkCloudAccountLimit(db, orgId);
+    const projected = planLimit.included && planLimit.included > 0
+      ? { used: planLimit.used, included: planLimit.included, afterImport: planLimit.used + importable.length,
+          overBy: Math.max(0, planLimit.used + importable.length - planLimit.included) }
+      : null;
+
     return okJson({
+      scope: parentId ? { parentId } : { parentId: null, description: 'entire organization' },
       total: listed.accounts.length,
       active: active.length,
       inactive: listed.accounts.length - active.length,
       alreadyConnected: active.length - importable.length,
       importable: importable.length,
       overLimit: importable.length > MAX_ACCOUNTS_PER_BULK_IMPORT ? importable.length - MAX_ACCOUNTS_PER_BULK_IMPORT : 0,
+      plan: projected,
       sample: importable.slice(0, 8).map((a) => ({ id: a.Id, name: a.Name ?? a.Id })),
     });
   }),
@@ -154,12 +202,15 @@ bulkImportRoutes.get('/accounts/bulk-import/preview', (c) =>
  * misconfigured StackSet role only becomes visible once
  * /internal/run-first-scans (internalScan.ts) actually tries to assume it,
  * exactly like any other broken cross-account-role connection today —
- * and, on top of that, actually calling sts:AssumeRole against a
- * cross-account-role connection needs PLATFORM_AWS_ACCESS_KEY_ID/SECRET
- * (see resolveCredentials in permissions.ts), which is not provisioned in
- * this environment. Every connection this endpoint creates is real and
- * correctly shaped; whether it can ever actually authenticate is genuinely
- * unverifiable until that credential exists.
+ * exactly like any other broken cross-account-role connection today.
+ *
+ * That last caveat USED to be larger: assuming a member role needed
+ * PLATFORM_AWS_ACCESS_KEY_ID, which was never provisioned, so every
+ * connection this created was correctly shaped and could never authenticate.
+ * Workload identity removed that dependency -- there is no platform AWS
+ * credential to provision any more -- so an imported connection can now
+ * actually be assumed, provided the StackSet was deployed with the matching
+ * TrustMode and PlatformGoogleSubject.
  *
  * requireRole(['owner']) rather than requireMenuPermission(..., 'admin'):
  * deliberately stricter than the single-account route, which any org admin
@@ -202,13 +253,15 @@ bulkImportRoutes.post('/accounts/bulk-import-from-organization', (c) =>
     const resolved = await resolveCredentials(c.env, managementConnection);
     if ('error' in resolved) return errJson(400, `Could not resolve credentials for the management account connection: ${resolved.error}`);
 
-    const listed = await listOrganizationAccounts(resolved.creds);
+    const listed = await listOrganizationAccounts(resolved.creds, body.parentId);
     if (!listed.ok) return errJson(400, listed.error);
 
     const activeAccounts = listed.accounts.filter((a): a is OrgAccount & { Id: string } => a.Status === 'ACTIVE' && !!a.Id);
     const inactiveCount = listed.accounts.length - activeAccounts.length;
     if (activeAccounts.length > MAX_ACCOUNTS_PER_BULK_IMPORT) {
-      return errJson(400, `This Organization has ${activeAccounts.length} active accounts, above this endpoint's ${MAX_ACCOUNTS_PER_BULK_IMPORT}-per-call safety limit. Contact HorizonVigil for a staged import.`);
+      // Actionable, not a support ticket: scoping to an OU is a parameter on
+      // this same endpoint, and the preview accepts it too.
+      return errJson(400, `This ${body.parentId ? 'organizational unit' : 'Organization'} has ${activeAccounts.length} active accounts, above this endpoint's ${MAX_ACCOUNTS_PER_BULK_IMPORT}-per-call safety limit. Import one organizational unit at a time by passing "parentId" (preview the same scope first with ?parentId=).`);
     }
 
     const alreadyConnected = await existingAwsAccountIds(db, orgId);
@@ -219,26 +272,46 @@ bulkImportRoutes.post('/accounts/bulk-import-from-organization', (c) =>
     }
 
     const externalId = await getOrCreateOrgExternalId(db, orgId);
+    const partition = partitionOf(managementConnection.role_arn);
+    const planLimit = await checkCloudAccountLimit(db, orgId);
 
-    const inserted = await db.insert<{ id: string; aws_account_id: string }[]>(
-      'cloud_connections',
-      toInsert.map((a) => ({
-        org_id: orgId,
-        project_id: body.projectId ?? null,
-        provider: 'aws',
-        connection_method: 'cross_account_role',
-        aws_account_id: a.Id,
-        connection_name: a.Name ?? a.Id,
-        role_arn: `arn:aws:iam::${a.Id}:role/${ROLE_NAME}`,
-        external_id: externalId,
-        default_region: 'us-east-1',
-        environment: body.environment ?? 'production',
-        status: 'pending',
-        auto_scan_enabled: true,
-        created_by: auth.userId,
-        credentials_encrypted: {},
-      })),
-    );
+    const rowsFor = (a: OrgAccount & { Id: string }) => ({
+      org_id: orgId,
+      project_id: body.projectId ?? null,
+      provider: 'aws',
+      connection_method: 'cross_account_role',
+      aws_account_id: a.Id,
+      connection_name: a.Name ?? a.Id,
+      // Partition taken from the management connection, not hardcoded: an
+      // `arn:aws:` role cannot exist in GovCloud or China.
+      role_arn: `arn:${partition}:iam::${a.Id}:role/${ROLE_NAME}`,
+      external_id: externalId,
+      default_region: managementConnection.default_region ?? 'us-east-1',
+      environment: body.environment ?? 'production',
+      status: 'pending',
+      auto_scan_enabled: true,
+      created_by: auth.userId,
+      credentials_encrypted: {},
+    });
+
+    const inserted: { id: string; aws_account_id: string }[] = [];
+    const failedBatches: { accounts: number; firstAccountId: string; error: string }[] = [];
+
+    for (const batch of chunk(toInsert, INSERT_CHUNK)) {
+      try {
+        const rows = await db.insert<{ id: string; aws_account_id: string }[]>('cloud_connections', batch.map(rowsFor));
+        inserted.push(...rows);
+      } catch (err) {
+        // Record and continue. One rejected batch must not discard the ones
+        // that already landed, and the customer needs to know WHICH accounts
+        // are missing rather than being told the whole import failed.
+        failedBatches.push({
+          accounts: batch.length,
+          firstAccountId: batch[0].Id,
+          error: err instanceof Error ? err.message : 'insert failed',
+        });
+      }
+    }
 
     await writeAuditLog(db, {
       orgId,
@@ -246,13 +319,34 @@ bulkImportRoutes.post('/accounts/bulk-import-from-organization', (c) =>
       action: 'aws_account.bulk_imported',
       targetType: 'cloud_connection',
       targetId: body.managementConnectionId,
-      metadata: { imported: inserted.length, skippedAlreadyConnected: activeAccounts.length - toInsert.length, skippedInactive: inactiveCount },
+      metadata: {
+        imported: inserted.length,
+        failed: toInsert.length - inserted.length,
+        scope: body.parentId ?? 'organization',
+        skippedAlreadyConnected: activeAccounts.length - toInsert.length,
+        skippedInactive: inactiveCount,
+      },
     });
 
     return okJson({
       imported: inserted.length,
+      // Stated separately and always, so a partial import can never read as a
+      // complete one. `imported` alone would look like success at any scale.
+      attempted: toInsert.length,
+      failed: toInsert.length - inserted.length,
+      failedBatches,
+      scope: body.parentId ? { parentId: body.parentId } : { parentId: null, description: 'entire organization' },
       skippedAlreadyConnected: activeAccounts.length - toInsert.length,
       skippedInactive: inactiveCount,
+      planLimitWarning: planLimit.included && planLimit.included > 0 && planLimit.used + inserted.length > planLimit.included
+        ? `This import takes you to ${planLimit.used + inserted.length} cloud accounts against a plan that includes ${planLimit.included}.`
+        : null,
+      // Imported connections are created 'pending'. They are assumed and
+      // validated by /internal/run-first-scans, not by this request -- 1,000
+      // sts:AssumeRole calls do not belong in one HTTP request.
+      nextStep: inserted.length > 0
+        ? 'Connections are queued as pending. First scans run on the scheduled internal sweep; a role whose trust policy does not match will surface there as a connection error.'
+        : null,
       connections: inserted.map((r) => ({ id: r.id, awsAccountId: r.aws_account_id })),
     }, 201);
   }),
