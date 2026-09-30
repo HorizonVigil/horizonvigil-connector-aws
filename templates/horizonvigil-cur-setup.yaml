@@ -1,0 +1,417 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  HorizonVigil Cost & Usage Report (CUR 2.0) setup. Creates the S3 bucket and
+  the AWS Data Exports export that HorizonVigil reads for per-resource cost.
+  Deploy ONCE, in us-east-1, in your MANAGEMENT (payer) account only.
+
+# WHY THIS IS A SEPARATE STACK FROM THE SCAN ROLE
+#
+# horizonvigil-scan-role-stackset.yaml is a StackSet: it lands in EVERY member
+# account of the organization, because every account needs its own read role.
+# A Cost & Usage Report is the opposite shape. Billing data is consolidated at
+# the payer, so one CUR in the management account already covers every member
+# account. Putting CUR creation in the StackSet would create one bucket and one
+# export per member account -- N buckets of duplicated or empty data, N times
+# the S3 bill, for one useful report.
+#
+# So: role stack everywhere, CUR stack once.
+#
+# WHY CUR 2.0 (DATA EXPORTS) AND NOT LEGACY CUR
+#
+# Legacy CUR (cur:PutReportDefinition) is the format HorizonVigil's ingester
+# was originally written against, and AWS is steering all new setups to Data
+# Exports. New builds target 2.0.
+#
+# WHY CSV+GZIP AND NOT PARQUET
+#
+# Data Exports can emit either. Parquet is smaller and faster to query, but
+# reading it requires a Parquet decoder in the connector. The CUR ingester
+# already streams gzip'd CSV and parses it row by row under a wall-clock
+# budget, so TEXT_OR_CSV + GZIP is the format it can consume today. Revisit if
+# export size makes CSV the bottleneck.
+#
+# DELIBERATELY NOT A FULL COLUMN DUMP
+#
+# The obvious thing is to select every available column. The query below
+# selects only the columns HorizonVigil actually reads, plus the few it needs
+# next (account attribution and tags). A narrower export is a smaller S3 bill
+# and a faster ingest, and an unused column is not evidence of anything.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Cost & Usage Report'
+        Parameters:
+          - ExportName
+          - S3Prefix
+          - RetentionInDays
+          - TimeGranularity
+    ParameterLabels:
+      ExportName:
+        default: 'Export name'
+      S3Prefix:
+        default: 'S3 key prefix'
+      RetentionInDays:
+        default: 'Keep CUR files for (days)'
+      TimeGranularity:
+        default: 'Time granularity'
+
+Parameters:
+  ExportName:
+    Type: String
+    Default: 'horizonvigil-cur'
+    AllowedPattern: '^[A-Za-z0-9!\-_.*''()]+$'
+    Description: >
+      Name of the Data Exports export. The default is what HorizonVigil looks
+      for first -- change it only if that name is already taken in this
+      account, and then enter the new name in HorizonVigil.
+
+  S3Prefix:
+    Type: String
+    Default: 'horizonvigil'
+    AllowedPattern: '^[A-Za-z0-9!\-_.*''()/]+$'
+    Description: >
+      Key prefix inside the bucket. Combined with the export name this fixes
+      the manifest path, which is how HorizonVigil finds the report without
+      you copying anything.
+
+  RetentionInDays:
+    Type: Number
+    Default: 400
+    MinValue: 32
+    MaxValue: 3650
+    Description: >
+      How long to keep CUR files. Default is 400 days (13 months) so
+      year-over-year comparison has a full prior year to compare against.
+      Below ~32 days AWS's own restatement window for the previous billing
+      period would be deleted before it is applied, so that is the floor.
+
+  TimeGranularity:
+    Type: String
+    Default: 'DAILY'
+    AllowedValues: ['DAILY', 'HOURLY']
+    Description: >
+      DAILY is the right default: HorizonVigil aggregates to a day anyway, and
+      HOURLY multiplies row count by roughly 24 for no gain today. Choose
+      HOURLY only if you need sub-day analysis elsewhere.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # The bucket. Its name is DERIVED, not configurable, on purpose: the scan
+  # role in horizonvigil-scan-role-stackset.yaml grants s3:GetObject on exactly
+  # this ARN pattern. A deterministic name lets the two stacks be deployed in
+  # either order, with no cross-stack reference and no bucket name to copy.
+  # ---------------------------------------------------------------------------
+  CurBucket:
+    Type: AWS::S3::Bucket
+    # Retain: the bucket holds historical billing data that cannot be
+    # regenerated once the retention window has passed. Deleting this stack
+    # should stop new deliveries, not destroy the cost history.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'horizonvigil-cur-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldCurFiles
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionInDays
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  CurBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CurBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # The billing service writes the export here. Both principals are
+          # required: bcm-data-exports is CUR 2.0, billingreports is the
+          # legacy service still used for some account configurations.
+          - Sid: AllowBillingServiceToWriteExports
+            Effect: Allow
+            Principal:
+              Service:
+                - bcm-data-exports.amazonaws.com
+                - billingreports.amazonaws.com
+            Action:
+              - 's3:PutObject'
+              - 's3:GetBucketPolicy'
+            Resource:
+              - !GetAtt CurBucket.Arn
+              - !Sub '${CurBucket.Arn}/*'
+            # Confused-deputy guard: without these conditions any account's
+            # billing service could be induced to write into this bucket.
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              ArnLike:
+                'aws:SourceArn':
+                  - !Sub 'arn:${AWS::Partition}:cur:us-east-1:${AWS::AccountId}:definition/*'
+                  - !Sub 'arn:${AWS::Partition}:bcm-data-exports:us-east-1:${AWS::AccountId}:export/*'
+
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CurBucket.Arn
+              - !Sub '${CurBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # ---------------------------------------------------------------------------
+  # Export creation runs through a Lambda-backed custom resource because
+  # CloudFormation has no native resource type for Data Exports.
+  # ---------------------------------------------------------------------------
+  CurCreatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/HorizonVigilCurCreator-${AWS::StackName}'
+      RetentionInDays: 14
+
+  CurCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: WriteOwnLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Scoped to this function's own log group rather than the
+              # AWSLambdaBasicExecutionRole managed policy, which allows
+              # writing to every log group in the account.
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !GetAtt CurCreatorLogGroup.Arn
+        - PolicyName: ManageHorizonVigilExport
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CreateTheExport
+                Effect: Allow
+                Action: 'bcm-data-exports:CreateExport'
+                # CreateExport is authorized against the table and billing
+                # view it reads as well as the export it creates, so all
+                # three resource forms are required.
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bcm-data-exports:*:*:table/COST_AND_USAGE_REPORT'
+                  - !Sub 'arn:${AWS::Partition}:bcm-data-exports:*:*:export/*'
+                  - !Sub 'arn:${AWS::Partition}:billing::*:billingview/*'
+              - Sid: ManageTheExportAfterCreation
+                Effect: Allow
+                Action:
+                  - 'bcm-data-exports:GetExport'
+                  - 'bcm-data-exports:UpdateExport'
+                  - 'bcm-data-exports:DeleteExport'
+                  - 'bcm-data-exports:ListExports'
+                Resource: '*'
+
+  CurCreatorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CurCreatorLogGroup
+    Properties:
+      FunctionName: !Sub 'HorizonVigilCurCreator-${AWS::StackName}'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CurCreatorRole.Arn
+      Timeout: 120
+      Code:
+        ZipFile: |
+          """Creates, updates and deletes the HorizonVigil CUR 2.0 export.
+
+          Every path must call cfnresponse.send exactly once. A custom
+          resource that returns nothing leaves the stack wedged in
+          CREATE_IN_PROGRESS until CloudFormation times it out an hour later,
+          so the broad try/except is deliberate: any unexpected error is
+          reported as FAILED with its message rather than escaping.
+          """
+          import json
+          import boto3
+          import cfnresponse
+
+          # Only the columns HorizonVigil reads, plus the two it needs next:
+          # line_item_usage_account_id, because a payer-account CUR carries
+          # every member account's rows and they have to be attributable, and
+          # resource_tags for tag-based allocation.
+          COLUMNS = [
+              'bill_billing_period_start_date',
+              'line_item_usage_account_id',
+              'line_item_line_item_type',
+              'line_item_product_code',
+              'line_item_resource_id',
+              'line_item_unblended_cost',
+              'line_item_usage_start_date',
+              'product_servicecode',
+              'product_region_code',
+              'resource_tags',
+          ]
+
+          QUERY = 'SELECT ' + ', '.join(COLUMNS) + ' FROM COST_AND_USAGE_REPORT'
+
+
+          def export_spec(props):
+              return {
+                  'Name': props['ExportName'],
+                  'Description': 'Cost and usage export read by HorizonVigil',
+                  'DataQuery': {
+                      'QueryStatement': QUERY,
+                      'TableConfigurations': {
+                          'COST_AND_USAGE_REPORT': {
+                              # Resource IDs are the whole point: without them
+                              # cost cannot be attributed to a resource, which
+                              # is the only reason to ingest CUR rather than
+                              # call Cost Explorer.
+                              'INCLUDE_RESOURCES': 'TRUE',
+                              'INCLUDE_SPLIT_COST_ALLOCATION_DATA': 'FALSE',
+                              'TIME_GRANULARITY': props['TimeGranularity'],
+                          }
+                      },
+                  },
+                  'DestinationConfigurations': {
+                      'S3Destination': {
+                          'S3Bucket': props['BucketName'],
+                          'S3Prefix': props['S3Prefix'],
+                          'S3Region': props['BucketRegion'],
+                          'S3OutputConfigurations': {
+                              'OutputType': 'CUSTOM',
+                              # CSV+GZIP, not Parquet: this is what the
+                              # connector's streaming CSV parser can read.
+                              'Format': 'TEXT_OR_CSV',
+                              'Compression': 'GZIP',
+                              # OVERWRITE keeps one copy per billing period.
+                              # CREATE_NEW would keep every daily refresh,
+                              # multiplying storage ~30x for data HorizonVigil
+                              # re-reads idempotently anyway.
+                              'Overwrite': 'OVERWRITE_REPORT',
+                          },
+                      }
+                  },
+                  'RefreshCadence': {'Frequency': 'SYNCHRONOUS'},
+              }
+
+
+          def handler(event, context):
+              print(f'Event: {json.dumps(event)}')
+              request_type = event.get('RequestType')
+              try:
+                  # Data Exports is a us-east-1 service regardless of where
+                  # this stack or the bucket lives.
+                  client = boto3.client('bcm-data-exports', region_name='us-east-1')
+                  props = event.get('ResourceProperties', {})
+                  physical_id = event.get('PhysicalResourceId', '')
+
+                  if request_type == 'Create':
+                      response = client.create_export(Export=export_spec(props))
+                      arn = response['ExportArn']
+                      print(f'Created export {arn}')
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                       {'ExportArn': arn}, arn)
+
+                  elif request_type == 'Update':
+                      old = event.get('OldResourceProperties', {})
+                      # A renamed export is a different export. Returning a new
+                      # physical id makes CloudFormation delete the old one
+                      # through the Delete path below, which is what should
+                      # happen; updating in place would orphan it.
+                      if old.get('ExportName') != props.get('ExportName'):
+                          response = client.create_export(Export=export_spec(props))
+                          arn = response['ExportArn']
+                          print(f'Recreated export under new name: {arn}')
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                           {'ExportArn': arn}, arn)
+                      else:
+                          spec = export_spec(props)
+                          spec['ExportArn'] = physical_id
+                          client.update_export(ExportArn=physical_id, Export=spec)
+                          print(f'Updated export {physical_id}')
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                           {'ExportArn': physical_id}, physical_id)
+
+                  elif request_type == 'Delete':
+                      # Deleting the export must not block deleting the stack.
+                      # An export that is already gone, or was never created
+                      # because Create failed, still has to report SUCCESS or
+                      # the stack cannot be removed.
+                      if physical_id.startswith('arn:'):
+                          try:
+                              client.delete_export(ExportArn=physical_id)
+                              print(f'Deleted export {physical_id}')
+                          except Exception as err:  # noqa: BLE001
+                              print(f'Delete failed, continuing: {err}')
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id or 'no-export')
+
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                       reason=f'Unknown request type {request_type}')
+
+              except Exception as err:  # noqa: BLE001
+                  print(f'Error: {err}')
+                  # Never report SUCCESS on a failed create: a stack that says
+                  # CREATE_COMPLETE with no export behind it is exactly the
+                  # false-success this platform refuses to ship.
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                   reason=str(err)[:1000])
+
+  CurExport:
+    Type: Custom::HorizonVigilCurExport
+    # The bucket policy must exist before the export is created, or the
+    # billing service's first write is denied.
+    DependsOn: CurBucketPolicy
+    Properties:
+      ServiceToken: !GetAtt CurCreatorFunction.Arn
+      ExportName: !Ref ExportName
+      S3Prefix: !Ref S3Prefix
+      TimeGranularity: !Ref TimeGranularity
+      BucketName: !Ref CurBucket
+      BucketRegion: !Ref 'AWS::Region'
+
+Outputs:
+  CurBucketName:
+    Description: >
+      The CUR bucket. You do not need to copy this into HorizonVigil -- the
+      name is derived from your account ID and HorizonVigil looks there
+      automatically. Shown for verification.
+    Value: !Ref CurBucket
+
+  CurExportName:
+    Description: 'The Data Exports export name.'
+    Value: !Ref ExportName
+
+  ManifestPath:
+    Description: >
+      Where HorizonVigil reads the manifest from. Useful when checking that
+      the first delivery has landed (AWS takes up to 24 hours).
+    Value: !Sub 's3://${CurBucket}/${S3Prefix}/${ExportName}/metadata/BILLING_PERIOD=YYYY-MM/${ExportName}-Manifest.json'
+
+  NextStep:
+    Description: 'What to do now'
+    Value: >
+      Nothing to copy. Deploy horizonvigil-scan-role-stackset.yaml if you have
+      not already -- it grants HorizonVigil read access to this bucket. The
+      first CUR delivery can take up to 24 hours, and cost will show as "not
+      yet delivered" until it lands.
