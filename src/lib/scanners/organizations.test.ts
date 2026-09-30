@@ -242,3 +242,80 @@ describe('listOrganizationTree / listOrganizationAccounts', () => {
     }
   });
 });
+/**
+ * Scoping the listing to an organizational unit.
+ *
+ * `ListAccounts` tops out at 100 pages x 20 accounts, so an Organization
+ * larger than 2,000 accounts cannot be read in one call at all. Reading it a
+ * branch at a time is the only way it is importable — and it is the control a
+ * customer wants regardless, to onboard Production without also onboarding
+ * every sandbox.
+ */
+describe('listOrganizationAccounts scoped to an OU', () => {
+  beforeEach(() => callJsonApiMock.mockReset());
+
+  const page = (accounts: unknown[], nextToken?: string) =>
+    Promise.resolve({ ok: true, status: 200, body: { Accounts: accounts, ...(nextToken ? { NextToken: nextToken } : {}) } });
+
+  it('calls ListAccountsForParent with the OU id when scoped', async () => {
+    callJsonApiMock.mockImplementation(() => page([{ Id: '111122223333', Name: 'prod-a', Status: 'ACTIVE' }]));
+
+    const result = await listOrganizationAccounts({ accessKeyId: 'AKIA_TEST', secretAccessKey: 's' }, 'ou-abc1-def2');
+
+    expect(result.ok).toBe(true);
+    const [, req] = callJsonApiMock.mock.calls[0];
+    expect((req as { target: string }).target).toContain('ListAccountsForParent');
+    expect((req as { body: Record<string, unknown> }).body).toMatchObject({ ParentId: 'ou-abc1-def2' });
+  });
+
+  it('calls ListAccounts for the whole organization when unscoped', async () => {
+    callJsonApiMock.mockImplementation(() => page([{ Id: '111122223333', Name: 'a', Status: 'ACTIVE' }]));
+
+    await listOrganizationAccounts({ accessKeyId: 'AKIA_TEST', secretAccessKey: 's' });
+
+    const [, req] = callJsonApiMock.mock.calls[0];
+    expect((req as { target: string }).target).toContain('ListAccounts');
+    expect((req as { target: string }).target).not.toContain('ForParent');
+    expect((req as { body: Record<string, unknown> }).body).not.toHaveProperty('ParentId');
+  });
+
+  it('pages a scoped listing to completion', async () => {
+    // 20 per page is the AWS maximum, so anything real is multi-page. A
+    // scoped read that stopped at page one would silently import a fraction
+    // of an OU.
+    callJsonApiMock
+      .mockImplementationOnce(() => page([{ Id: '1', Status: 'ACTIVE' }], 'tok'))
+      .mockImplementationOnce(() => page([{ Id: '2', Status: 'ACTIVE' }]));
+
+    const result = await listOrganizationAccounts({ accessKeyId: 'AKIA_TEST', secretAccessKey: 's' }, 'ou-1');
+
+    expect(result.ok && result.accounts.map((a) => a.Id)).toEqual(['1', '2']);
+    expect(callJsonApiMock).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * An unscoped listing that hit the page cap must point at the way out.
+   * "Could not be read completely" alone leaves a customer with a 3,000
+   * account org and nothing to do.
+   */
+  it('tells an over-sized organization to scope by OU', async () => {
+    callJsonApiMock.mockImplementation(() => page([{ Id: 'x', Status: 'ACTIVE' }], 'always-more'));
+
+    const result = await listOrganizationAccounts({ accessKeyId: 'AKIA_TEST', secretAccessKey: 's' });
+
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.error).toMatch(/organizational unit/i);
+  });
+
+  it('does not suggest scoping when the read was ALREADY scoped', async () => {
+    // Telling someone who passed an OU to pass an OU is noise, and hides the
+    // real cause (a single OU genuinely above the cap).
+    callJsonApiMock.mockImplementation(() => page([{ Id: 'x', Status: 'ACTIVE' }], 'always-more'));
+
+    const result = await listOrganizationAccounts({ accessKeyId: 'AKIA_TEST', secretAccessKey: 's' }, 'ou-1');
+
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.error).toContain('ListAccountsForParent(ou-1)');
+    expect(!result.ok && result.error).not.toMatch(/pass an OU id/i);
+  });
+});

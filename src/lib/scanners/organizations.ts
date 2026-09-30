@@ -264,13 +264,42 @@ export async function scanOrganizations(ctx: ScannerContext): Promise<ScannedRes
  * short success, because importing "all accounts" from a truncated list would
  * silently skip accounts.
  */
-export async function listOrganizationAccounts(creds: AwsCreds): Promise<{ ok: true; accounts: OrgAccount[] } | { ok: false; error: string }> {
-  const res = await listAll<OrgAccount>(makeCall(creds), 'ListAccounts', {}, 'Accounts');
+export async function listOrganizationAccounts(
+  creds: AwsCreds,
+  /**
+   * An OU or root id to scope the listing to. Omitted, the whole Organization
+   * is listed.
+   *
+   * This is what makes an Organization larger than the pagination ceiling
+   * importable at all: `ListAccounts` tops out at 100 pages x 20 accounts, and
+   * an org above that can only be read a branch at a time. It is also the
+   * control a customer wants anyway — importing "Production" without also
+   * importing every sandbox.
+   *
+   * NOT recursive. ListAccountsForParent returns an OU's DIRECT children only,
+   * which is the honest unit here: silently walking nested OUs would make
+   * "import this OU" mean something different depending on how deep the tree
+   * happens to be, and would reintroduce the same unbounded read this scoping
+   * exists to avoid.
+   */
+  parentId?: string,
+): Promise<{ ok: true; accounts: OrgAccount[] } | { ok: false; error: string }> {
+  const res = parentId
+    ? await listAll<OrgAccount>(makeCall(creds), 'ListAccountsForParent', { ParentId: parentId }, 'Accounts')
+    : await listAll<OrgAccount>(makeCall(creds), 'ListAccounts', {}, 'Accounts');
   if (res.firstPageFailed) {
     return { ok: false, error: res.error ?? 'AWS Organizations ListAccounts failed -- is this connection\'s account the Organization\'s management account (or a delegated administrator)?' };
   }
   if (!res.complete) {
-    return { ok: false, error: `AWS Organizations ListAccounts could not be read completely (${res.items.length} account(s) read): ${res.error}` };
+    // Names the way out. An Organization above the pagination ceiling is not
+    // a dead end -- it is imported one OU at a time -- and a message that only
+    // says "could not be read completely" leaves the customer with nothing to
+    // do about it.
+    const scoped = parentId
+      ? `AWS Organizations ListAccountsForParent(${parentId}) could not be read completely (${res.items.length} account(s) read): ${res.error}`
+      : `AWS Organizations ListAccounts could not be read completely (${res.items.length} account(s) read): ${res.error}. `
+        + `Organizations above this size are imported one organizational unit at a time — pass an OU id to scope the import.`;
+    return { ok: false, error: scoped };
   }
   // `Status` is deprecated in favour of `State`; keep callers reading Status working.
   return { ok: true, accounts: res.items.map((a) => ({ ...a, Status: a.Status ?? a.State })) };
