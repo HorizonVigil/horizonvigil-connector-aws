@@ -15,7 +15,7 @@
     "@horizonvigil/shared-lib": "github:HorizonVigil/horizonvigil-shared-lib#v1.0.28",
     "aws4fetch": "^1.0.20",
     "hono": "^4.6.0",
-    "undici": "^6.28.0"
+    "undici": "^6.29.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
