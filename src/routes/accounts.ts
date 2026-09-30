@@ -4,6 +4,7 @@ import { encryptCredentials, maskAccessKey, looksLikeValidAccessKeyId } from '..
 import { validateCandidate, activateCandidate, rollbackToPrevious } from '../lib/credentialRotation';
 import { isConnectionPurgeEnabled, purgeDisabledResponse, isAssumeRoleEnabled, assumeRoleDisabledResponse } from '../lib/capabilities';
 import { validateConnectionCandidate } from '../lib/connectionValidation';
+import { fetchGoogleIdToken, googleSubjectOf } from '../lib/webIdentity';
 
 export const accountsRoutes = new Hono<{ Bindings: Env }>();
 
@@ -11,6 +12,64 @@ const LIST_SELECT =
   'id,org_id,project_id,connection_method,aws_account_id,connection_name,masked_access_key,external_id,role_arn,default_region,status,environment,support_plan,resource_summary,last_discovery_at,last_full_scan_at,last_sync_at,key_rotated_at,error_message,scan_regions,created_at,updated_at';
 
 /** GET /api/aws-accounts/accounts — Account Inventory, paginated + filterable. */
+/**
+ * GET /accounts/aws-trust-identity — the values a customer needs to write a
+ * cross-account trust policy, and proof that the mechanism actually works
+ * here.
+ *
+ * The trust policy in templates/horizonvigil-scan-role-stackset.yaml pins
+ * `accounts.google.com:sub` to HorizonVigil's Google service account. Nothing
+ * in the product could tell a customer that number, and nothing could confirm
+ * the Cloud Run metadata server is able to mint tokens at all — so the first
+ * time either would be discovered was a customer's stack failing with
+ * AccessDenied.
+ *
+ * The subject is read from a freshly minted token rather than an environment
+ * variable, which makes it impossible for the published value to drift from
+ * the identity actually presented to AWS, and makes a successful response
+ * proof that token minting works in this deployment.
+ *
+ * The token itself is never returned; only its `sub`, which is a public
+ * identifier.
+ */
+accountsRoutes.get('/accounts/aws-trust-identity', (c) =>
+  guarded(async () => {
+    const auth = getAuthContext(c.req.raw);
+    const orgId = requireOrgId(c.req.raw);
+    const db = createDb(c.env, auth.accessToken);
+    await requireMenuPermission(db, auth.userId, orgId, 'cloud', 'read');
+
+    const minted = await fetchGoogleIdToken('horizonvigil-trust-identity-probe');
+    if (!minted || 'error' in minted) {
+      // Honest unavailable, never a blank or a placeholder subject: a customer
+      // who pastes a wrong value into a trust policy gets an AccessDenied with
+      // no indication which side is wrong.
+      return okJson({
+        available: false,
+        mechanism: 'web_identity',
+        reason: minted?.error
+          ?? 'This deployment is not running on Google infrastructure, so it cannot mint a workload identity token.',
+      });
+    }
+
+    const subject = googleSubjectOf(minted.token);
+    if (!subject) {
+      return okJson({ available: false, mechanism: 'web_identity', reason: 'The identity token carried no subject claim.' });
+    }
+
+    return okJson({
+      available: true,
+      mechanism: 'web_identity',
+      googleSubject: subject,
+      // Stated so the customer can check their trust policy against it rather
+      // than infer the convention from an example.
+      subjectConditionKey: 'accounts.google.com:sub',
+      audienceConditionKey: 'accounts.google.com:oaud',
+      audienceIsExternalId: true,
+    });
+  }),
+);
+
 accountsRoutes.get('/accounts', (c) =>
   guarded(async () => {
     const auth = getAuthContext(c.req.raw);
