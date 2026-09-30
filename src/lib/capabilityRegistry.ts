@@ -125,10 +125,14 @@ export const AWS_CAPABILITIES: readonly AwsCapability[] = [
   {
     key: 'cur',
     label: 'Cost & Usage Report ingestion',
-    awsApis: ['cur:DescribeReportDefinitions', 's3:GetObject'],
+    // Both report generations: bcm-data-exports for CUR 2.0 (what
+    // templates/horizonvigil-cur-setup.yaml creates) and cur:Describe* for a
+    // customer's pre-existing legacy report. Discovery tries v2 first and
+    // falls back, so an account with either one resolves.
+    awsApis: ['bcm-data-exports:ListExports', 'bcm-data-exports:GetExport', 'cur:DescribeReportDefinitions', 's3:GetObject'],
     implemented: true,
     probed: false,
-    requiredPermissions: ['cur:DescribeReportDefinitions', 's3:GetObject', 's3:ListBucket'],
+    requiredPermissions: ['bcm-data-exports:ListExports', 'bcm-data-exports:GetExport', 'cur:DescribeReportDefinitions', 's3:GetObject', 's3:ListBucket'],
     dataStored: ['cost_snapshots'],
     uiConsumer: 'FinOps → Cost Explorer',
     actionSupported: false,

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { CUR_COLUMNS } from './curSchema';
 
 /**
  * The templates in templates/ are the only artifact a customer actually
@@ -182,19 +183,27 @@ describe('the CUR export is delivered in a form the ingester can read', () => {
    * specification to satisfy, and so a column cannot be dropped from the
    * export without this failing.
    */
-  it('selects a CUR 2.0 column for every column the ingester requires', () => {
-    const required = /const required = \[([^\]]+)\]/.exec(CUR_INGEST)?.[1] ?? '';
-    const cur1Columns = [...required.matchAll(/'([^']+)'/g)].map((m) => m[1]);
-    expect(cur1Columns).toEqual(['lineItem/ResourceId', 'lineItem/UnblendedCost', 'lineItem/UsageStartDate']);
-
-    const CUR1_TO_CUR2: Record<string, string> = {
-      'lineItem/ResourceId': 'line_item_resource_id',
-      'lineItem/UnblendedCost': 'line_item_unblended_cost',
-      'lineItem/UsageStartDate': 'line_item_usage_start_date',
-    };
-    for (const col of cur1Columns) {
-      expect(CUR_CODE, `${col} has no CUR 2.0 equivalent in the export`).toContain(`'${CUR1_TO_CUR2[col]}'`);
+  /**
+   * Now asserted against the ingester's real column table rather than a
+   * hand-copied list, so adding a column the parser depends on without
+   * selecting it in the export fails here instead of at the first ingest.
+   *
+   * Every column in CUR_COLUMNS.v2 must appear, not only the three that are
+   * strictly required: the optional ones (service, region) are what turn a
+   * cost row into an attributable one, and an export that omits them
+   * produces rows labelled "unknown" rather than an error.
+   */
+  it('selects every CUR 2.0 column the ingester reads', () => {
+    for (const column of Object.values(CUR_COLUMNS.v2)) {
+      expect(CUR_CODE, `${column} is read by the ingester but not selected by the export`).toContain(`'${column}'`);
     }
+  });
+
+  it('the ingester can read both generations, so a pre-existing report still works', () => {
+    // The export this template creates is v2, but a customer who already had
+    // a legacy CUR must not be broken by that.
+    expect(Object.keys(CUR_COLUMNS).sort()).toEqual(['v1', 'v2']);
+    expect(CUR_INGEST).toContain('resolveCurColumns');
   });
 
   it('carries the usage account id, so a payer CUR can be attributed', () => {

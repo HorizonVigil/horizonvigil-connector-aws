@@ -134,12 +134,25 @@ collectionRunRoutes.post('/accounts/:id/cur-runs', (c) =>
 
     // The manifest IS the plan: one step per report file, discovered
     // server-side rather than fetched by the browser.
+    //
+    // The field names here are `cur_*` because that is what CurConnectionConfig
+    // declares. This call previously passed {bucket, region, prefix,
+    // reportName} behind an `as never` cast, which silenced the mismatch: the
+    // cast made the object assignable to anything, so every field arrived
+    // undefined and the manifest was fetched from
+    // s3://undefined/undefined/undefined/. `as never` on an argument does not
+    // loosen a type, it removes the check entirely.
     const manifest = await fetchCurManifest(resolved.creds, {
-      bucket: cfg[0].cur_s3_bucket, region: cfg[0].cur_s3_region ?? 'us-east-1',
-      prefix: cfg[0].cur_s3_prefix ?? '', reportName: cfg[0].cur_report_name ?? '',
-    } as never);
+      cur_s3_bucket: cfg[0].cur_s3_bucket,
+      cur_s3_region: cfg[0].cur_s3_region ?? 'us-east-1',
+      cur_s3_prefix: cfg[0].cur_s3_prefix ?? '',
+      cur_report_name: cfg[0].cur_report_name ?? '',
+    });
     if ('error' in manifest) return errJson(400, manifest.error);
-    const reportKeys = manifest.manifest.reportKeys ?? [];
+    // Normalized by fetchCurManifest across both manifest generations. Reading
+    // `manifest.manifest.reportKeys ?? []` instead would yield [] for every
+    // CUR 2.0 report -- a readable billing period reported as "no data".
+    const reportKeys = manifest.reportKeys;
     if (reportKeys.length === 0) {
       return c.json({ ok: false, code: 'cur_no_data_published', error: 'The report exists but no data files are published for this billing period yet.' }, 409);
     }
