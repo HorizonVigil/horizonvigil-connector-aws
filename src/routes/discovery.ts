@@ -134,6 +134,7 @@ import { computeFinalizeResult } from '../lib/discoveryFinalize';
 import { resolveGeneration, type ExistingGeneration, type LifecycleState } from '../lib/generations';
 import { triggerRecommendationGeneration, triggerAlertEvaluation } from '../lib/postScanHooks';
 import { RegionCoverageLedger } from '../lib/regionalAvailability';
+import { scannerCertificationSummary } from '../lib/scannerCertification';
 
 export const discoveryRoutes = new Hono<{ Bindings: Env }>();
 
@@ -1228,6 +1229,13 @@ export async function runFinalize(db: Db, orgId: string, actorId: string | null,
   const summary = {
     scannedAt: now, totalResources: activeCount, categoryCounts: activeCategoryCounts,
     servicesTotal: `${Object.keys(REGIONAL_SCANNERS).length + Object.keys(GLOBAL_SCANNERS).length} live / 245 catalogued`,
+    // Implementation count is not certification. This explicit machine-readable
+    // state prevents UI and Advisor consumers from calling unverified provider
+    // integrations production-certified merely because a scanner is registered.
+    scannerCertification: scannerCertificationSummary(
+      [...Object.keys(REGIONAL_SCANNERS), ...Object.keys(GLOBAL_SCANNERS)],
+      Object.keys(FINDING_SCANNERS),
+    ),
     regionsScanned: regionsFor(connection), errors: stepErrors.slice(0, 20),
     // Present so a reader can tell "this estate has no relationships" from
     // "the graph could not be built this run". Those render identically
