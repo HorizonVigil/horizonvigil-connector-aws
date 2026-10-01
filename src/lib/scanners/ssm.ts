@@ -1,4 +1,4 @@
-import { callJsonApi } from '../awsApi';
+import { reportWalk, walkJsonRpc } from './restJson';
 import type { ScannedResource, ScannerContext } from './types';
 
 /** Every resource_type_key this scanner can produce — see ec2.ts for why discovery.ts needs this list. */
@@ -31,65 +31,72 @@ interface PatchBaseline {
  * JSON-RPC, same signer, one call each. Owner='Self' on ListDocuments
  * mirrors iam.ts's Scope=Local reasoning: without it, AWS's own ~1,500+
  * published documents would swamp the inventory with things nobody created.
- * Each capped at its own default/max page size with no follow-up
- * pagination — accounts with more than that in one region need pagination
- * support, not built yet.
+ * Every list is paginated. An incomplete walk is reported through the
+ * collection failure sink so finalization preserves previously collected
+ * rows instead of treating an unread page as deletion.
  */
 export async function scanSsm(ctx: ScannerContext): Promise<ScannedResource[]> {
   const endpoint = `ssm.${ctx.region}.amazonaws.com`;
-  const call = async (action: string, body: Record<string, unknown>) => {
-    const result = await callJsonApi(ctx.creds, { service: 'ssm', region: ctx.region, host: endpoint, target: `AmazonSSM.${action}`, body });
-    if (!result.ok) {
-      console.error(`SSM ${action} failed in ${ctx.region} (continuing without it): ${result.errorMessage ?? result.errorCode ?? result.status}`);
-      return null;
-    }
-    return result.body as Record<string, unknown>;
-  };
+  const walk = <T>(action: string, itemsKey: string, body: Record<string, unknown>) =>
+    walkJsonRpc<T>(ctx, { service: 'ssm', host: endpoint, target: `AmazonSSM.${action}`, body }, itemsKey, {
+      tokenIn: 'NextToken', tokenOut: 'NextToken', maxPages: 200,
+    });
 
   const out: ScannedResource[] = [];
 
-  const paramsBody = await call('DescribeParameters', { MaxResults: 50 });
-  for (const p of (paramsBody?.Parameters as SsmParameter[] | undefined) ?? []) {
+  const [params, automations, documents, instances, windows, baselines, inventory] = await Promise.all([
+    walk<SsmParameter>('DescribeParameters', 'Parameters', { MaxResults: 50 }),
+    walk<AutomationExecution>('DescribeAutomationExecutions', 'AutomationExecutionMetadataList', { MaxResults: 50 }),
+    walk<SsmDocument>('ListDocuments', 'DocumentIdentifiers', { Filters: [{ Key: 'Owner', Values: ['Self'] }], MaxResults: 50 }),
+    walk<ManagedInstance>('DescribeInstanceInformation', 'InstanceInformationList', { MaxResults: 50 }),
+    walk<MaintenanceWindow>('DescribeMaintenanceWindows', 'WindowIdentities', { MaxResults: 50 }),
+    walk<PatchBaseline>('DescribePatchBaselines', 'BaselineIdentities', { MaxResults: 50 }),
+    walk<{ Id?: string; Data?: Record<string, unknown> }>('GetInventory', 'Entities', { MaxResults: 50 }),
+  ]);
+
+  const walks = [
+    ['DescribeParameters', params], ['DescribeAutomationExecutions', automations], ['ListDocuments', documents],
+    ['DescribeInstanceInformation', instances], ['DescribeMaintenanceWindows', windows],
+    ['DescribePatchBaselines', baselines], ['GetInventory', inventory],
+  ] as const;
+  for (const [action, result] of walks) reportWalk(ctx, result, 'ssm', action);
+
+  for (const p of params.items) {
     out.push({
       resourceTypeKey: 'ssm_parameter', resourceId: `${ctx.region}:${p.Name}`, region: ctx.region, resourceName: p.Name,
       metadata: { type: p.Type, lastModifiedDate: p.LastModifiedDate, version: p.Version, tier: p.Tier },
     });
   }
 
-  const automationsBody = await call('DescribeAutomationExecutions', { MaxResults: 50 });
-  for (const a of (automationsBody?.AutomationExecutionMetadataList as AutomationExecution[] | undefined) ?? []) {
+  for (const a of automations.items) {
     out.push({
       resourceTypeKey: 'ssm_automation', resourceId: a.AutomationExecutionId, region: ctx.region, resourceName: a.DocumentName,
       state: a.AutomationExecutionStatus, metadata: { startTime: a.ExecutionStartTime, endTime: a.ExecutionEndTime },
     });
   }
 
-  const documentsBody = await call('ListDocuments', { Filters: [{ Key: 'Owner', Values: ['Self'] }], MaxResults: 50 });
-  for (const d of (documentsBody?.DocumentIdentifiers as SsmDocument[] | undefined) ?? []) {
+  for (const d of documents.items) {
     out.push({
       resourceTypeKey: 'ssm_document', resourceId: `${ctx.region}:${d.Name}`, region: ctx.region, resourceName: d.Name,
       metadata: { documentType: d.DocumentType, documentVersion: d.DocumentVersion, platformTypes: d.PlatformTypes },
     });
   }
 
-  const instancesBody = await call('DescribeInstanceInformation', { MaxResults: 50 });
-  for (const i of (instancesBody?.InstanceInformationList as ManagedInstance[] | undefined) ?? []) {
+  for (const i of instances.items) {
     out.push({
       resourceTypeKey: 'ssm_managed_instance', resourceId: i.InstanceId, region: ctx.region, resourceName: i.ComputerName ?? i.InstanceId,
       state: i.PingStatus, metadata: { platformType: i.PlatformType, platformName: i.PlatformName, agentVersion: i.AgentVersion, ipAddress: i.IPAddress },
     });
   }
 
-  const windowsBody = await call('DescribeMaintenanceWindows', { MaxResults: 50 });
-  for (const w of (windowsBody?.WindowIdentities as MaintenanceWindow[] | undefined) ?? []) {
+  for (const w of windows.items) {
     out.push({
       resourceTypeKey: 'ssm_maintenance_window', resourceId: w.WindowId, region: ctx.region, resourceName: w.Name,
       state: w.Enabled ? 'enabled' : 'disabled', metadata: { durationHours: w.Duration, cutoffHours: w.Cutoff },
     });
   }
 
-  const baselinesBody = await call('DescribePatchBaselines', { MaxResults: 50 });
-  for (const b of (baselinesBody?.BaselineIdentities as PatchBaseline[] | undefined) ?? []) {
+  for (const b of baselines.items) {
     // AWS ships one default baseline per OS ("AWS-AmazonLinuxDefaultPatchBaseline",
     // "AWS-WindowsDefaultPatchBaseline", ...) in every account/region with
     // zero setup. Confirmed via a real discovery run: without this filter, a
@@ -108,8 +115,7 @@ export async function scanSsm(ctx: ScannerContext): Promise<ScannedResource[]> {
   // Entities[] item per instance with a Data map keyed by inventory type
   // name, summarized here to which types are present rather than dumping
   // every field of every type.
-  const inventoryBody = await call('GetInventory', { MaxResults: 50 });
-  for (const e of (inventoryBody?.Entities as { Id?: string; Data?: Record<string, unknown> }[] | undefined) ?? []) {
+  for (const e of inventory.items) {
     if (!e.Id) continue;
     out.push({
       resourceTypeKey: 'systems_manager_inventory', resourceId: `${ctx.region}:${e.Id}`, region: ctx.region, resourceName: e.Id,
