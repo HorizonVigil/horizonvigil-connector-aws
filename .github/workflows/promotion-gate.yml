@@ -1,0 +1,40 @@
+name: Promotion Gate
+
+on:
+  pull_request:
+    branches: [dev, test, main]
+
+permissions:
+  contents: read
+
+jobs:
+  promotion-gate:
+    name: Promotion gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce dev to test to main promotion
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          set -eu
+          case "$BASE_BRANCH" in
+            main)
+              [ "$HEAD_BRANCH" = "test" ] || {
+                echo "::error::Pull requests into main must come from test."
+                exit 1
+              }
+              ;;
+            test)
+              [ "$HEAD_BRANCH" = "dev" ] || {
+                echo "::error::Pull requests into test must come from dev."
+                exit 1
+              }
+              ;;
+            dev)
+              ;;
+            *)
+              echo "::error::Unsupported target branch: $BASE_BRANCH"
+              exit 1
+              ;;
+          esac
